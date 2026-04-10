@@ -1,0 +1,84 @@
+# ── v4call docker-compose.yml ─────────────────────────────────────────────────
+# Runs the complete v4call stack:
+#   - v4call Node.js server
+#   - Nginx reverse proxy (handles SSL termination)
+#   - Certbot for automatic Let's Encrypt SSL certificates
+#
+# QUICK START:
+#   1. cp .env.example .env && nano .env    (fill in your details)
+#   2. Edit nginx/v4call.conf — replace v4call.com with your domain
+#   3. docker compose up -d
+#   4. docker compose run --rm certbot certonly --webroot \
+#        -w /var/www/certbot -d yourdomain.com
+#   5. docker compose restart nginx
+
+name: v4call
+
+services:
+
+  # ── v4call Node.js Server ──────────────────────────────────────────────────
+  app:
+    build: .
+    container_name: v4call-app
+    restart: unless-stopped
+
+    # Load all config from .env file
+    env_file: .env
+
+    # Override BIND_HOST — inside Docker, bind to all interfaces
+    # (Nginx container handles external access)
+    environment:
+      - BIND_HOST=0.0.0.0
+
+    # Persist SQLite database between container restarts
+    volumes:
+      - ./data/logs:/app/logs
+
+    # Only accessible from within the Docker network (Nginx proxies to it)
+    networks:
+      - v4call-net
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/debug-state"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+  # ── Nginx Reverse Proxy ────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: v4call-nginx
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - ./nginx/v4call.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/certbot/conf:/etc/letsencrypt:ro
+      - ./data/certbot/www:/var/www/certbot:ro
+
+    depends_on:
+      - app
+
+    networks:
+      - v4call-net
+
+  # ── Certbot (Let's Encrypt SSL) ────────────────────────────────────────────
+  certbot:
+    image: certbot/certbot
+    container_name: v4call-certbot
+    restart: unless-stopped
+
+    volumes:
+      - ./data/certbot/conf:/etc/letsencrypt
+      - ./data/certbot/www:/var/www/certbot
+
+    # Auto-renew certificates every 12 hours
+    entrypoint: /bin/sh -c "trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done"
+
+networks:
+  v4call-net:
+    driver: bridge

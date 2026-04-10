@@ -1,0 +1,31 @@
+{
+  "name": "v4call",
+  "version": "1.0.0",
+  "description": "Decentralised video/audio calling with Hive blockchain identity and HBD micropayments",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@hiveio/dhive": "^1.3.2",
+    "better-sqlite3": "^9.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hive",
+    "blockchain",
+    "webrtc",
+    "voip",
+    "video-calling",
+    "hbd",
+    "micropayments",
+    "decentralised"
+  ]
+}
