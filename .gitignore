@@ -2,7 +2,7 @@
 .env
 *.key
 *.pem
-
+nginx/.htpasswd
 # ── Runtime data ──────────────────────────────────────────────────────────────
 data/
 logs/

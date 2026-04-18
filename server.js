@@ -1,15 +1,27 @@
-// Load .env file if present (for local dev and Docker)
-// In production via systemd, env vars are set directly in the service file
-try { require('dotenv').config(); } catch(e) { /* dotenv optional */ }
+// ─────────────────────────────────────────────────────────────────────────────
+// v4call — server.js
+// Decentralised paid communications via Hive blockchain + WebRTC
+//
+// FORKING: Only change the constants at the top of each section marked
+//          ── FORK CONFIG ── to rebrand for your own node.
+//          Everything else is logic — leave it alone unless you know why.
+//
+// Rate format: supports both [V4CALL-RATES-V1] and [V4CALL-RATES-V2]
+// V2 adds: [BLOCKED], [TOKEN:SYMBOL], TEXT-SESSION, ALLOW-BLOCKED, CHAIN, SERVER, NOSTR
+// ─────────────────────────────────────────────────────────────────────────────
 
-const express     = require('express');
-const http        = require('http');
-const { Server }  = require('socket.io');
-const path        = require('path');
-const crypto      = require('crypto');
-const fs          = require('fs');
-const Database    = require('better-sqlite3');
-const dhive       = require('@hiveio/dhive');
+// Load .env file if present (local dev and Docker).
+// In production via systemd, env vars are set directly in the service file.
+try { require('dotenv').config(); } catch(e) { /* dotenv is optional */ }
+
+const express    = require('express');
+const http       = require('http');
+const { Server } = require('socket.io');
+const path       = require('path');
+const crypto     = require('crypto');
+const fs         = require('fs');
+const Database   = require('better-sqlite3');
+const dhive      = require('@hiveio/dhive');
 
 const app    = express();
 const server = http.createServer(app);
@@ -17,9 +29,11 @@ const io     = new Server(server);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Config ────────────────────────────────────────────────────────────────────
-// ── Config — all values read from environment variables (.env / systemd) ─────
-// Edit .env file to configure your server — do not hardcode values here
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── FORK CONFIG — Edit .env to set these. Do NOT hardcode values here. ───────
+// ─────────────────────────────────────────────────────────────────────────────
+
 const SERVER_NAME         = process.env.SERVER_NAME         || 'v4call';
 const SERVER_DOMAIN       = process.env.SERVER_DOMAIN       || 'v4call.com';
 const SERVER_HIVE_ACCOUNT = process.env.SERVER_HIVE_ACCOUNT || 'v4call';
@@ -28,33 +42,43 @@ const PLATFORM_FEE        = parseFloat(process.env.DEFAULT_PLATFORM_FEE || '10')
 const PORT                = parseInt(process.env.PORT        || '3000');
 const BIND_HOST           = process.env.BIND_HOST            || '127.0.0.1';
 
-// Hive API nodes — can override first node via HIVE_API env var
-const HIVE_API        = process.env.HIVE_API || 'https://api.hive.blog';
-const HIVE_API_NODES  = [
+// Hive API nodes — can override the primary node via HIVE_API env var.
+// Server tries each in order and falls back automatically on failure.
+const HIVE_API       = process.env.HIVE_API || 'https://api.hive.blog';
+const HIVE_API_NODES = [
   HIVE_API,
   'https://anyx.io',
   'https://api.deathwing.me',
   'https://hived.emre.sh'
-].filter((v, i, a) => a.indexOf(v) === i); // deduplicate
+].filter((v, i, a) => a.indexOf(v) === i); // deduplicate if HIVE_API matches a fallback
 
-// Call behaviour — tunable via env vars
-const CALL_COOLDOWN_MS      = parseInt(process.env.CALL_COOLDOWN_MS      || '30000');
-const MAX_CALL_DURATION_MIN = parseInt(process.env.MAX_CALL_DURATION_MIN  || '120');
-const PAYMENT_VERIFY_RETRIES    = parseInt(process.env.PAYMENT_VERIFY_RETRIES    || '3');
-const PAYMENT_VERIFY_DELAY_MS   = parseInt(process.env.PAYMENT_VERIFY_DELAY_MS   || '5000');
+// Call behaviour — tunable via .env
+const CALL_COOLDOWN_MS          = parseInt(process.env.CALL_COOLDOWN_MS          || '30000');
+const MAX_CALL_DURATION_MIN     = parseInt(process.env.MAX_CALL_DURATION_MIN      || '120');
+const PAYMENT_VERIFY_RETRIES    = parseInt(process.env.PAYMENT_VERIFY_RETRIES     || '3');
+const PAYMENT_VERIFY_DELAY_MS   = parseInt(process.env.PAYMENT_VERIFY_DELAY_MS    || '5000');
 
-console.log(`[config] Server: ${SERVER_NAME} (${SERVER_DOMAIN})`);
-console.log(`[config] Escrow: @${ESCROW_ACCOUNT}`);
+// Chat storage — tunable via .env
+const DM_RETENTION_DAYS         = parseInt(process.env.DM_RETENTION_DAYS          || '33');
+const ROOM_RETENTION_DAYS       = parseInt(process.env.ROOM_RETENTION_DAYS        || '33');
+const DM_PREVIEW_COUNT          = parseInt(process.env.DM_PREVIEW_COUNT           || '1'); // 0 = off
+
+console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
+console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
 console.log(`[config] Platform fee: ${PLATFORM_FEE * 100}%`);
-console.log(`[config] Max call duration: ${MAX_CALL_DURATION_MIN} min`);
+console.log(`[config] Max duration: ${MAX_CALL_DURATION_MIN} min`);
+console.log(`[config] DM retention: ${DM_RETENTION_DAYS} days | Room retention: ${ROOM_RETENTION_DAYS} days | DM preview: ${DM_PREVIEW_COUNT}`);
 
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ── SQLite Ledger ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const db = new Database(path.join(LOG_DIR, 'v4call-ledger.db'));
 
-// Create tables
 db.exec(`
   CREATE TABLE IF NOT EXISTS payments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,17 +111,213 @@ db.exec(`
     duration_cost   REAL    DEFAULT 0,
     callee_net      REAL    DEFAULT 0,
     platform_cut    REAL    DEFAULT 0,
-    status          TEXT    NOT NULL DEFAULT 'initiated',  -- 'initiated'|'ringing'|'connected'|'ended'|'missed'|'declined'
-    end_reason      TEXT    -- 'caller_hung_up'|'callee_hung_up'|'timeout'|'declined'|'cap_reached'
+    status          TEXT    NOT NULL DEFAULT 'initiated',
+    end_reason      TEXT
   );
 
-  CREATE INDEX IF NOT EXISTS idx_calls_caller  ON calls(caller);
-  CREATE INDEX IF NOT EXISTS idx_calls_callee  ON calls(callee);
-  CREATE INDEX IF NOT EXISTS idx_calls_call_id ON calls(call_id);
+  CREATE INDEX IF NOT EXISTS idx_calls_caller   ON calls(caller);
+  CREATE INDEX IF NOT EXISTS idx_calls_callee   ON calls(callee);
+  CREATE INDEX IF NOT EXISTS idx_calls_call_id  ON calls(call_id);
   CREATE INDEX IF NOT EXISTS idx_payments_call_id ON payments(call_id);
 `);
 
-// Ledger helper functions
+console.log('[ledger] SQLite ready:', path.join(LOG_DIR, 'v4call-ledger.db'));
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── SQLite Chat Store (separate DB for security) ─────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+const chatDb = new Database(path.join(LOG_DIR, 'v4call-chat.db'));
+
+chatDb.exec(`
+  CREATE TABLE IF NOT EXISTS dm_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT    NOT NULL DEFAULT (datetime('now')),
+    from_user   TEXT    NOT NULL,
+    to_user     TEXT    NOT NULL,
+    owner       TEXT    NOT NULL,
+    ciphertext  TEXT    NOT NULL,
+    signature   TEXT,
+    timestamp   TEXT,
+    text_paid   REAL    DEFAULT 0,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS room_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT    NOT NULL DEFAULT (datetime('now')),
+    room_name   TEXT    NOT NULL,
+    from_user   TEXT    NOT NULL,
+    to_user     TEXT    NOT NULL,
+    ciphertext  TEXT    NOT NULL,
+    signature   TEXT,
+    timestamp   TEXT,
+    is_broadcast INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS user_seen (
+    username    TEXT    PRIMARY KEY,
+    last_seen   TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_dm_owner      ON dm_messages(owner);
+  CREATE INDEX IF NOT EXISTS idx_dm_from       ON dm_messages(from_user);
+  CREATE INDEX IF NOT EXISTS idx_dm_to         ON dm_messages(to_user);
+  CREATE INDEX IF NOT EXISTS idx_dm_created     ON dm_messages(created_at);
+  CREATE INDEX IF NOT EXISTS idx_room_name     ON room_messages(room_name);
+  CREATE INDEX IF NOT EXISTS idx_room_created  ON room_messages(created_at);
+`);
+
+console.log('[chat] SQLite ready:', path.join(LOG_DIR, 'v4call-chat.db'));
+
+// ── Chat DB helpers ──────────────────────────────────────────────────────────
+
+function chatStoreDm(fromUser, toUser, ciphertextForRecipient, ciphertextForSender, signature, timestamp, textPaid) {
+  try {
+    const stmt = chatDb.prepare(`
+      INSERT INTO dm_messages (from_user, to_user, owner, ciphertext, signature, timestamp, text_paid)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    // Store recipient's copy (encrypted to recipient's key)
+    stmt.run(fromUser, toUser, toUser, ciphertextForRecipient, signature, timestamp, textPaid || 0);
+    // Store sender's copy (encrypted to sender's key)
+    if (ciphertextForSender) {
+      stmt.run(fromUser, toUser, fromUser, ciphertextForSender, signature, timestamp, textPaid || 0);
+    }
+  } catch(e) {
+    console.error('[chat] DM store failed:', e.message);
+  }
+}
+
+function chatStoreRoomMsg(roomName, fromUser, toUser, ciphertext, signature, timestamp, isBroadcast) {
+  try {
+    chatDb.prepare(`
+      INSERT INTO room_messages (room_name, from_user, to_user, ciphertext, signature, timestamp, is_broadcast)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(roomName, fromUser, toUser, ciphertext, signature, timestamp, isBroadcast ? 1 : 0);
+  } catch(e) {
+    console.error('[chat] Room message store failed:', e.message);
+  }
+}
+
+function chatGetDmUnread(username) {
+  try {
+    const seen = chatDb.prepare(`SELECT last_seen FROM user_seen WHERE username = ?`).get(username);
+    const since = seen ? seen.last_seen : '1970-01-01 00:00:00';
+    const rows = chatDb.prepare(`
+      SELECT from_user, COUNT(*) as cnt
+      FROM dm_messages
+      WHERE owner = ? AND to_user = ? AND created_at > ?
+      GROUP BY from_user
+    `).all(username, username, since);
+    return rows; // [{ from_user, cnt }, ...]
+  } catch(e) {
+    console.error('[chat] Unread count failed:', e.message);
+    return [];
+  }
+}
+
+function chatGetDmPreviews(username, countPerUser) {
+  if (countPerUser <= 0) return [];
+  try {
+    // Get the N most recent messages per conversation partner
+    const partners = chatDb.prepare(`
+      SELECT DISTINCT CASE WHEN from_user = ? THEN to_user ELSE from_user END as partner
+      FROM dm_messages WHERE owner = ?
+    `).all(username, username);
+
+    const previews = [];
+    const stmt = chatDb.prepare(`
+      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, created_at
+      FROM dm_messages
+      WHERE owner = ? AND (
+        (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
+      )
+      ORDER BY created_at DESC LIMIT ?
+    `);
+    for (const { partner } of partners) {
+      const rows = stmt.all(username, username, partner, partner, username, countPerUser);
+      previews.push(...rows.reverse()); // chronological order
+    }
+    return previews;
+  } catch(e) {
+    console.error('[chat] DM preview failed:', e.message);
+    return [];
+  }
+}
+
+function chatGetDmHistory(username, withUser) {
+  try {
+    return chatDb.prepare(`
+      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, created_at
+      FROM dm_messages
+      WHERE owner = ? AND (
+        (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
+      )
+      ORDER BY created_at ASC
+    `).all(username, username, withUser, withUser, username);
+  } catch(e) {
+    console.error('[chat] DM history failed:', e.message);
+    return [];
+  }
+}
+
+function chatGetRoomHistory(roomName, username) {
+  try {
+    return chatDb.prepare(`
+      SELECT from_user, to_user, ciphertext, signature, timestamp, is_broadcast, created_at
+      FROM room_messages
+      WHERE room_name = ? AND (is_broadcast = 1 OR to_user = ? OR from_user = ?)
+      ORDER BY created_at ASC
+    `).all(roomName, username, username);
+  } catch(e) {
+    console.error('[chat] Room history failed:', e.message);
+    return [];
+  }
+}
+
+function chatDeleteRoom(roomName) {
+  try {
+    const info = chatDb.prepare(`DELETE FROM room_messages WHERE room_name = ?`).run(roomName);
+    if (info.changes > 0) console.log(`[chat] Deleted ${info.changes} messages for room #${roomName}`);
+  } catch(e) {
+    console.error('[chat] Room delete failed:', e.message);
+  }
+}
+
+function chatUpdateSeen(username) {
+  try {
+    chatDb.prepare(`
+      INSERT INTO user_seen (username, last_seen) VALUES (?, datetime('now'))
+      ON CONFLICT(username) DO UPDATE SET last_seen = datetime('now')
+    `).run(username);
+  } catch(e) {
+    console.error('[chat] Seen update failed:', e.message);
+  }
+}
+
+function chatCleanup() {
+  try {
+    const dmCutoff   = chatDb.prepare(`SELECT datetime('now', ?) as cutoff`).get(`-${DM_RETENTION_DAYS} days`).cutoff;
+    const roomCutoff = chatDb.prepare(`SELECT datetime('now', ?) as cutoff`).get(`-${ROOM_RETENTION_DAYS} days`).cutoff;
+    const dmDel   = chatDb.prepare(`DELETE FROM dm_messages WHERE created_at < ?`).run(dmCutoff);
+    const roomDel = chatDb.prepare(`DELETE FROM room_messages WHERE created_at < ?`).run(roomCutoff);
+    if (dmDel.changes || roomDel.changes) {
+      console.log(`[chat] Cleanup: removed ${dmDel.changes} DMs, ${roomDel.changes} room messages`);
+    }
+  } catch(e) {
+    console.error('[chat] Cleanup failed:', e.message);
+  }
+}
+
+// Run cleanup on startup and then every hour
+chatCleanup();
+setInterval(chatCleanup, 60 * 60 * 1000);
+
+// ── Ledger helpers ────────────────────────────────────────────────────────────
+
 function ledgerPayment(callId, type, fromUser, toUser, amount, memo = '', status = 'pending', txId = null) {
   try {
     db.prepare(`
@@ -123,7 +343,7 @@ function ledgerCallCreate(callId, caller, callee, callType = 'voice') {
 function ledgerCallUpdate(callId, fields) {
   const keys = Object.keys(fields);
   if (!keys.length) return;
-  const set = keys.map(k => k + ' = ?').join(', ');
+  const set  = keys.map(k => k + ' = ?').join(', ');
   const vals = [...keys.map(k => fields[k]), callId];
   try {
     db.prepare(`UPDATE calls SET ${set} WHERE call_id = ?`).run(...vals);
@@ -143,10 +363,13 @@ function ledgerPaymentUpdate(callId, type, status, txId = null) {
   }
 }
 
-console.log('[ledger] SQLite database ready:', path.join(LOG_DIR, 'v4call-ledger.db'));
 
-// ── Lobby ─────────────────────────────────────────────────────────────────────
-const lobbyUsers = {};
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Lobby & Rooms ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+const lobbyUsers = {}; // username → { socketId, pubKey, invisible, inCall? }
+const rooms      = {}; // roomName → { creator, allowlist(Set), members[], isCall?, callId?, ... }
 
 function lobbySnapshot() {
   return Object.entries(lobbyUsers)
@@ -154,9 +377,6 @@ function lobbySnapshot() {
     .map(([username, u]) => ({ username, socketId: u.socketId, pubKey: u.pubKey }));
 }
 function broadcastLobby() { io.emit('lobby-users', lobbySnapshot()); }
-
-// ── Rooms ─────────────────────────────────────────────────────────────────────
-const rooms = {};
 
 function roomsSnapshot() {
   return Object.entries(rooms).map(([name, r]) => ({
@@ -172,9 +392,66 @@ function roomsSnapshot() {
 }
 function broadcastRooms() { io.emit('lobby-rooms', roomsSnapshot()); }
 
-// ── Rate cache (TTL: 10 minutes) ──────────────────────────────────────────────
-const rateCache = {};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Rate Cache (10-minute TTL) ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+const rateCache     = {}; // username → { rates, fetchedAt }
 const RATE_CACHE_TTL = 10 * 60 * 1000;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Hive-Engine Token Balance (5-minute cache) ────────────────────────────────
+// Checks if a caller holds a specific Hive-Engine token (PIZZA, NOBLEMAGE, etc.)
+// Used for V2 TOKEN sections and ALLOW-IF-TOKEN bypass in BLOCKED section.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const tokenBalanceCache = {}; // key: "account:SYMBOL" → { balance, fetchedAt }
+const TOKEN_CACHE_TTL   = 5 * 60 * 1000; // 5 minutes — short enough to be responsive, long enough to avoid hammering the API
+
+async function getHiveEngineTokenBalance(account, symbol) {
+  const cacheKey = `${account}:${symbol}`;
+  const cached   = tokenBalanceCache[cacheKey];
+  if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL) {
+    return cached.balance;
+  }
+  try {
+    const res = await fetch('https://api.hive-engine.com/rpc/contracts', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        jsonrpc: '2.0',
+        id:      1,
+        method:  'find',
+        params:  { contract: 'tokens', table: 'balances', query: { account, symbol } }
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const data    = await res.json();
+    const balance = (data.result && data.result.length > 0)
+      ? parseFloat(data.result[0].balance) || 0
+      : 0;
+    tokenBalanceCache[cacheKey] = { balance, fetchedAt: Date.now() };
+    return balance;
+  } catch(e) {
+    console.warn(`[token] Balance check failed ${symbol}/@${account}: ${e.message}`);
+    return 0; // safe fallback — treat as not holding the token
+  }
+}
+
+// Clean expired token balance cache entries every 15 minutes
+setInterval(() => {
+  const cutoff = Date.now() - TOKEN_CACHE_TTL;
+  for (const k in tokenBalanceCache) {
+    if (tokenBalanceCache[k].fetchedAt < cutoff) delete tokenBalanceCache[k];
+  }
+}, 15 * 60 * 1000);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Hive Post Fetch (multi-node fallback) ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchRates(username) {
   const cached = rateCache[username];
@@ -182,13 +459,44 @@ async function fetchRates(username) {
     return cached.rates;
   }
   try {
-    // Try direct permlink first (most reliable — permlink is always 'v4call-rates')
-    const directRes = await fetch(HIVE_API, {
-      method: 'POST',
+    // ── Step 1: Blog search first ────────────────────────────────────────────
+    // The V2 rate editor posts with a timestamped permlink (v4call-rates-TIMESTAMP)
+    // rather than the fixed permlink 'v4call-rates' used by V1.
+    // Blog search sorted by date DESC ensures we always get the MOST RECENT
+    // rates post, regardless of which permlink was used.
+    const blogRes  = await fetch(HIVE_API, {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body:    JSON.stringify({
+        jsonrpc: '2.0', method: 'condenser_api.get_discussions_by_author_before_date',
+        params:  [username, '', '2099-01-01T00:00:00', 20], id: 1
+      })
+    });
+    const blogData = await blogRes.json();
+    if (blogData.result) {
+      // find() on a date-DESC list returns the most recent matching post first
+      const post = blogData.result.find(p =>
+        p.title.toLowerCase() === 'v4call-rates' && p.author === username
+      );
+      if (post) {
+        const rates = parseRates(post.body);
+        if (rates) {
+          rateCache[username] = { rates, fetchedAt: Date.now() };
+          console.log(`[rates] Loaded V${rates.version} for @${username} (permlink: ${post.permlink})`);
+          return rates;
+        }
+      }
+    }
+
+    // ── Step 2: Fallback — try the fixed permlink 'v4call-rates' ─────────────
+    // This catches V1 users who posted before the rate editor added timestamps,
+    // and any edge case where the blog search missed the post.
+    const directRes  = await fetch(HIVE_API, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
         jsonrpc: '2.0', method: 'condenser_api.get_content',
-        params: [username, 'v4call-rates'], id: 1
+        params:  [username, 'v4call-rates'], id: 1
       })
     });
     const directData = await directRes.json();
@@ -196,291 +504,430 @@ async function fetchRates(username) {
       const rates = parseRates(directData.result.body);
       if (rates) {
         rateCache[username] = { rates, fetchedAt: Date.now() };
-        console.log(`[rates] Fetched rates for @${username} via direct permlink`);
+        console.log(`[rates] Loaded V${rates.version} for @${username} (fallback direct permlink)`);
         return rates;
       }
     }
 
-    // Fallback: search recent blog posts for title 'v4call-rates'
-    // Handles cases where permlink was customised (e.g. 'v4call-rates-1234')
-    const blogRes  = await fetch(HIVE_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0', method: 'condenser_api.get_discussions_by_author_before_date',
-        params: [username, '', '2099-01-01T00:00:00', 20], id: 1
-      })
-    });
-    const blogData = await blogRes.json();
-    if (!blogData.result) return null;
-
-    // Find the most recent post whose title matches (case-insensitive)
-    const post = blogData.result.find(p =>
-      p.title.toLowerCase() === 'v4call-rates' && p.author === username
-    );
-    if (!post) {
-      console.log(`[rates] No v4call-rates post found for @${username}`);
-      return null;
-    }
-
-    const rates = parseRates(post.body);
-    if (rates) {
-      rateCache[username] = { rates, fetchedAt: Date.now() };
-      console.log(`[rates] Fetched rates for @${username} via blog search`);
-    }
-    return rates;
+    console.log(`[rates] No v4call-rates post found for @${username}`);
+    return null;
   } catch(e) {
     console.error(`[rates] Failed to fetch rates for @${username}:`, e.message);
     return null;
   }
 }
 
-// ── Rate Parser ───────────────────────────────────────────────────────────────
-// Parses [V4CALL-RATES-V1] format from a Hive post body
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Rate Parser — supports V1 and V2 format ───────────────────────────────────
+//
+// V1: [V4CALL-RATES-V1] ... [LIST:name] ... [/V4CALL-RATES-V1]
+// V2: Adds [BLOCKED], [TOKEN:SYMBOL], TEXT-SESSION, CHAIN, SERVER, NOSTR fields
+//
+// The parser detects the version tag automatically — no manual switch needed.
+// Old V1 posts continue to work unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
 function parseRates(body) {
+  // Result object — all fields have safe defaults
   const result = {
+    version:     'V1',
     account:     '',
-    platformFee: 0.10,
+    chain:       'hive',
+    server:      '',
+    nostr:       '',
+    platformFee: PLATFORM_FEE, // fall back to server default if not in post
     escrow:      ESCROW_ACCOUNT,
-    lists:       []
+    blocked:     { users: [], message: 'You have been blocked.', allowIfToken: null },
+    tokens:      [], // V2 only: [{ symbol, allowBlocked, text, voiceRing, voiceConnect, ... }]
+    lists:       []  // named lists (family, friends, work, default, etc.)
   };
 
-  // Check for the rates block
-  const blockMatch = body.match(/\[V4CALL-RATES-V1\]([\s\S]*?)\[\/V4CALL-RATES-V1\]/i);
+  // Detect version from opening tag
+  if (/\[V4CALL-RATES-V2\]/i.test(body)) result.version = 'V2';
+
+  // Extract the content between the outer block tags (accepts V1 or V2)
+  const blockMatch = body.match(/\[V4CALL-RATES-V[12]\]([\s\S]*?)\[\/V4CALL-RATES-V[12]\]/i);
   if (!blockMatch) return null;
   const block = blockMatch[1];
 
-  // Parse top-level fields
-  const accountMatch = block.match(/^ACCOUNT:(.+)$/m);
-  if (accountMatch) result.account = accountMatch[1].trim();
+  // ── Top-level identity / config fields ──────────────────────────────────────
+  const accountM = block.match(/^ACCOUNT:(.+)$/mi);
+  if (accountM) result.account = accountM[1].trim().toLowerCase();
 
-  const feeMatch = block.match(/^PLATFORM-FEE:(\d+(?:\.\d+)?)%/m);
-  if (feeMatch) result.platformFee = parseFloat(feeMatch[1]) / 100;
+  const chainM = block.match(/^CHAIN:(.+)$/mi);
+  if (chainM)   result.chain   = chainM[1].trim().toLowerCase();
 
-  const escrowMatch = block.match(/^ESCROW:(.+)$/m);
-  if (escrowMatch) result.escrow = escrowMatch[1].trim();
+  const serverM = block.match(/^SERVER:(.+)$/mi);
+  if (serverM)  result.server  = serverM[1].trim();
 
-  // Parse each LIST block
+  const nostrM = block.match(/^NOSTR:(.+)$/mi);
+  if (nostrM)   result.nostr   = nostrM[1].trim();
+
+  const feeM = block.match(/^PLATFORM-FEE:(\d+(?:\.\d+)?)%/mi);
+  if (feeM)     result.platformFee = parseFloat(feeM[1]) / 100;
+
+  const escrowM = block.match(/^ESCROW:(.+)$/mi);
+  if (escrowM)  result.escrow  = escrowM[1].trim();
+
+  // ── [BLOCKED] section (V2 only — safely ignored if absent) ──────────────────
+  const blockedMatch = block.match(/\[BLOCKED\]([\s\S]*?)\[\/BLOCKED\]/i);
+  if (blockedMatch) {
+    const b      = blockedMatch[1];
+    const usersM = b.match(/^USERS:(.+)$/mi);
+    if (usersM) {
+      result.blocked.users = usersM[1]
+        .split(',').map(u => u.trim().toLowerCase()).filter(Boolean);
+    }
+    const msgM = b.match(/^MESSAGE:(.+)$/mi);
+    if (msgM) result.blocked.message = msgM[1].trim();
+
+    const tokM = b.match(/^ALLOW-IF-TOKEN:(.+)$/mi);
+    if (tokM) result.blocked.allowIfToken = tokM[1].trim().toUpperCase();
+  }
+
+  // ── [TOKEN:SYMBOL] sections (V2 only) ───────────────────────────────────────
+  // Each token section defines rates that apply if the caller holds that token.
+  // The first token section where the caller has a balance > 0 wins.
+  const tokenRegex = /\[TOKEN:([^\]]+)\]([\s\S]*?)\[\/TOKEN\]/gi;
+  let tokenMatch;
+  while ((tokenMatch = tokenRegex.exec(block)) !== null) {
+    const symbol      = tokenMatch[1].trim().toUpperCase();
+    const tBody       = tokenMatch[2];
+    const rates       = parseRateBlock(tBody);
+    const allowBlocked = /^ALLOW-BLOCKED:\s*yes/mi.test(tBody); // can this token bypass a block?
+    result.tokens.push({ symbol, allowBlocked, ...rates });
+  }
+
+  // ── [LIST:name] sections (V1 and V2) ────────────────────────────────────────
+  // Each list has an optional USERS: line and one or more time windows.
+  // [LIST:default] is the fallback for anyone not matched above.
   const listRegex = /\[LIST:([^\]]+)\]([\s\S]*?)\[\/LIST\]/gi;
   let listMatch;
   while ((listMatch = listRegex.exec(block)) !== null) {
-    const listName = listMatch[1].trim();
+    const listName = listMatch[1].trim().toLowerCase();
     const listBody = listMatch[2];
+    const list     = { name: listName, users: [], windows: [] };
 
-    const list = { name: listName, users: [], windows: [] };
-
-    // Parse USERS line
-    const usersMatch = listBody.match(/^USERS:(.+)$/m);
-    if (usersMatch) {
-      list.users = usersMatch[1].split(',').map(u => u.trim().toLowerCase()).filter(Boolean);
+    const usersM = listBody.match(/^USERS:(.+)$/mi);
+    if (usersM) {
+      list.users = usersM[1].split(',').map(u => u.trim().toLowerCase()).filter(Boolean);
     }
 
-    // Parse TIME windows within this list
+    // [DAYS:...][TIME:HH:MM-HH:MM] ... [/TIME] windows within this list
     const timeRegex = /\[DAYS:([^\]]+)\]\[TIME:([^\]]+)\]([\s\S]*?)\[\/TIME\]/gi;
-    let timeMatch;
-    while ((timeMatch = timeRegex.exec(listBody)) !== null) {
-      const daysStr  = timeMatch[1].trim();
-      const timeStr  = timeMatch[2].trim();
-      const timeBody = timeMatch[3];
-
-      // Parse days
-      const days = parseDays(daysStr);
-
-      // Parse time range
-      const timeParts = timeStr.split('-');
-      const timeStart = timeParts[0]?.trim() || '00:00';
-      const timeEnd   = timeParts[1]?.trim() || '23:59';
-
-      // Parse rates
-      const window = { days, timeStart, timeEnd };
-
-      const textMatch = timeBody.match(/^TEXT:(.+)$/m);
-      if (textMatch) window.text = parseHbd(textMatch[1]);
-
-      const voiceMatch = timeBody.match(/^VOICE:(.+)$/m);
-      if (voiceMatch) {
-        const v = parseRateLine(voiceMatch[1]);
-        window.voiceRing         = v.ring;
-        window.voiceConnect      = v.connect;
-        window.voiceRate         = v.rate;
-        window.voiceMinDepMin    = v.minDepositMin;
-        window.voiceMinDepHbd    = v.minDepositHbd;
-      }
-
-      const videoMatch = timeBody.match(/^VIDEO:(.+)$/m);
-      if (videoMatch) {
-        const v = parseRateLine(videoMatch[1]);
-        window.videoRing         = v.ring;
-        window.videoConnect      = v.connect;
-        window.videoRate         = v.rate;
-        window.videoMinDepMin    = v.minDepositMin;
-        window.videoMinDepHbd    = v.minDepositHbd;
-      }
-
-      list.windows.push(window);
+    let timeM;
+    while ((timeM = timeRegex.exec(listBody)) !== null) {
+      const timeParts = timeM[2].trim().split('-');
+      const win = {
+        days:      parseDays(timeM[1].trim()),
+        timeStart: timeParts[0]?.trim() || '00:00',
+        timeEnd:   timeParts[1]?.trim() || '23:59',
+        ...parseRateBlock(timeM[3])
+      };
+      list.windows.push(win);
     }
-
     result.lists.push(list);
   }
 
   return result;
 }
 
-function parseDays(daysStr) {
-  const ALL_DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
-  if (daysStr === 'mon-sun') return ALL_DAYS;
-  if (daysStr === 'mon-fri') return ['mon','tue','wed','thu','fri'];
-  if (daysStr === 'sat-sun') return ['sat','sun'];
-  return daysStr.split(',').map(d => d.trim().toLowerCase());
+// ── parseRateBlock ────────────────────────────────────────────────────────────
+// Parses TEXT, TEXT-SESSION, VOICE and VIDEO lines from inside a window or token block.
+// Returns a flat object with all rate fields at safe 0 defaults.
+
+function parseRateBlock(body) {
+  const r = {
+    text:              0,
+    textSession:       0,
+    voiceRing:         0, voiceConnect:    0, voiceRate:         0,
+    voiceMinDepositMin: 10, voiceMinDepositHbd: null,
+    videoRing:         0, videoConnect:    0, videoRate:         0,
+    videoMinDepositMin: 10, videoMinDepositHbd: null
+  };
+
+  const textM = body.match(/^TEXT:(.+)$/mi);
+  if (textM) r.text = parseHbdOrFree(textM[1]);
+
+  const tsM = body.match(/^TEXT-SESSION:(.+)$/mi);
+  if (tsM) r.textSession = parseHbdOrFree(tsM[1]);
+
+  const voiceM = body.match(/^VOICE:(.+)$/mi);
+  if (voiceM) Object.assign(r, parseVoiceVideoLine(voiceM[1], 'voice'));
+
+  const videoM = body.match(/^VIDEO:(.+)$/mi);
+  if (videoM) Object.assign(r, parseVoiceVideoLine(videoM[1], 'video'));
+
+  return r;
 }
 
-function parseHbd(str) {
-  const m = str.match(/([\d.]+)\s*HBD/i);
+// ── parseVoiceVideoLine ───────────────────────────────────────────────────────
+// Parses a VOICE: or VIDEO: rate line into named fields.
+// prefix is 'voice' or 'video'.
+// Handles both numeric values and the FREE keyword.
+
+function parseVoiceVideoLine(line, prefix) {
+  const obj    = {};
+  const isFree = (v) => v && v.toUpperCase() === 'FREE';
+
+  const ringM    = line.match(/RING:([\d.]+|FREE)/i);
+  if (ringM)    obj[`${prefix}Ring`]    = isFree(ringM[1])    ? 0 : parseFloat(ringM[1]);
+
+  const connectM = line.match(/CONNECT:([\d.]+|FREE)/i);
+  if (connectM) obj[`${prefix}Connect`] = isFree(connectM[1]) ? 0 : parseFloat(connectM[1]);
+
+  const rateM    = line.match(/RATE:([\d.]+|FREE)/i);
+  if (rateM)    obj[`${prefix}Rate`]    = isFree(rateM[1])    ? 0 : parseFloat(rateM[1]);
+
+  // MIN-DEPOSIT can be: MIN-DEPOSIT:10min  or  MIN-DEPOSIT:0.500 HBD
+  const minDepM  = line.match(/MIN-DEPOSIT:([\d.]+)\s*(min|HBD)/i);
+  if (minDepM) {
+    const val  = parseFloat(minDepM[1]);
+    const unit = minDepM[2].toUpperCase();
+    if (unit === 'HBD') obj[`${prefix}MinDepositHbd`] = val;
+    else                obj[`${prefix}MinDepositMin`]  = val;
+  }
+
+  return obj;
+}
+
+// ── parseHbdOrFree ────────────────────────────────────────────────────────────
+// Extracts a numeric HBD value from a string, treating FREE and 0 as 0.
+
+function parseHbdOrFree(str) {
+  const s = str.trim().toUpperCase();
+  // Handle FREE and FREE/hr (rate editor appends /hr on session fields)
+  if (s === 'FREE' || s.startsWith('FREE/')) return 0;
+  const m = str.match(/([\d.]+)/);
   return m ? parseFloat(m[1]) : 0;
 }
 
-function parseRateLine(str) {
-  const ring       = str.match(/RING:([\d.]+)\s*HBD/i);
-  const connect    = str.match(/CONNECT:([\d.]+)\s*HBD/i);
-  const rate       = str.match(/RATE:([\d.]+)\s*HBD/i);
-  // MIN-DEPOSIT can be specified as minutes: MIN-DEPOSIT:10min
-  // or as a fixed HBD amount: MIN-DEPOSIT:0.500 HBD
-  const minDepMin  = str.match(/MIN-DEPOSIT:([\d.]+)\s*min/i);
-  const minDepHbd  = str.match(/MIN-DEPOSIT:([\d.]+)\s*HBD/i);
-  return {
-    ring:         ring      ? parseFloat(ring[1])      : 0,
-    connect:      connect   ? parseFloat(connect[1])   : 0,
-    rate:         rate      ? parseFloat(rate[1])      : 0,
-    minDepositMin: minDepMin ? parseFloat(minDepMin[1]) : null,  // minutes
-    minDepositHbd: minDepHbd ? parseFloat(minDepHbd[1]) : null   // fixed HBD
-  };
+// ── parseDays ─────────────────────────────────────────────────────────────────
+// Converts a DAYS string into an array of lowercase day abbreviations.
+// Supports: 'mon-sun', 'mon-fri', 'sat-sun', or comma-separated 'mon,wed,fri'
+
+function parseDays(daysStr) {
+  const ALL = ['mon','tue','wed','thu','fri','sat','sun'];
+  if (daysStr === 'mon-sun') return [...ALL];
+  if (daysStr === 'mon-fri') return ALL.slice(0, 5); // ['mon','tue','wed','thu','fri']
+  if (daysStr === 'sat-sun') return ['sat', 'sun'];
+  return daysStr.split(',').map(d => d.trim().toLowerCase());
 }
 
-// ── Calculate minimum deposit amount ─────────────────────────────────────────
-// Returns the HBD amount caller must deposit upfront for call credit
+// ── timeInWindow ──────────────────────────────────────────────────────────────
+// Returns true if timeStr (HH:MM) falls within [start, end].
+// Handles windows that cross midnight (e.g. 23:00-07:00).
+
+function timeInWindow(timeStr, start, end) {
+  if (start <= end) return timeStr >= start && timeStr <= end;
+  return timeStr >= start || timeStr <= end; // crosses midnight
+}
+
+// ── calcMinDeposit ────────────────────────────────────────────────────────────
+// Returns the HBD amount a caller must pre-pay before a call connects.
+// Fixed HBD amount takes priority over minutes-based calculation.
+
 function calcMinDeposit(ratePerHour, minDepositMin, minDepositHbd) {
-  // Fixed HBD amount takes priority
   if (minDepositHbd && minDepositHbd > 0) return minDepositHbd;
-  // Minutes-based deposit
-  const minutes = minDepositMin || 10; // default 10 minutes
+  const minutes = minDepositMin || 10; // default: 10 minutes
   return parseFloat(((ratePerHour / 60) * minutes).toFixed(3));
 }
 
-// ── Rate Lookup ───────────────────────────────────────────────────────────────
-// Given a callee's rates, caller's username, call type, and current time,
-// return the applicable rates object
-function getRatesForCaller(rates, callerUsername, callType, now) {
-  if (!rates || !rates.lists.length) return null;
+// ── buildCallRateResult ───────────────────────────────────────────────────────
+// Converts a raw parsed rate block (window or token block) into the response
+// object shape that index.html and the payment handlers expect.
+// Keeps the API contract stable regardless of whether rates come from a
+// time window or a token section.
 
-  const dayName  = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
-  const timeStr  = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
-
-  // Find which list the caller belongs to (first match wins)
-  // Default list has no users array — it's the fallback
-  let matchedList = null;
-  for (const list of rates.lists) {
-    if (list.name === 'default') continue; // check default last
-    if (list.users.includes(callerUsername)) { matchedList = list; break; }
+function buildCallRateResult(rateBlock, callType, escrow, platformFee) {
+  if (callType === 'text') {
+    return {
+      type:        'text',
+      flat:        rateBlock.text        || 0,
+      textSession: rateBlock.textSession || 0,
+      escrow,
+      platformFee
+    };
   }
-  if (!matchedList) {
-    matchedList = rates.lists.find(l => l.name === 'default');
+  const prefix      = callType === 'video' ? 'video' : 'voice';
+  const ratePerHour = rateBlock[`${prefix}Rate`]    || 0;
+  const minDeposit  = calcMinDeposit(
+    ratePerHour,
+    rateBlock[`${prefix}MinDepositMin`],
+    rateBlock[`${prefix}MinDepositHbd`]
+  );
+  return {
+    type:          callType,
+    ring:          rateBlock[`${prefix}Ring`]    || 0,
+    connect:       rateBlock[`${prefix}Connect`] || 0,
+    rate:          ratePerHour,
+    minDeposit,
+    minDepositMin: rateBlock[`${prefix}MinDepositMin`] || 10,
+    escrow,
+    platformFee
+  };
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Rate Resolver — 5-step priority (V2) / 3-step (V1 fallback) ───────────────
+//
+// Priority order:
+//   1. BLOCKED list  → block (unless caller holds ALLOW-IF-TOKEN token)
+//   2. TOKEN sections → apply token rates if caller holds the token
+//   3. Named lists    → first list containing the caller's username
+//   4. Default list   → fallback for everyone else
+//   5. No rates found → free call
+//
+// Returns: { type, ring, connect, rate, minDeposit, escrow, platformFee }
+//          { blocked: true, message: '...' }
+//          null  (free call)
+//
+// This function is async because token checks hit the Hive-Engine API.
+// All call sites must await it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice', now = new Date()) {
+  if (!calleeRates) return null;
+
+  const caller  = callerUsername.toLowerCase();
+  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
+  const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+  const { escrow } = calleeRates;
+
+  // ── Platform fee enforcement ───────────────────────────────────────────────
+  // Callee's posted fee must meet or exceed the server's minimum.
+  // If it does, callee gets the best price (server's minimum, not their higher posted fee).
+  const calleeFee = calleeRates.platformFee;
+  const serverFee = PLATFORM_FEE;
+  const platformFee = serverFee; // always charge the server's rate (best price for callee)
+
+  if (typeof calleeFee === 'number' && calleeFee < serverFee) {
+    const calleePct = (calleeFee * 100).toFixed(1);
+    const serverPct = (serverFee * 100).toFixed(1);
+    return {
+      feeRejected: true,
+      message: `@${calleeRates.account || 'this user'}'s platform fee (${calleePct}%) is below this server's minimum (${serverPct}%). They need to set PLATFORM-FEE to at least ${serverPct}% in their rates post to receive paid contacts on this server.`
+    };
   }
-  if (!matchedList) return null;
 
-  // Find the matching time window
-  for (const window of matchedList.windows) {
-    if (!window.days.includes(dayName)) continue;
-    if (!timeInWindow(timeStr, window.timeStart, window.timeEnd)) continue;
+  // ── Step 1: BLOCKED check ──────────────────────────────────────────────────
+  if (calleeRates.blocked && calleeRates.blocked.users.includes(caller)) {
+    const bypassToken = calleeRates.blocked.allowIfToken;
+    let bypassed      = false;
 
-    if (callType === 'text') {
-      return { type: 'text', flat: window.text || 0, escrow: rates.escrow, platformFee: rates.platformFee };
+    if (bypassToken) {
+      const bal = await getHiveEngineTokenBalance(caller, bypassToken);
+      if (bal > 0) {
+        console.log(`[rates] Block bypass: @${caller} holds ${bypassToken} (bal: ${bal})`);
+        bypassed = true;
+        // If bypassed, apply that token's rates directly (skip normal token loop)
+        const tokSection = (calleeRates.tokens || []).find(t => t.symbol === bypassToken);
+        if (tokSection) {
+          console.log(`[rates] Applying ${bypassToken} token rates for bypassed @${caller}`);
+          return { currency: bypassToken, ...buildCallRateResult(tokSection, callType, escrow, platformFee) };
+        }
+      }
     }
-    if (callType === 'voice') {
-      const r = window.voiceRate || 0;
-      const deposit = calcMinDeposit(r, window.voiceMinDepMin, window.voiceMinDepHbd);
-      return { type: 'voice',
-               ring: window.voiceRing || 0,
-               connect: window.voiceConnect || 0,
-               rate: r,
-               minDeposit: deposit,
-               minDepositMin: window.voiceMinDepMin || 10,
-               escrow: rates.escrow,
-               platformFee: rates.platformFee };
+
+    if (!bypassed) {
+      return { blocked: true, message: calleeRates.blocked.message || 'You have been blocked.' };
     }
-    if (callType === 'video') {
-      const r = window.videoRate || 0;
-      const deposit = calcMinDeposit(r, window.videoMinDepMin, window.videoMinDepHbd);
-      return { type: 'video',
-               ring: window.videoRing || 0,
-               connect: window.videoConnect || 0,
-               rate: r,
-               minDeposit: deposit,
-               minDepositMin: window.videoMinDepMin || 10,
-               escrow: rates.escrow,
-               platformFee: rates.platformFee };
+    // If bypassed but no matching token section, fall through to list matching
+  }
+
+  // ── Step 2: TOKEN sections ─────────────────────────────────────────────────
+  // First token section where the caller holds a balance > 0 wins.
+  for (const tok of (calleeRates.tokens || [])) {
+    const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
+    if (bal > 0) {
+      console.log(`[rates] @${caller} qualifies for ${tok.symbol} token rates (bal: ${bal})`);
+      return { currency: tok.symbol, ...buildCallRateResult(tok, callType, escrow, platformFee) };
     }
   }
 
+  // ── Step 3: Named lists (first match wins, default excluded) ──────────────
+  for (const list of (calleeRates.lists || [])) {
+    if (list.name === 'default') continue;
+    if (!list.users.includes(caller)) continue;
+    const win = list.windows.find(w =>
+      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+    );
+    if (win) {
+      console.log(`[rates] @${caller} matched list "${list.name}"`);
+      return { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+    }
+  }
+
+  // ── Step 4: Default list ───────────────────────────────────────────────────
+  const defList = (calleeRates.lists || []).find(l => l.name === 'default');
+  if (defList) {
+    const win = defList.windows.find(w =>
+      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+    );
+    if (win) {
+      return { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+    }
+  }
+
+  // ── Step 5: No rates apply → free call ────────────────────────────────────
   return null;
 }
 
-function timeInWindow(time, start, end) {
-  // Handle windows that cross midnight (e.g. 23:00-07:00)
-  if (start <= end) {
-    return time >= start && time <= end;
-  } else {
-    return time >= start || time <= end;
-  }
-}
 
+// ─────────────────────────────────────────────────────────────────────────────
 // ── Payment tracking ──────────────────────────────────────────────────────────
 // activePayments: callId → { caller, callee, ringPaid, depositPaid, creditRemaining,
-//                            startTime, ratePerHour, escrow, platformFee, _processing }
+//                            connectPaid, startTime, ratePerHour, escrow, platformFee, _processing }
+// ─────────────────────────────────────────────────────────────────────────────
+
 const activePayments = {};
 
-// ── Credit burn engine ────────────────────────────────────────────────────────
-// Tracks remaining credit per call and disconnects when exhausted
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Credit Burn Engine ────────────────────────────────────────────────────────
+// Tracks remaining call credit and disconnects when exhausted.
+// Fires warnings at 5 minutes and 2 minutes remaining.
+// ─────────────────────────────────────────────────────────────────────────────
+
 const creditTimers = {}; // callId → intervalId
 
 function startCreditBurn(callId, roomName) {
   const payment = activePayments[callId];
-  if (!payment || !payment.ratePerHour) return; // free call — no burn needed
+  if (!payment || !payment.ratePerHour) return; // free call — nothing to burn
 
-  const ratePerMs  = payment.ratePerHour / (60 * 60 * 1000);
-  let   warned5    = false;
-  let   warned2    = false;
+  const ratePerMs = payment.ratePerHour / (60 * 60 * 1000);
+  let warned5     = false;
+  let warned2     = false;
 
   creditTimers[callId] = setInterval(async () => {
     const p = activePayments[callId];
     if (!p) { clearInterval(creditTimers[callId]); return; }
 
-    const elapsed  = Date.now() - (p.startTime || Date.now());
-    const burned   = elapsed * ratePerMs;
-    p.creditRemaining = Math.max(0, (p.depositPaid || 0) - burned);
+    const elapsed         = Date.now() - (p.startTime || Date.now());
+    const burned          = elapsed * ratePerMs;
+    p.creditRemaining     = Math.max(0, (p.depositPaid || 0) - burned);
+    const minLeft         = p.creditRemaining / (p.ratePerHour / 60);
 
-    const minLeft  = p.creditRemaining / (p.ratePerHour / 60);
-
-    // 5-minute warning
     if (!warned5 && minLeft <= 5 && minLeft > 2) {
       warned5 = true;
       io.to(roomName).emit('credit-warning', {
         minutesLeft: parseFloat(minLeft.toFixed(1)),
         creditLeft:  parseFloat(p.creditRemaining.toFixed(3)),
-        level: '5min'
+        level:       '5min'
       });
     }
 
-    // 2-minute warning
     if (!warned2 && minLeft <= 2 && minLeft > 0) {
       warned2 = true;
       io.to(roomName).emit('credit-warning', {
         minutesLeft: parseFloat(minLeft.toFixed(1)),
         creditLeft:  parseFloat(p.creditRemaining.toFixed(3)),
-        level: '2min'
+        level:       '2min'
       });
     }
 
-    // Credit exhausted — disconnect
     if (p.creditRemaining <= 0) {
       clearInterval(creditTimers[callId]);
       delete creditTimers[callId];
@@ -488,7 +935,7 @@ function startCreditBurn(callId, roomName) {
       io.to(roomName).emit('credit-exhausted', { callId });
       await processCallEnd(callId, roomName, io, lobbyUsers, 'credit_exhausted');
     }
-  }, 10000); // check every 10 seconds — fine enough for warnings
+  }, 10000); // check every 10 seconds
 }
 
 function stopCreditBurn(callId) {
@@ -498,9 +945,14 @@ function stopCreditBurn(callId) {
   }
 }
 
-// callCooldowns: "caller->callee" → timestamp of last attempt
-// Prevents spam-ringing the same user
-const callCooldowns = {};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Call Cooldown ─────────────────────────────────────────────────────────────
+// Prevents spam-ringing the same user on free calls.
+// Paid ring attempts bypass this — the ring fee is their skin in the game.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const callCooldowns = {}; // "caller->callee" → timestamp of last attempt
 
 function checkCallCooldown(caller, callee) {
   const key  = `${caller}->${callee}`;
@@ -513,7 +965,7 @@ function checkCallCooldown(caller, callee) {
   return { allowed: true };
 }
 
-// Clean up cooldowns older than 5 minutes
+// Clean up entries older than 5 minutes
 setInterval(() => {
   const cutoff = Date.now() - 5 * 60 * 1000;
   for (const k in callCooldowns) {
@@ -521,15 +973,19 @@ setInterval(() => {
   }
 }, 60000);
 
-// ── Hive API helper — tries multiple nodes ────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Hive API Helper — tries multiple nodes ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function hivePost(body, nodes = HIVE_API_NODES) {
   for (const node of nodes) {
     try {
-      const res = await fetch(node, {
-        method: 'POST',
+      const res  = await fetch(node, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(8000)
+        body:    JSON.stringify(body),
+        signal:  AbortSignal.timeout(8000)
       });
       const data = await res.json();
       if (data.result !== undefined) return data;
@@ -540,7 +996,11 @@ async function hivePost(body, nodes = HIVE_API_NODES) {
   return null;
 }
 
-// ── Check escrow HBD balance ───────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Escrow Helpers ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function getEscrowBalance() {
   const data = await hivePost({
     jsonrpc: '2.0', method: 'condenser_api.get_accounts',
@@ -551,8 +1011,12 @@ async function getEscrowBalance() {
   return parseFloat(hbd.split(' ')[0]);
 }
 
-// ── Send from escrow with balance check ───────────────────────────────────────
 async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null) {
+  // Route token transfers to the Hive-Engine path
+  if (currency !== 'HBD' && currency !== 'HIVE') {
+    return sendFromEscrowToken(to, amount, memo, currency, callId);
+  }
+
   const escrowKey = process.env.V4CALL_ESCROW_KEY;
   if (!escrowKey) {
     console.error('[escrow] V4CALL_ESCROW_KEY not set — cannot disburse');
@@ -564,7 +1028,6 @@ async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null)
     return { success: true, skipped: true };
   }
 
-  // Check escrow has sufficient balance
   const balance = await getEscrowBalance();
   if (balance < amount) {
     console.error(`[escrow] Insufficient balance: have ${balance} HBD, need ${amount} HBD for @${to}`);
@@ -573,32 +1036,122 @@ async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null)
   }
 
   try {
-    // Use top-level required dhive (not dynamic import — avoids ESM/CJS mismatch)
     const client    = new dhive.Client(HIVE_API_NODES);
     const key       = dhive.PrivateKey.fromString(escrowKey);
     const amountStr = amount.toFixed(3) + ' ' + currency;
 
-    console.log(`[escrow] Attempting transfer: ${amountStr} from @${ESCROW_ACCOUNT} to @${to}`);
-    console.log(`[escrow] Memo: ${memo}`);
-
+    console.log(`[escrow] Transfer: ${amountStr} → @${to} | memo: ${memo}`);
     const result = await client.broadcast.transfer({
       from: ESCROW_ACCOUNT, to, amount: amountStr, memo
     }, key);
 
-    console.log(`[escrow] ✓ SUCCESS — Sent ${amountStr} to @${to} — tx: ${result.id}`);
+    console.log(`[escrow] ✓ Sent ${amountStr} to @${to} — tx: ${result.id}`);
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', result.id);
     return { success: true, txId: result.id, amount: amountStr };
   } catch(e) {
-    console.error(`[escrow] ✗ TRANSFER FAILED to @${to}:`);
-    console.error(`[escrow]   Amount: ${amount} ${currency}`);
-    console.error(`[escrow]   Error:  ${e.message}`);
-    console.error(`[escrow]   Stack:  ${e.stack}`);
+    console.error(`[escrow] ✗ TRANSFER FAILED to @${to}: ${e.message}`);
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
     return { success: false, reason: e.message };
   }
 }
 
-// ── Process call end — calculate bill, disburse, send receipts ─────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Hive-Engine Token Transfers (for custom token payments) ──────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getEscrowTokenBalance(symbol) {
+  try {
+    const bal = await getHiveEngineTokenBalance(ESCROW_ACCOUNT, symbol);
+    return bal;
+  } catch(e) {
+    console.error(`[escrow-token] Balance check failed for ${symbol}: ${e.message}`);
+    return 0;
+  }
+}
+
+async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
+  const escrowKey = process.env.V4CALL_ESCROW_KEY;
+  if (!escrowKey) {
+    console.error('[escrow-token] V4CALL_ESCROW_KEY not set — cannot disburse');
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
+    return { success: false, reason: 'Escrow key not configured' };
+  }
+  if (amount < 0.001) {
+    console.log(`[escrow-token] Amount ${amount} too small — skipping transfer to @${to}`);
+    return { success: true, skipped: true };
+  }
+
+  const balance = await getEscrowTokenBalance(symbol);
+  if (balance < amount) {
+    console.error(`[escrow-token] Insufficient ${symbol} balance: have ${balance}, need ${amount} for @${to}`);
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
+    return { success: false, reason: `Escrow ${symbol} balance insufficient (${balance} available)` };
+  }
+
+  try {
+    const client = new dhive.Client(HIVE_API_NODES);
+    const key    = dhive.PrivateKey.fromString(escrowKey);
+    const json   = JSON.stringify({
+      contractName:   'tokens',
+      contractAction: 'transfer',
+      contractPayload: {
+        symbol,
+        to,
+        quantity: amount.toFixed(8).replace(/\.?0+$/, ''), // Hive-Engine uses variable precision
+        memo
+      }
+    });
+
+    console.log(`[escrow-token] Transfer: ${amount} ${symbol} → @${to} | memo: ${memo}`);
+    const result = await client.broadcast.json({
+      required_auths:         [ESCROW_ACCOUNT],
+      required_posting_auths: [],
+      id:                     'ssc-mainnet-hive',
+      json
+    }, key);
+
+    console.log(`[escrow-token] ✓ Sent ${amount} ${symbol} to @${to} — tx: ${result.id}`);
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', result.id);
+    return { success: true, txId: result.id, amount: `${amount} ${symbol}` };
+  } catch(e) {
+    console.error(`[escrow-token] ✗ TOKEN TRANSFER FAILED to @${to}: ${e.message}`);
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
+    return { success: false, reason: e.message };
+  }
+}
+
+async function verifyHiveEnginePayment(fromUser, toUser, amount, symbol, memo, retries = PAYMENT_VERIFY_RETRIES) {
+  // Hive-Engine doesn't expose transferHistory via the contracts RPC reliably.
+  // Instead, we verify by checking that the escrow account holds enough of the token.
+  // The payment was already signed via Keychain — we trust the client-side broadcast
+  // succeeded if the escrow balance reflects the expected amount.
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const bal = await getHiveEngineTokenBalance(toUser, symbol);
+      if (bal >= amount - 0.001) {
+        console.log(`[payment] ✓ Verified ${symbol} balance on @${toUser}: ${bal} (need ${amount}) — attempt ${attempt}`);
+        // Clear the balance cache so next check is fresh
+        delete tokenBalanceCache[`${toUser}:${symbol}`];
+        return true;
+      }
+      console.warn(`[payment] HE verify attempt ${attempt}/${retries} — @${toUser} ${symbol} balance: ${bal}, need: ${amount}`);
+      // Clear cache to get fresh balance on next attempt
+      delete tokenBalanceCache[`${toUser}:${symbol}`];
+    } catch(e) {
+      console.warn(`[payment] HE verify attempt ${attempt}/${retries} error:`, e.message);
+    }
+    if (attempt < retries) await new Promise(r => setTimeout(r, PAYMENT_VERIFY_DELAY_MS));
+  }
+  console.error(`[payment] ✗ HE payment verification failed after ${retries} attempts`);
+  return false;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Call End — calculate bill, disburse from escrow, send receipts ────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unknown') {
   const payment = activePayments[callId];
   if (!payment) {
@@ -610,42 +1163,35 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     return;
   }
   payment._processing = true;
-  stopCreditBurn(callId); // Stop the credit burn timer
+  stopCreditBurn(callId);
 
   const now         = Date.now();
   const startTime   = payment.startTime || now;
   const durationMs  = payment.startTime ? (now - startTime) : 0;
-  // Cap duration at MAX_CALL_DURATION_MIN
   const durationMin = Math.min(durationMs / 60000, MAX_CALL_DURATION_MIN);
   const durationHr  = durationMin / 60;
 
-  const ratePerHour  = payment.ratePerHour  || 0;
-  const depositPaid  = payment.depositPaid  || 0;  // credit deposit (refundable portion)
-  const connectPaid  = payment.connectPaid  || 0;  // connect fee paid upfront in combined payment
-  const ringPaid     = payment.ringPaid     || 0;  // ring fee (non-refundable, goes to platform)
-  const platformFee  = payment.platformFee  || 0.10;
+  const ratePerHour = payment.ratePerHour || 0;
+  const depositPaid = payment.depositPaid || 0;
+  const connectPaid = payment.connectPaid || 0;
+  const ringPaid    = payment.ringPaid    || 0;
+  const platformFee = payment.platformFee || 0.10;
+  const currency    = payment.currency    || 'HBD';
 
   // ── Money flow ──────────────────────────────────────────────────────────────
-  // Total received by escrow = ringPaid + connectPaid + depositPaid
-  // ring fee    → platform (non-refundable service charge)
-  // connect fee → callee (non-refundable answer fee, minus platform %)
-  // deposit     → duration cost to callee, remainder refunded to caller
+  // Total received = ring + connect + deposit
+  // ring fee       → platform (non-refundable interrupt cost)
+  // connect fee    → callee (non-refundable answer fee, minus platform %)
+  // deposit        → duration cost to callee; unused portion refunded to caller
 
-  // Duration charge (prorated, capped at deposit)
   const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(3));
-
-  // Unused deposit → refund to caller
   const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(3));
-
-  // Callee earns: connect fee + duration cost, minus platform %
   const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(3));
   const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(3));
   const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(3));
-
-  // Platform earns: ring fee (flat) + % of callee earnings
   const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(3));
 
-  // Verify escrow accounting (should sum to 0)
+  // Sanity check
   const totalIn  = ringPaid + connectPaid + depositPaid;
   const totalOut = calleeNet + refundAmount + platformTotal;
   const delta    = parseFloat((totalIn - totalOut).toFixed(3));
@@ -654,31 +1200,21 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   }
 
   console.log(`[billing] Call ${callId} ended (${endReason})`);
-  console.log(`[billing]   Duration:    ${durationMin.toFixed(2)} min`);
-  console.log(`[billing]   Ring paid:   ${ringPaid} HBD → platform`);
-  console.log(`[billing]   Connect:     ${connectPaid} HBD → callee`);
-  console.log(`[billing]   Duration $:  ${durationCost} HBD → callee`);
-  console.log(`[billing]   Refund:      ${refundAmount} HBD → caller`);
-  console.log(`[billing]   Platform:    ${platformTotal} HBD (ring + ${platformOnCall.toFixed(3)} cut)`);
-  console.log(`[billing]   Callee net:  ${calleeNet} HBD`);
+  console.log(`[billing]   Duration:   ${durationMin.toFixed(2)} min`);
+  console.log(`[billing]   Ring:       ${ringPaid} ${currency} → platform`);
+  console.log(`[billing]   Connect:    ${connectPaid} ${currency} → callee`);
+  console.log(`[billing]   Duration $: ${durationCost} ${currency} → callee`);
+  console.log(`[billing]   Refund:     ${refundAmount} ${currency} → caller`);
+  console.log(`[billing]   Platform:   ${platformTotal} ${currency}`);
+  console.log(`[billing]   Callee net: ${calleeNet} ${currency}`);
 
   const receipt = {
     callId,
-    caller:         payment.caller,
-    callee:         payment.callee,
-    startTime:      new Date(startTime).toISOString(),
-    endTime:        new Date(now).toISOString(),
-    durationMin:    parseFloat(durationMin.toFixed(2)),
-    ringPaid,
-    connectPaid,
-    depositPaid,
-    durationCost,
-    refundAmount,
-    calleeNet,
-    platformTotal,
-    platformOnCall,
-    currency:       'HBD',
-    endReason
+    caller: payment.caller, callee: payment.callee,
+    startTime: new Date(startTime).toISOString(), endTime: new Date(now).toISOString(),
+    durationMin: parseFloat(durationMin.toFixed(2)),
+    ringPaid, connectPaid, depositPaid, durationCost, refundAmount,
+    calleeNet, platformTotal, platformOnCall, currency, endReason
   };
 
   // Update SQLite ledger
@@ -694,7 +1230,6 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     end_reason:    endReason
   });
 
-  // Send receipts
   const callerSid = lobbyUsers[payment.caller]?.socketId;
   const calleeSid = lobbyUsers[payment.callee]?.socketId;
   if (callerSid) io.to(callerSid).emit('call-receipt', { ...receipt, perspective: 'caller' });
@@ -702,29 +1237,27 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
 
   // ── Disburse from escrow ────────────────────────────────────────────────────
 
-  // 1. Callee payout (connect fee + duration cost, minus platform %)
+  // 1. Callee payout
   if (calleeNet >= 0.001) {
     const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
     ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
-    const result = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, 'HBD', callId);
+    const result = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
     if (!result.success) {
       console.error(`[billing] Callee payout FAILED to @${payment.callee}: ${result.reason}`);
       if (calleeSid) io.to(calleeSid).emit('payout-failed', { amount: calleeNet, reason: result.reason, callId });
     } else {
       ledgerPaymentUpdate(callId, 'payout', 'sent', result.txId);
     }
-  } else {
-    console.log(`[billing] Callee payout skipped (${calleeNet} HBD < 0.001 minimum)`);
   }
 
   // 2. Refund unused deposit to caller
   if (refundAmount >= 0.001) {
     const refundMemo = `v4call:refund:${callId}:unused-credit`;
     ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
-    const refundResult = await sendFromEscrow(payment.caller, refundAmount, refundMemo, 'HBD', callId);
+    const refundResult = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
     if (refundResult.success) {
       ledgerPaymentUpdate(callId, 'refund', 'sent', refundResult.txId);
-      console.log(`[billing] Refunded ${refundAmount} HBD to @${payment.caller}`);
+      console.log(`[billing] Refunded ${refundAmount} ${currency} to @${payment.caller}`);
     } else {
       console.error(`[billing] Refund FAILED to @${payment.caller}: ${refundResult.reason}`);
       if (callerSid) io.to(callerSid).emit('payout-failed', {
@@ -734,14 +1267,14 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     }
   }
 
-  // 3. Platform fee (ring fee + % cut of call earnings)
+  // 3. Platform fee (ring fee + % cut)
   if (platformTotal >= 0.001) {
-    const feeMemo = `v4call:fee:${callId}:ring+cut`;
-    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, 'v4call', platformTotal, feeMemo, 'pending');
-    const feeResult = await sendFromEscrow('v4call', platformTotal, feeMemo, 'HBD', callId);
+    const feeMemo   = `v4call:fee:${callId}:ring+cut`;
+    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
+    const feeResult = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
     if (feeResult.success) {
       ledgerPaymentUpdate(callId, 'platform_fee', 'sent', feeResult.txId);
-      console.log(`[billing] Platform fee sent: ${platformTotal} HBD`);
+      console.log(`[billing] Platform fee sent: ${platformTotal} ${currency}`);
     } else {
       console.error(`[billing] Platform fee FAILED: ${feeResult.reason}`);
     }
@@ -749,6 +1282,11 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
 
   delete activePayments[callId];
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Payment Verification — checks Hive blockchain for a transfer ──────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function verifyHivePayment(fromUser, toUser, amount, memo, retries = PAYMENT_VERIFY_RETRIES) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -760,15 +1298,15 @@ async function verifyHivePayment(fromUser, toUser, amount, memo, retries = PAYME
       if (!data?.result) {
         console.warn(`[payment] verify attempt ${attempt}/${retries} — no result`);
       } else {
-        const cutoff = Date.now() - (5 * 60 * 1000); // within last 5 minutes
+        const cutoff = Date.now() - (5 * 60 * 1000);
         for (const [, op] of data.result) {
           if (op.op[0] !== 'transfer') continue;
           const t = op.op[1];
-          if (t.from !== fromUser)           continue;
-          if (t.to   !== toUser)             continue;
-          if (!t.memo.includes(memo))        continue;
+          if (t.from !== fromUser)    continue;
+          if (t.to   !== toUser)      continue;
+          if (!t.memo.includes(memo)) continue;
           const txTime   = new Date(op.timestamp + 'Z').getTime();
-          if (txTime < cutoff)               continue;
+          if (txTime < cutoff)        continue;
           const txAmount = parseFloat(t.amount.split(' ')[0]);
           if (txAmount >= amount - 0.001) {
             console.log(`[payment] ✓ Verified ${amount} HBD from @${fromUser} (attempt ${attempt})`);
@@ -780,15 +1318,19 @@ async function verifyHivePayment(fromUser, toUser, amount, memo, retries = PAYME
     } catch(e) {
       console.warn(`[payment] verify attempt ${attempt}/${retries} error:`, e.message);
     }
-    // Wait before retry (except on last attempt)
     if (attempt < retries) await new Promise(r => setTimeout(r, PAYMENT_VERIFY_DELAY_MS));
   }
   console.error(`[payment] ✗ Payment not found after ${retries} attempts`);
   return false;
 }
 
-// ── Tokens ────────────────────────────────────────────────────────────────────
-const tokens = {};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Join Tokens (room access, not Hive-Engine tokens) ─────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+const tokens = {}; // short-lived room join tokens: token → { username, pubKey, roomName, expires }
+
 function generateToken(username, pubKey, roomName) {
   const token   = crypto.randomBytes(24).toString('hex');
   tokens[token] = { username, pubKey, roomName, expires: Date.now() + 30000 };
@@ -800,7 +1342,11 @@ function consumeToken(token) {
   delete tokens[token];
   return t;
 }
-setInterval(() => { const now = Date.now(); for (const k in tokens) if (tokens[k].expires < now) delete tokens[k]; }, 60000);
+// Clean up expired join tokens
+setInterval(() => {
+  const now = Date.now();
+  for (const k in tokens) if (tokens[k].expires < now) delete tokens[k];
+}, 60000);
 
 app.get('/join-token', (req, res) => {
   const t = consumeToken(req.query.token);
@@ -808,10 +1354,14 @@ app.get('/join-token', (req, res) => {
   res.json({ username: t.username, pubKey: t.pubKey, roomName: t.roomName });
 });
 
-// ── Admin ledger endpoint (protected by secret key) ──────────────────────────
-// Usage: GET /admin/ledger?key=YOUR_ADMIN_KEY&limit=50
-// Usage: GET /admin/ledger/calls?key=YOUR_ADMIN_KEY&status=ended
-// Set ADMIN_KEY env variable in your systemd service
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Admin & Debug Endpoints ───────────────────────────────────────────────────
+// Set ADMIN_KEY in your .env — endpoints return 403 without it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /admin/ledger?key=ADMIN_KEY&limit=50
+// GET /admin/ledger?key=ADMIN_KEY&call_id=CALL_ID
 app.get('/admin/ledger', (req, res) => {
   const adminKey = process.env.ADMIN_KEY;
   if (!adminKey || req.query.key !== adminKey) {
@@ -843,7 +1393,7 @@ app.get('/admin/ledger', (req, res) => {
   }
 });
 
-// Escrow balance check endpoint
+// GET /admin/balance?key=ADMIN_KEY
 app.get('/admin/balance', async (req, res) => {
   const adminKey = process.env.ADMIN_KEY;
   if (!adminKey || req.query.key !== adminKey) return res.status(403).json({ error: 'Forbidden' });
@@ -851,7 +1401,7 @@ app.get('/admin/balance', async (req, res) => {
   res.json({ account: ESCROW_ACCOUNT, balance_hbd: balance });
 });
 
-// ── Debug endpoint ────────────────────────────────────────────────────────────
+// GET /debug-state — shows current lobby and room state (no auth, safe info only)
 app.get('/debug-state', (req, res) => {
   res.json({
     lobbyUsers: Object.entries(lobbyUsers).map(([username, u]) => ({
@@ -864,31 +1414,36 @@ app.get('/debug-state', (req, res) => {
   });
 });
 
-// ── Debug: see exactly what rates were parsed for a user ─────────────────────
+// GET /debug-rates/:username?caller=x&type=voice
+// Shows the full parsed rate structure for a user, plus what rates a caller would receive.
+// Useful for testing rate posts without making actual calls.
+// Clears cache so you always get a fresh fetch.
 app.get('/debug-rates/:username', async (req, res) => {
-  // Clear cache first so we always get fresh data
   delete rateCache[req.params.username];
   const rates = await fetchRates(req.params.username);
   if (!rates) {
     return res.json({
-      found: false,
-      message: `No v4call-rates post found for @${req.params.username}. Make sure the post exists with title exactly "v4call-rates" and contains a [V4CALL-RATES-V1] block.`
+      found:   false,
+      message: `No v4call-rates post found for @${req.params.username}. ` +
+               `Make sure the post exists with title "v4call-rates" and contains a [V4CALL-RATES-V1] or [V4CALL-RATES-V2] block.`
     });
   }
-  // Also show what rates a specific caller would get right now
-  const caller     = req.query.caller || 'unknown';
-  const callType   = req.query.type   || 'voice';
-  const applicable = getRatesForCaller(rates, caller, callType, new Date());
-  res.json({ found: true, rates, applicable, testedWith: { caller, callType, time: new Date().toISOString() } });
+  const caller    = req.query.caller || 'unknown';
+  const callType  = req.query.type   || 'voice';
+  const applicable = await getRatesForCaller(rates, caller, callType, new Date());
+  res.json({ found: true, version: rates.version, rates, applicable, testedWith: { caller, callType, time: new Date().toISOString() } });
 });
 
-// ── Rate endpoint (client can fetch callee rates before showing cost) ─────────
+// GET /rates/:username — client fetches callee rates before showing payment modal
 app.get('/rates/:username', async (req, res) => {
   const rates = await fetchRates(req.params.username);
   if (!rates) return res.json({ found: false });
   res.json({ found: true, rates });
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Socket.io — Connection Handler ────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 io.on('connection', (socket) => {
@@ -897,19 +1452,39 @@ io.on('connection', (socket) => {
   // ── LOBBY ──────────────────────────────────────────────────────────────────
 
   socket.on('lobby-join', ({ username, pubKey }) => {
-    socket._username  = username;
-    socket._pubKey    = pubKey;
-    socket._invisible = false;
-    socket._room      = null;
+    socket._username    = username;
+    socket._pubKey      = pubKey;
+    socket._invisible   = false;
+    socket._room        = null;
     socket._pendingCall = null;
 
-    const prev = lobbyUsers[username];
+    const prev          = lobbyUsers[username];
     lobbyUsers[username] = { socketId: socket.id, pubKey, invisible: prev ? prev.invisible : false };
 
-    socket.emit('lobby-users',  lobbySnapshot());
-    socket.emit('lobby-rooms',  roomsSnapshot());
+    socket.emit('lobby-users', lobbySnapshot());
+    socket.emit('lobby-rooms', roomsSnapshot());
     broadcastLobby();
     broadcastRooms();
+
+    // ── DM unread summary ──────────────────────────────────────────────────
+    const unread = chatGetDmUnread(username);
+    if (unread.length > 0) {
+      const totalMessages = unread.reduce((sum, r) => sum + r.cnt, 0);
+      const fromUsers     = unread.map(r => r.from_user);
+      socket.emit('dm-unread-summary', { totalMessages, fromUsers });
+    }
+
+    // ── DM previews (last N per conversation) ──────────────────────────────
+    if (DM_PREVIEW_COUNT > 0) {
+      const previews = chatGetDmPreviews(username, DM_PREVIEW_COUNT);
+      if (previews.length > 0) {
+        socket.emit('dm-previews', previews);
+      }
+    }
+
+    // Update last_seen
+    chatUpdateSeen(username);
+
     console.log(`@${username} entered lobby`);
   });
 
@@ -929,28 +1504,162 @@ io.on('connection', (socket) => {
     io.emit('lobby-chat', { from, message, signature, timestamp });
   });
 
-  socket.on('lobby-dm', ({ to, ciphertext, signature, timestamp }) => {
+  // ── LOBBY DM — rate-checked and payment-enforced ──────────────────────────
+  // Free DMs: emitted with no payment fields → relayed immediately.
+  // ── LOBBY ENCRYPTED — toggle path ─────────────────────────────────────────
+  // Sent when a user has another user toggled on in the lobby user list.
+  // Ephemeral: server only relays, no billing, no storage, no verification.
+  // The ciphertext is encrypted with the recipient's public key — server never sees plaintext.
+
+  socket.on('lobby-encrypted', ({ to, ciphertext, senderCiphertext, signature, timestamp }) => {
     const from = socket._username;
     if (!from) return;
     const recipient = lobbyUsers[to];
-    if (!recipient) { socket.emit('lobby-dm-error', `@${to} is not online`); return; }
-    io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp });
-    socket.emit('lobby-dm-sent', { to });
+    if (!recipient) return; // silently drop — recipient went offline
+    io.to(recipient.socketId).emit('lobby-encrypted', { from, ciphertext, signature, timestamp });
+
+    // Store in chat DB (both copies)
+    chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, 0);
+  });
+
+  // ── LOBBY DM — paid direct message path ───────────────────────────────────
+  // Paid DMs: client sends { msgId, textPaid, textMemo } after Keychain approval.
+  //           Server verifies on-chain before relaying, then disburses to recipient.
+  // Blocked senders are rejected server-side regardless of client state.
+
+  socket.on('lobby-dm', async ({ to, ciphertext, senderCiphertext, signature, timestamp, msgId, textPaid, textMemo, textCurrency }) => {
+    const from = socket._username;
+    if (!from) return;
+
+    const recipient = lobbyUsers[to];
+    if (!recipient) {
+      socket.emit('lobby-dm-error', `@${to} is not online`);
+      return;
+    }
+
+    // Fetch recipient's rates and resolve applicable text rate for this sender
+    const calleeRates = await fetchRates(to);
+    const applicable  = calleeRates
+      ? await getRatesForCaller(calleeRates, from, 'text', new Date())
+      : null;
+
+    // Enforce block list server-side — client check is UX only
+    if (applicable?.blocked) {
+      socket.emit('lobby-dm-error', `🚫 ${applicable.message || 'You have been blocked by this user.'}`);
+      return;
+    }
+
+    // Enforce platform fee minimum
+    if (applicable?.feeRejected) {
+      socket.emit('lobby-dm-error', `⚠ ${applicable.message}`);
+      return;
+    }
+
+    const textRate = applicable?.flat || 0;
+    const cur      = textCurrency || applicable?.currency || 'HBD';
+
+    if (textRate >= 0.001) {
+      // ── Payment required ─────────────────────────────────────────────────
+      if (!textPaid || !textMemo || !msgId) {
+        socket.emit('lobby-dm-payment-required', {
+          to,
+          rate:     textRate,
+          currency: cur,
+          escrow:   calleeRates?.escrow || ESCROW_ACCOUNT
+        });
+        return;
+      }
+
+      // Verify the transfer — route to correct verifier based on currency
+      const ok = (cur !== 'HBD' && cur !== 'HIVE')
+        ? await verifyHiveEnginePayment(from, ESCROW_ACCOUNT, textPaid, cur, textMemo)
+        : await verifyHivePayment(from, ESCROW_ACCOUNT, textPaid, textMemo);
+      if (!ok) {
+        socket.emit('lobby-dm-error', `Payment not found on blockchain — message not sent. Funds are safe if ${cur} left your account.`);
+        return;
+      }
+
+      ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, textPaid, textMemo, 'verified');
+
+      // ── Disburse ─────────────────────────────────────────────────────────
+      const platformFee  = applicable.platformFee || PLATFORM_FEE;
+      const platformCut  = parseFloat((textPaid * platformFee).toFixed(3));
+      const recipientNet = parseFloat((textPaid - platformCut).toFixed(3));
+
+      if (recipientNet >= 0.001) {
+        const payoutMemo = `v4call:text-payout:${msgId}`;
+        ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
+        sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+          if (r.success) {
+            ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+            io.to(recipient.socketId).emit('text-payment-received', {
+              from, amount: recipientNet, currency: cur, msgId
+            });
+          } else {
+            console.error(`[text] Payout failed to @${to}: ${r.reason}`);
+          }
+        });
+      }
+
+      if (platformCut >= 0.001) {
+        const feeMemo = `v4call:text-fee:${msgId}`;
+        ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
+        sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+          if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+        });
+      }
+
+      console.log(`[text] @${from} → @${to}: paid ${textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
+    }
+
+    // ── Relay the message ─────────────────────────────────────────────────
+    io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0 });
+    socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0 });
+
+    // ── Store in chat DB (both copies) ────────────────────────────────────
+    chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, textPaid || 0);
+  });
+
+  // ── DM HISTORY (on demand) ───────────────────────────────────────────────
+  socket.on('dm-history', ({ withUser }, cb) => {
+    const username = socket._username;
+    if (!username || !withUser) return cb ? cb([]) : null;
+    const history = chatGetDmHistory(username, withUser);
+    if (cb) cb(history);
+    else socket.emit('dm-history', { withUser, messages: history });
+  });
+
+  // ── DM MARK READ ─────────────────────────────────────────────────────────
+  socket.on('dm-mark-read', () => {
+    const username = socket._username;
+    if (username) chatUpdateSeen(username);
   });
 
   // ── RATE QUERY ─────────────────────────────────────────────────────────────
-  // Client requests callee's rates before initiating a call
+  // Client requests callee's applicable rates before initiating a call.
+  // Returns: { found, free, rates, escrow } or { found, free: true } or { error }
+  // NOTE: getRatesForCaller is async (may check Hive-Engine token balances)
+
   socket.on('get-rates', async ({ callee, callType }, cb) => {
     const caller = socket._username;
     if (!caller || !callee || !callType) return cb({ error: 'Missing parameters' });
 
     const rates = await fetchRates(callee);
     if (!rates) {
-      // No rates found — callee has no v4call-rates post, call is free
+      // No rates post found → free call
       return cb({ found: false, free: true });
     }
 
-    const applicable = getRatesForCaller(rates, caller, callType, new Date());
+    const applicable = await getRatesForCaller(rates, caller, callType, new Date());
+
+    if (applicable?.blocked) {
+      return cb({ found: true, blocked: true, message: applicable.message });
+    }
+
+    if (applicable?.feeRejected) {
+      return cb({ found: true, feeRejected: true, message: applicable.message });
+    }
+
     if (!applicable) {
       return cb({ found: true, free: true });
     }
@@ -958,80 +1667,179 @@ io.on('connection', (socket) => {
     cb({ found: true, free: false, rates: applicable, escrow: rates.escrow || ESCROW_ACCOUNT });
   });
 
+  // ── ALL RATE OPTIONS (for payment picker) ──────────────────────────────────
+  // Returns every qualifying payment option so the client can show a choice.
+  socket.on('get-all-rates', async ({ callee, callType }, cb) => {
+    const caller = socket._username;
+    if (!caller || !callee || !callType) return cb({ error: 'Missing parameters' });
+
+    const rates = await fetchRates(callee);
+    if (!rates) return cb({ found: false, free: true });
+
+    const now     = new Date();
+    const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
+    const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+    const { escrow } = rates;
+
+    // ── Platform fee enforcement ─────────────────────────────────────────────
+    const calleeFee = rates.platformFee;
+    const serverFee = PLATFORM_FEE;
+    const platformFee = serverFee; // best price for callee
+
+    if (typeof calleeFee === 'number' && calleeFee < serverFee) {
+      const calleePct = (calleeFee * 100).toFixed(1);
+      const serverPct = (serverFee * 100).toFixed(1);
+      return cb({
+        found: true, feeRejected: true,
+        message: `@${callee}'s platform fee (${calleePct}%) is below this server's minimum (${serverPct}%). They need to set PLATFORM-FEE to at least ${serverPct}% in their rates post to receive paid contacts on this server.`
+      });
+    }
+
+    // Check blocked
+    if (rates.blocked && rates.blocked.users.includes(caller.toLowerCase())) {
+      const bypassToken = rates.blocked.allowIfToken;
+      let bypassed = false;
+      if (bypassToken) {
+        const bal = await getHiveEngineTokenBalance(caller, bypassToken);
+        if (bal > 0) bypassed = true;
+      }
+      if (!bypassed) {
+        return cb({ found: true, blocked: true, message: rates.blocked.message || 'You have been blocked.' });
+      }
+    }
+
+    const options = [];
+
+    // Collect all token options the caller qualifies for
+    for (const tok of (rates.tokens || [])) {
+      const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
+      if (bal > 0) {
+        const built = buildCallRateResult(tok, callType, escrow, platformFee);
+        options.push({ currency: tok.symbol, balance: bal, ...built });
+      }
+    }
+
+    // Collect HBD default rate (from named lists or default list)
+    const callerLower = caller.toLowerCase();
+    let hbdOption = null;
+
+    // Named lists first
+    for (const list of (rates.lists || [])) {
+      if (list.name === 'default') continue;
+      if (!list.users.includes(callerLower)) continue;
+      const win = list.windows.find(w =>
+        w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+      );
+      if (win) {
+        hbdOption = { currency: 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
+        break;
+      }
+    }
+
+    // Default list fallback
+    if (!hbdOption) {
+      const defList = (rates.lists || []).find(l => l.name === 'default');
+      if (defList) {
+        const win = defList.windows.find(w =>
+          w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+        );
+        if (win) {
+          hbdOption = { currency: 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
+        }
+      }
+    }
+
+    if (hbdOption) options.push(hbdOption);
+
+    if (options.length === 0) {
+      return cb({ found: true, free: true });
+    }
+
+    // Mark the "best" (auto-selected) option — first token match, or HBD
+    if (options.length > 0) options[0]._recommended = true;
+
+    cb({ found: true, free: false, options, escrow: escrow || ESCROW_ACCOUNT });
+  });
+
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
-  // Caller tells server they've paid the ring fee — server verifies on blockchain
-  socket.on('verify-ring-payment', async ({ callId, callee, amount, memo }, cb) => {
+
+  socket.on('verify-ring-payment', async ({ callId, callee, amount, memo, currency }, cb) => {
     const caller = socket._username;
     if (!caller) return cb({ verified: false, reason: 'Not authenticated' });
+    const cur = currency || 'HBD';
 
-    console.log(`[payment] Verifying ring payment: @${caller} paid ${amount} HBD (memo: ${memo})`);
-    const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
+    console.log(`[payment] Verifying ring payment: @${caller} paid ${amount} ${cur} (memo: ${memo})`);
+    const ok = (cur !== 'HBD' && cur !== 'HIVE')
+      ? await verifyHiveEnginePayment(caller, ESCROW_ACCOUNT, amount, cur, memo)
+      : await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
 
     if (ok) {
-      // Store payment record
       if (!activePayments[callId]) activePayments[callId] = {};
-      activePayments[callId].ringPaid   = amount;
-      activePayments[callId].ringMemo   = memo;
-      activePayments[callId].caller     = caller;
-      activePayments[callId].callee     = callee;
+      activePayments[callId].ringPaid = amount;
+      activePayments[callId].ringMemo = memo;
+      activePayments[callId].caller   = caller;
+      activePayments[callId].callee   = callee;
+      activePayments[callId].currency = cur;
+
       // Fetch and store rate info for billing at call end
       const rates = await fetchRates(callee);
       if (rates) {
-        const applicable = getRatesForCaller(rates, caller, 'voice', new Date());
-        if (applicable) {
-          activePayments[callId].ratePerHour  = applicable.rate       || 0;
-          activePayments[callId].minDeposit   = applicable.minDeposit || 0;
-          activePayments[callId].platformFee  = rates.platformFee     || 0.10;
+        const applicable = await getRatesForCaller(rates, caller, 'voice', new Date());
+        if (applicable && !applicable.blocked) {
+          activePayments[callId].ratePerHour = applicable.rate       || 0;
+          activePayments[callId].minDeposit  = applicable.minDeposit || 0;
+          activePayments[callId].platformFee = rates.platformFee     || PLATFORM_FEE;
         }
       }
-      console.log(`[payment] Ring fee verified for call ${callId} — rate: ${activePayments[callId].ratePerHour} HBD/hr`);
+      console.log(`[payment] Ring fee verified for ${callId} — rate: ${activePayments[callId].ratePerHour} ${cur}/hr`);
     }
 
     cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
   });
 
-  // ── DIRECT CALLS ───────────────────────────────────────────────────────────
-
-  // Verify combined deposit payment (ring + connect + credit deposit in one transfer)
-  socket.on('verify-deposit-payment', async ({ callId, callee, totalAmount, depositAmount, connectAmount, memo }, cb) => {
+  socket.on('verify-deposit-payment', async ({ callId, callee, totalAmount, depositAmount, connectAmount, memo, currency }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false, reason: 'Not authenticated' });
+    const cur = currency || 'HBD';
 
-    console.log(`[payment] Verifying deposit: @${caller} paid ${totalAmount} HBD (memo: ${memo})`);
-    const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, totalAmount, memo);
+    console.log(`[payment] Verifying deposit: @${caller} paid ${totalAmount} ${cur} (memo: ${memo})`);
+    const ok = (cur !== 'HBD' && cur !== 'HIVE')
+      ? await verifyHiveEnginePayment(caller, ESCROW_ACCOUNT, totalAmount, cur, memo)
+      : await verifyHivePayment(caller, ESCROW_ACCOUNT, totalAmount, memo);
 
     if (ok) {
       if (!activePayments[callId]) activePayments[callId] = {};
-      activePayments[callId].depositPaid     = depositAmount;   // credit portion (refundable)
-      activePayments[callId].connectPaid     = connectAmount || 0; // connect fee (to callee)
+      activePayments[callId].depositPaid     = depositAmount;
+      activePayments[callId].connectPaid     = connectAmount || 0;
       activePayments[callId].creditRemaining = depositAmount;
       activePayments[callId].caller          = caller;
       activePayments[callId].callee          = callee;
-      console.log(`[payment] ✓ Deposit verified for call ${callId}: total=${totalAmount} connect=${connectAmount} deposit=${depositAmount} HBD`);
+      activePayments[callId].currency        = cur;
+      console.log(`[payment] ✓ Deposit verified ${callId}: total=${totalAmount} connect=${connectAmount} deposit=${depositAmount} ${cur}`);
       ledgerPayment(callId, 'deposit', caller, ESCROW_ACCOUNT, totalAmount, memo, 'verified');
     }
 
     if (cb) cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
   });
 
-  // Add top-up credit during an active call
   socket.on('verify-topup-payment', async ({ callId, amount, memo }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false });
     const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
     if (ok && activePayments[callId]) {
-      activePayments[callId].depositPaid     = (activePayments[callId].depositPaid || 0) + amount;
+      activePayments[callId].depositPaid     = (activePayments[callId].depositPaid     || 0) + amount;
       activePayments[callId].creditRemaining = (activePayments[callId].creditRemaining || 0) + amount;
       const minLeft = activePayments[callId].creditRemaining / ((activePayments[callId].ratePerHour || 0) / 60);
       const room    = socket._room;
-      if (room) io.to(room).emit('credit-topup', { amount, creditRemaining: activePayments[callId].creditRemaining, minutesLeft: minLeft });
+      if (room) io.to(room).emit('credit-topup', {
+        amount, creditRemaining: activePayments[callId].creditRemaining, minutesLeft: minLeft
+      });
       ledgerPayment(callId, 'topup', caller, ESCROW_ACCOUNT, amount, memo, 'verified');
       console.log(`[payment] Top-up ${amount} HBD for call ${callId}`);
     }
     if (cb) cb({ verified: ok });
   });
 
-  // Verify connect fee payment (called after caller pays connect fee via Keychain)
   socket.on('verify-connect-payment', async ({ callId, callee, amount, memo }) => {
     const caller = socket._username;
     if (!caller) return;
@@ -1039,24 +1847,24 @@ io.on('connection', (socket) => {
     const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
     if (ok) {
       activePayments[callId].connectPaid = amount;
-      console.log(`[payment] Connect fee verified for call ${callId}: ${amount} HBD`);
+      console.log(`[payment] Connect fee verified for ${callId}: ${amount} HBD`);
     }
   });
 
   // ── CALL END (explicit hang-up) ────────────────────────────────────────────
+
   socket.on('call-end', async ({ callId }) => {
     const username = socket._username;
     const room     = socket._room;
     if (room && rooms[room]) {
-      const r = rooms[room];
-      // Notify the other party
       socket.to(room).emit('peer-hung-up', { by: username });
-      // Process billing
-      const cid = r.callId || callId;
+      const cid = rooms[room].callId || callId;
       if (cid) await processCallEnd(cid, room, io, lobbyUsers);
     }
     console.log(`📵 @${username} ended call`);
   });
+
+  // ── DIRECT CALL — initiate ─────────────────────────────────────────────────
 
   socket.on('call-user', ({ callee, callType, ringFeePaid, callId }) => {
     const caller = socket._username;
@@ -1067,10 +1875,8 @@ io.on('connection', (socket) => {
 
     const getSocketId = (username) => lobbyUsers[username]?.socketId;
 
-    // Rate limit — cooldown between calls to same callee
-    if (ringFeePaid === 0 || !ringFeePaid) {
-      // Only apply cooldown to free ring attempts, not paid ones
-      // (paid ring attempts already have skin in the game)
+    // Free-ring cooldown (paid rings bypass this — ring fee is the skin in the game)
+    if (!ringFeePaid || ringFeePaid === 0) {
       const cool = checkCallCooldown(caller, callee);
       if (!cool.allowed) {
         const waitSec = Math.ceil(cool.waitMs / 1000);
@@ -1079,23 +1885,25 @@ io.on('connection', (socket) => {
       }
     }
 
+    // Callee must be online
     if (!lobbyUsers[callee]) {
-      // Callee went offline — refund ring fee if already paid
       if (ringFeePaid && ringFeePaid > 0 && callId) {
+        // Callee went offline between rate check and ring — refund ring fee
         const refundMemo = `v4call:refund:${callId}:offline`;
         ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending');
         sendFromEscrow(caller, ringFeePaid, refundMemo, 'HBD', callId).then(r => {
-          if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
           const msg = r.success
             ? `@${callee} is offline. Ring fee of ${ringFeePaid.toFixed(3)} HBD refunded.`
             : `@${callee} is offline. Refund of ${ringFeePaid.toFixed(3)} HBD pending — contact support.`;
           socket.emit('call-failed', { reason: msg, refunded: r.success });
+          if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
         });
       } else {
         socket.emit('call-failed', { reason: `@${callee} is not online.` });
       }
       return;
     }
+
     if (lobbyUsers[callee]?.inCall) {
       socket.emit('call-failed', { reason: `@${callee} is already in a call.` });
       return;
@@ -1105,9 +1913,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const roomName = `call__${caller}__${callee}__${Date.now()}`;
-
+    const roomName        = `call__${caller}__${callee}__${Date.now()}`;
     const effectiveCallId = callId || roomName;
+
     rooms[roomName] = {
       creator:   caller,
       allowlist: new Set([caller, callee]),
@@ -1118,7 +1926,6 @@ io.on('connection', (socket) => {
       callId:    effectiveCallId
     };
 
-    // Log call initiation to SQLite
     ledgerCallCreate(effectiveCallId, caller, callee, callType || 'voice');
     ledgerCallUpdate(effectiveCallId, { status: 'ringing' });
     if (ringFeePaid > 0) {
@@ -1128,22 +1935,16 @@ io.on('connection', (socket) => {
 
     if (lobbyUsers[caller]) lobbyUsers[caller].inCall = roomName;
     if (lobbyUsers[callee]) lobbyUsers[callee].inCall = roomName;
-
     socket._pendingCall = { roomName, callee };
 
     const calleeSid = getSocketId(callee);
     console.log(`📞 @${caller} → @${callee} (${callType}) room: ${roomName}`);
-    console.log(`📞 callee socketId: ${calleeSid || 'NOT FOUND'}`);
 
     if (calleeSid) {
       io.to(calleeSid).emit('incoming-call', {
-        caller,
-        callerPubKey: socket._pubKey,
-        roomName,
-        callType: callType || 'voice',
-        ringFeePaid: ringFeePaid || 0
+        caller, callerPubKey: socket._pubKey,
+        roomName, callType: callType || 'voice', ringFeePaid: ringFeePaid || 0
       });
-      console.log(`📞 incoming-call sent to @${callee}`);
     } else {
       socket.emit('call-failed', { reason: `@${callee} is online but unreachable. Ask them to refresh.` });
       delete rooms[roomName];
@@ -1154,6 +1955,7 @@ io.on('connection', (socket) => {
 
     socket.emit('call-ringing', { callee, roomName });
 
+    // 30-second ring timeout → missed call
     const timer = setTimeout(() => {
       if (rooms[roomName] && rooms[roomName].members.length === 0) {
         delete rooms[roomName];
@@ -1164,7 +1966,7 @@ io.on('connection', (socket) => {
         const calleeSidNow = getSocketId(callee);
         if (calleeSidNow) io.to(calleeSidNow).emit('call-missed', { caller, roomName });
         broadcastRooms();
-        console.log(`⏰ Call timed out: @${caller} → @${callee}`);
+        console.log(`⏰ Timed out: @${caller} → @${callee}`);
       }
     }, 30000);
 
@@ -1185,11 +1987,10 @@ io.on('connection', (socket) => {
       socket.emit('call-accepted', { caller, roomName });
       const now = Date.now();
       if (activePayments[room.callId]) activePayments[room.callId].startTime = now;
-      // Log connection to SQLite
       ledgerCallUpdate(room.callId, { connected_at: new Date(now).toISOString(), status: 'connected' });
-      // Start credit burn engine
       startCreditBurn(room.callId, roomName);
-      // Duration cap timer
+
+      // Duration cap — disconnect when max call length reached
       const capMs   = MAX_CALL_DURATION_MIN * 60 * 1000;
       const warnMs  = Math.max(0, (MAX_CALL_DURATION_MIN - 5) * 60 * 1000);
       const capTimer = setTimeout(async () => {
@@ -1239,7 +2040,10 @@ io.on('connection', (socket) => {
   socket.on('room-create', ({ roomName, invitees }) => {
     const creator = socket._username;
     if (!creator) return;
-    if (rooms[roomName]) { socket.emit('room-create-error', `Room "${roomName}" already exists.`); return; }
+    if (rooms[roomName]) {
+      socket.emit('room-create-error', `Room "${roomName}" already exists.`);
+      return;
+    }
     const allowlist = new Set([creator, ...invitees]);
     rooms[roomName] = { creator, allowlist, members: [], createdAt: new Date() };
     for (const invitee of invitees) {
@@ -1277,6 +2081,13 @@ io.on('connection', (socket) => {
     const everyone = rooms[room].members.map(u => ({ socketId: u.socketId, username: u.username, pubKey: u.pubKey }));
     socket.emit('room-users', everyone);
     socket.emit('room-info', { creator: rooms[room].creator, allowlist: [...rooms[room].allowlist] });
+
+    // Send room history (broadcasts + messages encrypted to this user)
+    const history = chatGetRoomHistory(room, username);
+    if (history.length > 0) {
+      socket.emit('room-history', history);
+    }
+
     socket.to(room).emit('user-joined', { socketId: socket.id, username, pubKey });
     broadcastRooms();
     console.log(`@${username} joined #${room} (${rooms[room].members.length} members)`);
@@ -1314,13 +2125,13 @@ io.on('connection', (socket) => {
     socket.emit('room-users-resync', everyone);
   });
 
-  // ── WEBRTC ─────────────────────────────────────────────────────────────────
+  // ── WebRTC Signalling ──────────────────────────────────────────────────────
 
-  socket.on('offer',         ({ to, offer })      => { io.to(to).emit('offer',         { from: socket.id, offer }); });
-  socket.on('answer',        ({ to, answer })     => { io.to(to).emit('answer',        { from: socket.id, answer }); });
-  socket.on('ice-candidate', ({ to, candidate })  => { io.to(to).emit('ice-candidate', { from: socket.id, candidate }); });
+  socket.on('offer',         ({ to, offer })     => { io.to(to).emit('offer',         { from: socket.id, offer }); });
+  socket.on('answer',        ({ to, answer })    => { io.to(to).emit('answer',        { from: socket.id, answer }); });
+  socket.on('ice-candidate', ({ to, candidate }) => { io.to(to).emit('ice-candidate', { from: socket.id, candidate }); });
 
-  // ── ROOM CHAT ──────────────────────────────────────────────────────────────
+  // ── Room Chat ──────────────────────────────────────────────────────────────
 
   socket.on('chat-message', ({ room, to, from, ciphertext, broadcast, signature, timestamp }) => {
     if (broadcast) {
@@ -1331,6 +2142,8 @@ io.on('connection', (socket) => {
       if (!recipient) return;
       io.to(recipient.socketId).emit('chat-message', { from, to, ciphertext, broadcast: false, signature, timestamp });
     }
+    // Store in chat DB
+    chatStoreRoomMsg(room, from, to, ciphertext, signature, timestamp, broadcast);
   });
 
   // ── DISCONNECT ─────────────────────────────────────────────────────────────
@@ -1339,6 +2152,7 @@ io.on('connection', (socket) => {
     const username = socket._username;
     const room     = socket._room;
 
+    // Clean up any pending (ringing) call
     if (socket._pendingCall) {
       const { roomName, callee } = socket._pendingCall;
       if (rooms[roomName]?._callTimer) clearTimeout(rooms[roomName]._callTimer);
@@ -1350,7 +2164,7 @@ io.on('connection', (socket) => {
     if (room && rooms[room]) {
       rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
       socket.to(room).emit('user-left', socket.id);
-      // If this was a call room, notify peer and process billing
+
       if (rooms[room].isCall) {
         socket.to(room).emit('peer-hung-up', { by: username });
         const callId = rooms[room].callId;
@@ -1358,11 +2172,12 @@ io.on('connection', (socket) => {
           processCallEnd(callId, room, io, lobbyUsers);
         }
       }
+
       if (rooms[room].members.length === 0) {
-        // Clear duration cap timers
         if (rooms[room]._capTimer)  clearTimeout(rooms[room]._capTimer);
         if (rooms[room]._warnTimer) clearTimeout(rooms[room]._warnTimer);
         delete rooms[room];
+        chatDeleteRoom(room); // Clean up stored messages — room is ephemeral
         console.log(`Room #${room} closed`);
       }
       broadcastRooms();
@@ -1378,61 +2193,57 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(PORT, BIND_HOST, () => {
-  console.log(`v4call server running on port ${PORT}`);
 
-  // ── Startup checks ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Startup ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+server.listen(PORT, BIND_HOST, () => {
+  console.log(`\nv4call server running on ${BIND_HOST}:${PORT}`);
+  console.log(`Rate format: V1 and V2 supported\n`);
+
   const escrowKey = process.env.V4CALL_ESCROW_KEY;
   const adminKey  = process.env.ADMIN_KEY;
 
   if (!escrowKey) {
-    console.error('⚠️  WARNING: V4CALL_ESCROW_KEY is not set — escrow payouts will not work!');
-    console.error('   Add to /etc/systemd/system/webrtc.service: Environment=V4CALL_ESCROW_KEY=5K...');
+    console.error('⚠️  WARNING: V4CALL_ESCROW_KEY not set — escrow payouts will not work!');
   } else {
-    // Verify the key is valid and matches escrow account
     try {
       const key    = dhive.PrivateKey.fromString(escrowKey);
       const pubKey = key.createPublic().toString();
-      console.log(`✓ Escrow key loaded — public key: ${pubKey}`);
+      console.log(`✓ Escrow key loaded — public: ${pubKey}`);
 
-      // Verify key matches escrow account on-chain
       getEscrowBalance().then(balance => {
-        console.log(`✓ Escrow account @${ESCROW_ACCOUNT} balance: ${balance.toFixed(3)} HBD`);
+        console.log(`✓ Escrow @${ESCROW_ACCOUNT} balance: ${balance.toFixed(3)} HBD`);
       }).catch(e => {
         console.error(`⚠️  Could not check escrow balance: ${e.message}`);
       });
 
-      // Verify key matches the account's active key
-      hivePost({
-        jsonrpc: '2.0', method: 'condenser_api.get_accounts',
-        params: [[ESCROW_ACCOUNT]], id: 1
-      }).then(data => {
-        if (!data?.result?.[0]) {
-          console.error(`⚠️  Could not find @${ESCROW_ACCOUNT} on Hive`);
-          return;
-        }
-        const activeKeys = data.result[0].active?.key_auths?.map(k => k[0]) || [];
-        if (activeKeys.includes(pubKey)) {
-          console.log(`✓ Escrow key verified — matches @${ESCROW_ACCOUNT} active key`);
-        } else {
-          console.error(`⚠️  WARNING: Escrow key does NOT match @${ESCROW_ACCOUNT} active key!`);
-          console.error(`   Key provided derives to: ${pubKey}`);
-          console.error(`   Account active keys: ${activeKeys.join(', ')}`);
-          console.error('   Payouts will fail until correct active key is provided.');
-        }
-      }).catch(e => {
-        console.error(`⚠️  Could not verify escrow key against blockchain: ${e.message}`);
-      });
-
+      hivePost({ jsonrpc: '2.0', method: 'condenser_api.get_accounts', params: [[ESCROW_ACCOUNT]], id: 1 })
+        .then(data => {
+          if (!data?.result?.[0]) {
+            console.error(`⚠️  Could not find @${ESCROW_ACCOUNT} on Hive`);
+            return;
+          }
+          const activeKeys = data.result[0].active?.key_auths?.map(k => k[0]) || [];
+          if (activeKeys.includes(pubKey)) {
+            console.log(`✓ Escrow key verified against @${ESCROW_ACCOUNT} active key`);
+          } else {
+            console.error(`⚠️  Escrow key does NOT match @${ESCROW_ACCOUNT} active key!`);
+            console.error(`   Derived: ${pubKey}`);
+            console.error(`   Expected one of: ${activeKeys.join(', ')}`);
+          }
+        }).catch(e => {
+          console.error(`⚠️  Could not verify escrow key: ${e.message}`);
+        });
     } catch(e) {
-      console.error(`⚠️  Invalid V4CALL_ESCROW_KEY format: ${e.message}`);
-      console.error('   Make sure you are using the ACTIVE private key (starts with 5K or 5J)');
+      console.error(`⚠️  Invalid V4CALL_ESCROW_KEY: ${e.message}`);
     }
   }
 
   if (!adminKey) {
     console.warn('⚠️  ADMIN_KEY not set — /admin/* endpoints are disabled');
   } else {
-    console.log('✓ Admin key configured — /admin/ledger and /admin/balance available');
+    console.log('✓ Admin endpoints available: /admin/ledger  /admin/balance');
   }
 });
