@@ -22,10 +22,14 @@ const crypto     = require('crypto');
 const fs         = require('fs');
 const Database   = require('better-sqlite3');
 const dhive      = require('@hiveio/dhive');
+const WebSocket  = require('ws');
 
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server);
+// CORS is permissive on the Socket.io server — browsers from federated peers
+// connect here to join call rooms hosted on this server (see federation
+// cross-server call flow below).
+const io     = new Server(server, { cors: { origin: true, credentials: true } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -63,11 +67,22 @@ const DM_RETENTION_DAYS         = parseInt(process.env.DM_RETENTION_DAYS        
 const ROOM_RETENTION_DAYS       = parseInt(process.env.ROOM_RETENTION_DAYS        || '33');
 const DM_PREVIEW_COUNT          = parseInt(process.env.DM_PREVIEW_COUNT           || '1'); // 0 = off
 
+// Federation — comma-separated list of peer WebSocket URLs (e.g. wss://peer.com/federation)
+const FEDERATION_PEERS = (process.env.FEDERATION_PEERS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const FEDERATION_ENABLED = FEDERATION_PEERS.length > 0;
+const FEDERATION_VERSION = '0.2';
+
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
 console.log(`[config] Platform fee: ${PLATFORM_FEE * 100}%`);
 console.log(`[config] Max duration: ${MAX_CALL_DURATION_MIN} min`);
 console.log(`[config] DM retention: ${DM_RETENTION_DAYS} days | Room retention: ${ROOM_RETENTION_DAYS} days | DM preview: ${DM_PREVIEW_COUNT}`);
+if (FEDERATION_ENABLED) {
+  console.log(`[config] Federation: ENABLED — peers: ${FEDERATION_PEERS.join(', ')}`);
+} else {
+  console.log(`[config] Federation: disabled (no FEDERATION_PEERS set)`);
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,12 +386,40 @@ function ledgerPaymentUpdate(callId, type, status, txId = null) {
 const lobbyUsers = {}; // username → { socketId, pubKey, invisible, inCall? }
 const rooms      = {}; // roomName → { creator, allowlist(Set), members[], isCall?, callId?, ... }
 
+// Federation state — populated by federation message handlers (see below).
+// domain → { ws, connected, name, users: Map(username → { pubKey }) }
+const federationPeers = {};
+
+function federatedUserSnapshot() {
+  const out = [];
+  for (const [domain, peer] of Object.entries(federationPeers)) {
+    if (!peer.connected) continue;
+    for (const [username, u] of peer.users) {
+      // Skip collisions with local users — local identity wins to avoid spoofing.
+      if (lobbyUsers[username]) continue;
+      out.push({ username, pubKey: u.pubKey, server: domain });
+    }
+  }
+  return out;
+}
+
 function lobbySnapshot() {
-  return Object.entries(lobbyUsers)
+  const local = Object.entries(lobbyUsers)
     .filter(([, u]) => !u.invisible)
-    .map(([username, u]) => ({ username, socketId: u.socketId, pubKey: u.pubKey }));
+    .map(([username, u]) => ({ username, socketId: u.socketId, pubKey: u.pubKey, server: SERVER_DOMAIN }));
+  return [...local, ...federatedUserSnapshot()];
 }
 function broadcastLobby() { io.emit('lobby-users', lobbySnapshot()); }
+
+// Look up which federation peer hosts a given username. Returns the peer
+// record (with ws) or null if no federated peer has that user.
+function peerForUser(username) {
+  for (const [domain, peer] of Object.entries(federationPeers)) {
+    if (!peer.connected) continue;
+    if (peer.users.has(username)) return { domain, ...peer };
+  }
+  return null;
+}
 
 function roomsSnapshot() {
   return Object.entries(rooms).map(([name, r]) => ({
@@ -1466,6 +1509,9 @@ io.on('connection', (socket) => {
     broadcastLobby();
     broadcastRooms();
 
+    // Announce new user to federated peers.
+    if (FEDERATION_ENABLED) fedAnnounceUserOnline(username);
+
     // ── DM unread summary ──────────────────────────────────────────────────
     const unread = chatGetDmUnread(username);
     if (unread.length > 0) {
@@ -1494,6 +1540,10 @@ io.on('connection', (socket) => {
     lobbyUsers[u].invisible = invisible;
     socket._invisible       = invisible;
     broadcastLobby();
+    if (FEDERATION_ENABLED) {
+      if (invisible) fedAnnounceUserOffline(u);
+      else           fedAnnounceUserOnline(u);
+    }
   });
 
   // ── LOBBY CHAT ─────────────────────────────────────────────────────────────
@@ -1515,8 +1565,26 @@ io.on('connection', (socket) => {
     const from = socket._username;
     if (!from) return;
     const recipient = lobbyUsers[to];
-    if (!recipient) return; // silently drop — recipient went offline
-    io.to(recipient.socketId).emit('lobby-encrypted', { from, ciphertext, signature, timestamp });
+    if (recipient) {
+      io.to(recipient.socketId).emit('lobby-encrypted', { from, ciphertext, signature, timestamp });
+    } else if (FEDERATION_ENABLED) {
+      // Toggle messages to federated users get relayed as free DMs — ephemeral,
+      // no billing, no payment verification. Store sender's copy only on this
+      // side; the peer stores the recipient's copy.
+      const peer = peerForUser(to);
+      if (peer) {
+        fedSend(peer.ws, {
+          type: 'dm',
+          from, to, ciphertext, signature, timestamp,
+          textPaid: 0,
+          fromServer: SERVER_DOMAIN
+        });
+      } else {
+        return; // recipient went offline
+      }
+    } else {
+      return;
+    }
 
     // Store in chat DB (both copies)
     chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, 0);
@@ -1531,8 +1599,9 @@ io.on('connection', (socket) => {
     const from = socket._username;
     if (!from) return;
 
-    const recipient = lobbyUsers[to];
-    if (!recipient) {
+    const recipient    = lobbyUsers[to];
+    const federatedTo  = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
+    if (!recipient && !federatedTo) {
       socket.emit('lobby-dm-error', `@${to} is not online`);
       return;
     }
@@ -1557,6 +1626,16 @@ io.on('connection', (socket) => {
 
     const textRate = applicable?.flat || 0;
     const cur      = textCurrency || applicable?.currency || 'HBD';
+
+    // v0.2 federation limitation: paid DMs across servers aren't yet supported
+    // because disbursement requires the recipient's server to hold the escrow
+    // key for the destination account. Free DMs work; paid ones fail clearly.
+    if (federatedTo && textRate >= 0.001) {
+      socket.emit('lobby-dm-error',
+        `@${to} is on ${federatedTo.domain}. Paid DMs across federated servers are not yet supported. ` +
+        `Either contact @${to} on ${federatedTo.domain} directly, or wait for them to reduce their text rate to free.`);
+      return;
+    }
 
     if (textRate >= 0.001) {
       // ── Payment required ─────────────────────────────────────────────────
@@ -1613,10 +1692,21 @@ io.on('connection', (socket) => {
     }
 
     // ── Relay the message ─────────────────────────────────────────────────
-    io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0 });
+    if (recipient) {
+      io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0 });
+    } else if (federatedTo) {
+      fedSend(federatedTo.ws, {
+        type: 'dm',
+        from, to, ciphertext, signature, timestamp,
+        textPaid:  textPaid || 0,
+        msgId:     msgId    || null,
+        fromServer: SERVER_DOMAIN
+      });
+    }
     socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0 });
 
-    // ── Store in chat DB (both copies) ────────────────────────────────────
+    // ── Store in chat DB (sender's local copy) ────────────────────────────
+    // For federated recipients, the peer server stores the recipient's copy.
     chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, textPaid || 0);
   });
 
@@ -1633,6 +1723,19 @@ io.on('connection', (socket) => {
   socket.on('dm-mark-read', () => {
     const username = socket._username;
     if (username) chatUpdateSeen(username);
+  });
+
+  // ── FEDERATED CALL ENDED ─────────────────────────────────────────────────
+  // Emitted by the callee's client on its HOME-server socket after leaving a
+  // federated call that lived on a peer server. Clears the in-call state that
+  // was set when we forwarded the incoming-call invite.
+  socket.on('federated-call-ended', () => {
+    const u = socket._username;
+    if (u && lobbyUsers[u]) {
+      delete lobbyUsers[u].inCall;
+      delete lobbyUsers[u].pendingFederatedCall;
+      console.log(`[federation] Cleared call state for @${u}`);
+    }
   });
 
   // ── RATE QUERY ─────────────────────────────────────────────────────────────
@@ -1885,8 +1988,11 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Callee must be online
-    if (!lobbyUsers[callee]) {
+    // Determine where the callee lives — local socket or federated peer.
+    const federatedCallee = lobbyUsers[callee] ? null : (FEDERATION_ENABLED ? peerForUser(callee) : null);
+
+    // Callee must be online (locally or on a federated peer)
+    if (!lobbyUsers[callee] && !federatedCallee) {
       if (ringFeePaid && ringFeePaid > 0 && callId) {
         // Callee went offline between rate check and ring — refund ring fee
         const refundMemo = `v4call:refund:${callId}:offline`;
@@ -1923,7 +2029,8 @@ io.on('connection', (socket) => {
       createdAt: new Date(),
       isCall:    true,
       callType:  callType || 'voice',
-      callId:    effectiveCallId
+      callId:    effectiveCallId,
+      federated: federatedCallee ? { calleeServer: federatedCallee.domain } : null
     };
 
     ledgerCallCreate(effectiveCallId, caller, callee, callType || 'voice');
@@ -1935,22 +2042,36 @@ io.on('connection', (socket) => {
 
     if (lobbyUsers[caller]) lobbyUsers[caller].inCall = roomName;
     if (lobbyUsers[callee]) lobbyUsers[callee].inCall = roomName;
-    socket._pendingCall = { roomName, callee };
+    socket._pendingCall = { roomName, callee, federatedTo: federatedCallee?.domain || null };
 
-    const calleeSid = getSocketId(callee);
-    console.log(`📞 @${caller} → @${callee} (${callType}) room: ${roomName}`);
+    console.log(`📞 @${caller} → @${callee}${federatedCallee ? '@' + federatedCallee.domain : ''} (${callType}) room: ${roomName}`);
 
-    if (calleeSid) {
-      io.to(calleeSid).emit('incoming-call', {
-        caller, callerPubKey: socket._pubKey,
-        roomName, callType: callType || 'voice', ringFeePaid: ringFeePaid || 0
+    if (federatedCallee) {
+      // Ring the callee through their home server.
+      fedSend(federatedCallee.ws, {
+        type:         'call-invite',
+        caller,
+        callee,
+        callType:     callType || 'voice',
+        roomName,
+        callerPubKey: socket._pubKey,
+        callerServer: SERVER_DOMAIN,
+        ringFeePaid:  ringFeePaid || 0
       });
     } else {
-      socket.emit('call-failed', { reason: `@${callee} is online but unreachable. Ask them to refresh.` });
-      delete rooms[roomName];
-      if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
-      if (lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
-      return;
+      const calleeSid = getSocketId(callee);
+      if (calleeSid) {
+        io.to(calleeSid).emit('incoming-call', {
+          caller, callerPubKey: socket._pubKey,
+          roomName, callType: callType || 'voice', ringFeePaid: ringFeePaid || 0
+        });
+      } else {
+        socket.emit('call-failed', { reason: `@${callee} is online but unreachable. Ask them to refresh.` });
+        delete rooms[roomName];
+        if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
+        if (lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
+        return;
+      }
     }
 
     socket.emit('call-ringing', { callee, roomName });
@@ -1958,13 +2079,18 @@ io.on('connection', (socket) => {
     // 30-second ring timeout → missed call
     const timer = setTimeout(() => {
       if (rooms[roomName] && rooms[roomName].members.length === 0) {
+        const wasFederated = rooms[roomName].federated;
         delete rooms[roomName];
         if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
         if (lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
         socket._pendingCall = null;
         socket.emit('call-missed', { callee, roomName });
-        const calleeSidNow = getSocketId(callee);
-        if (calleeSidNow) io.to(calleeSidNow).emit('call-missed', { caller, roomName });
+        if (wasFederated && federatedCallee) {
+          fedSend(federatedCallee.ws, { type: 'call-missed', caller, callee, roomName });
+        } else {
+          const calleeSidNow = getSocketId(callee);
+          if (calleeSidNow) io.to(calleeSidNow).emit('call-missed', { caller, roomName });
+        }
         broadcastRooms();
         console.log(`⏰ Timed out: @${caller} → @${callee}`);
       }
@@ -1976,6 +2102,33 @@ io.on('connection', (socket) => {
 
   socket.on('call-response', ({ roomName, accepted }) => {
     const callee = socket._username;
+
+    // Federated incoming call — we don't host the room; relay response to caller's server.
+    const fedPending = callee && lobbyUsers[callee]?.pendingFederatedCall;
+    if (fedPending && fedPending.roomName === roomName) {
+      const peer = federationPeers[fedPending.callerServer];
+      if (peer?.connected) {
+        fedSend(peer.ws, {
+          type: accepted ? 'call-response' : 'call-declined',
+          caller: fedPending.caller,
+          callee,
+          accepted: !!accepted,
+          roomName
+        });
+      }
+      if (!accepted) {
+        if (lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
+        delete lobbyUsers[callee].pendingFederatedCall;
+      } else {
+        socket.emit('call-accepted', {
+          caller: fedPending.caller,
+          roomName,
+          callerServer: fedPending.callerServer
+        });
+      }
+      return;
+    }
+
     const room   = rooms[roomName];
     if (!room) return;
     const caller = room.creator;
@@ -2022,12 +2175,18 @@ io.on('connection', (socket) => {
     const room   = rooms[roomName];
     if (!room) return;
     const callee = [...room.allowlist].find(u => u !== caller);
+    const federated = room.federated;
     if (room._callTimer) { clearTimeout(room._callTimer); delete room._callTimer; }
     delete rooms[roomName];
     if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
     if (callee && lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
-    const calleeSid = lobbyUsers[callee]?.socketId;
-    if (callee && calleeSid) io.to(calleeSid).emit('call-cancelled', { caller, roomName });
+    if (federated) {
+      const peer = federationPeers[federated.calleeServer];
+      if (peer?.connected) fedSend(peer.ws, { type: 'call-cancelled', caller, callee, roomName });
+    } else {
+      const calleeSid = lobbyUsers[callee]?.socketId;
+      if (callee && calleeSid) io.to(calleeSid).emit('call-cancelled', { caller, roomName });
+    }
     socket._pendingCall = null;
     broadcastRooms();
     console.log(`🚫 @${caller} cancelled call to @${callee}`);
@@ -2187,11 +2346,317 @@ io.on('connection', (socket) => {
       delete lobbyUsers[username];
       broadcastLobby();
       broadcastRooms();
+      if (FEDERATION_ENABLED) fedAnnounceUserOffline(username);
     }
 
     console.log(`Disconnected: @${username || '?'} (${socket.id})`);
   });
 });
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Federation (server-to-server) ─────────────────────────────────────────────
+//
+// Two v4call servers discover each other via hardcoded FEDERATION_PEERS URLs
+// and exchange a small set of JSON messages over a persistent WebSocket:
+//
+//   hello        — identify self (domain + version)
+//   presence     — full user list snapshot (sent on connect)
+//   user-online  — incremental add to peer's user list
+//   user-offline — incremental remove
+//   dm           — relay an encrypted DM (ciphertext only — server never sees plaintext)
+//   call-invite  — ring a federated user (caller's server hosts the room)
+//   call-response / call-declined / call-cancelled / call-missed — call lifecycle
+//
+// Both servers connect outbound to each other AND accept inbound connections.
+// The most recent connection per domain wins (old one gets closed).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fedSend(ws, msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(msg)); } catch(e) { /* ignore — peer will reconnect */ }
+  }
+}
+
+function fedBroadcast(msg) {
+  for (const peer of Object.values(federationPeers)) {
+    if (peer.connected) fedSend(peer.ws, msg);
+  }
+}
+
+function fedRegisterPeer(domain, name, ws) {
+  // Close any existing connection for this domain — most recent wins.
+  const existing = federationPeers[domain];
+  if (existing && existing.ws && existing.ws !== ws) {
+    try { existing.ws.close(); } catch(_) {}
+  }
+  federationPeers[domain] = {
+    ws,
+    connected: true,
+    name: name || domain,
+    users: existing ? existing.users : new Map()
+  };
+}
+
+function fedSendLocalPresence(ws) {
+  const users = Object.entries(lobbyUsers)
+    .filter(([, u]) => !u.invisible)
+    .map(([username, u]) => ({ username, pubKey: u.pubKey }));
+  fedSend(ws, { type: 'presence', users });
+}
+
+function fedAnnounceUserOnline(username) {
+  const u = lobbyUsers[username];
+  if (!u || u.invisible) return;
+  fedBroadcast({ type: 'user-online', username, pubKey: u.pubKey });
+}
+
+function fedAnnounceUserOffline(username) {
+  fedBroadcast({ type: 'user-offline', username });
+}
+
+function fedHandleMessage(ws, raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch(e) { return; }
+  if (!msg || !msg.type) return;
+
+  switch (msg.type) {
+    case 'hello': {
+      const domain = (msg.domain || '').toLowerCase();
+      if (!domain) return;
+      ws._domain = domain;
+      fedRegisterPeer(domain, msg.name, ws);
+      console.log(`[federation] Peer identified: @${domain} (${msg.name || 'v4call'}, v${msg.version || '?'})`);
+      fedSendLocalPresence(ws);
+      broadcastLobby();
+      break;
+    }
+    case 'presence': {
+      if (!ws._domain) return;
+      const peer = federationPeers[ws._domain];
+      if (!peer) return;
+      peer.users = new Map();
+      for (const u of (msg.users || [])) {
+        if (u.username) peer.users.set(u.username, { pubKey: u.pubKey || '' });
+      }
+      console.log(`[federation] Presence from ${ws._domain}: ${peer.users.size} users`);
+      broadcastLobby();
+      break;
+    }
+    case 'user-online': {
+      if (!ws._domain) return;
+      const peer = federationPeers[ws._domain];
+      if (!peer) return;
+      if (msg.username) peer.users.set(msg.username, { pubKey: msg.pubKey || '' });
+      broadcastLobby();
+      break;
+    }
+    case 'user-offline': {
+      if (!ws._domain) return;
+      const peer = federationPeers[ws._domain];
+      if (!peer) return;
+      peer.users.delete(msg.username);
+      broadcastLobby();
+      break;
+    }
+    case 'dm': {
+      // Incoming DM for one of our local users — ciphertext only.
+      // The recipient's server (us) stores the recipient's copy; the sender's
+      // server stores the sender's copy. We never see plaintext.
+      const { from, to, ciphertext, signature, timestamp, textPaid, fromServer } = msg;
+      if (!from || !to || !ciphertext) return;
+      const recipient = lobbyUsers[to];
+      if (recipient) {
+        io.to(recipient.socketId).emit('lobby-dm', {
+          from, ciphertext, signature, timestamp,
+          textPaid: textPaid || 0,
+          fromServer: fromServer || ws._domain
+        });
+      }
+      // Store recipient's copy regardless of online status (so they see it on next login)
+      chatStoreDm(from, to, ciphertext, null, signature, timestamp, textPaid || 0);
+      fedSend(ws, { type: 'dm-delivered', from, to, msgId: msg.msgId || null });
+      console.log(`[federation] DM relayed: @${from}@${fromServer || ws._domain} → @${to}`);
+      break;
+    }
+    case 'dm-delivered': {
+      // Confirmation from the recipient's server — currently informational only.
+      break;
+    }
+    case 'dm-failed': {
+      // Notify the original sender if still online.
+      const sender = lobbyUsers[msg.from];
+      if (sender) io.to(sender.socketId).emit('lobby-dm-error', `DM to @${msg.to} failed: ${msg.reason || 'unknown'}`);
+      break;
+    }
+    case 'call-invite': {
+      // A peer server is asking us to ring one of our local users.
+      const { caller, callee, callType, roomName, callerPubKey, callerServer, ringFeePaid } = msg;
+      if (!caller || !callee || !roomName) return;
+      const calleeUser = lobbyUsers[callee];
+      if (!calleeUser) {
+        fedSend(ws, { type: 'call-missed', caller, callee, roomName, reason: 'offline' });
+        return;
+      }
+      if (calleeUser.inCall) {
+        fedSend(ws, { type: 'call-declined', caller, callee, roomName, reason: 'busy' });
+        return;
+      }
+      // Mark the callee as in-call so local traffic doesn't collide.
+      calleeUser.inCall = roomName;
+      // Remember the federated context for this pending invite.
+      calleeUser.pendingFederatedCall = { roomName, caller, callerServer };
+      io.to(calleeUser.socketId).emit('incoming-call', {
+        caller,
+        callerPubKey: callerPubKey || '',
+        roomName,
+        callType: callType || 'voice',
+        ringFeePaid: ringFeePaid || 0,
+        callerServer: callerServer || ws._domain
+      });
+      console.log(`[federation] Incoming call: @${caller}@${callerServer || ws._domain} → @${callee} (${callType})`);
+      break;
+    }
+    case 'call-response': {
+      // Our local user is the caller; the peer's user has accepted/declined.
+      const { caller, callee, accepted, roomName } = msg;
+      const callerUser = lobbyUsers[caller];
+      const room       = rooms[roomName];
+      if (!callerUser) return;
+      if (accepted) {
+        if (room && room._callTimer) { clearTimeout(room._callTimer); delete room._callTimer; }
+        io.to(callerUser.socketId).emit('call-accepted', { callee, roomName });
+        if (room) {
+          const now = Date.now();
+          if (activePayments[room.callId]) activePayments[room.callId].startTime = now;
+          ledgerCallUpdate(room.callId, { connected_at: new Date(now).toISOString(), status: 'connected' });
+          startCreditBurn(room.callId, roomName);
+
+          const capMs   = MAX_CALL_DURATION_MIN * 60 * 1000;
+          const warnMs  = Math.max(0, (MAX_CALL_DURATION_MIN - 5) * 60 * 1000);
+          room._capTimer  = setTimeout(async () => {
+            if (rooms[roomName]) {
+              io.to(roomName).emit('call-cap-reached', { maxMinutes: MAX_CALL_DURATION_MIN });
+              await processCallEnd(room.callId, roomName, io, lobbyUsers, 'cap_reached');
+            }
+          }, capMs);
+          room._warnTimer = setTimeout(() => {
+            if (rooms[roomName]) io.to(roomName).emit('call-cap-warning', { minutesLeft: 5 });
+          }, warnMs);
+        }
+        console.log(`[federation] ✓ Call accepted: @${caller} ↔ @${callee}`);
+      } else {
+        io.to(callerUser.socketId).emit('call-declined', { callee, roomName });
+        delete callerUser.inCall;
+        if (rooms[roomName]) {
+          if (rooms[roomName]._callTimer) clearTimeout(rooms[roomName]._callTimer);
+          delete rooms[roomName];
+        }
+        ledgerCallUpdate(msg.roomName, { status: 'declined', end_reason: 'declined', ended_at: new Date().toISOString() });
+      }
+      break;
+    }
+    case 'call-declined': {
+      const callerUser = lobbyUsers[msg.caller];
+      if (callerUser) {
+        io.to(callerUser.socketId).emit('call-declined', { callee: msg.callee, roomName: msg.roomName });
+        delete callerUser.inCall;
+      }
+      if (msg.roomName && rooms[msg.roomName]) delete rooms[msg.roomName];
+      break;
+    }
+    case 'call-cancelled': {
+      // The remote caller gave up before our user answered.
+      const calleeUser = lobbyUsers[msg.callee];
+      if (calleeUser) {
+        io.to(calleeUser.socketId).emit('call-cancelled', { caller: msg.caller, roomName: msg.roomName });
+        delete calleeUser.inCall;
+        delete calleeUser.pendingFederatedCall;
+      }
+      break;
+    }
+    case 'call-missed': {
+      // Our local user was the callee — the peer caller's ring timed out.
+      const calleeUser = lobbyUsers[msg.callee];
+      if (calleeUser) {
+        io.to(calleeUser.socketId).emit('call-missed', { caller: msg.caller, roomName: msg.roomName });
+        delete calleeUser.inCall;
+        delete calleeUser.pendingFederatedCall;
+      }
+      break;
+    }
+  }
+}
+
+function fedAttachSocket(ws, label) {
+  ws.on('message', (data) => fedHandleMessage(ws, data.toString()));
+  ws.on('close',   () => {
+    if (ws._domain && federationPeers[ws._domain]?.ws === ws) {
+      federationPeers[ws._domain].connected = false;
+      console.log(`[federation] ${label} to ${ws._domain} closed`);
+      broadcastLobby();
+    }
+  });
+  ws.on('error', (e) => {
+    console.warn(`[federation] ${label} error (${ws._domain || 'unidentified'}): ${e.message}`);
+  });
+  // Say hello immediately.
+  fedSend(ws, {
+    type:    'hello',
+    domain:  SERVER_DOMAIN,
+    name:    SERVER_NAME,
+    version: FEDERATION_VERSION
+  });
+}
+
+// Inbound WebSocket server (peers connect to us at /federation)
+const federationWss = new WebSocket.Server({ noServer: true });
+federationWss.on('connection', (ws) => {
+  console.log('[federation] Inbound peer connection — waiting for hello');
+  fedAttachSocket(ws, 'inbound');
+});
+
+server.on('upgrade', (request, socket, head) => {
+  const url = request.url || '';
+  if (url === '/federation' || url.startsWith('/federation?')) {
+    federationWss.handleUpgrade(request, socket, head, (ws) => {
+      federationWss.emit('connection', ws, request);
+    });
+  }
+  // All other upgrades (including /socket.io/) are handled by Socket.io directly.
+});
+
+// Outbound connections to configured peers, with exponential-backoff reconnect.
+function fedConnectPeer(url) {
+  let attempt = 0;
+  const open = () => {
+    console.log(`[federation] Connecting to ${url}...`);
+    const ws = new WebSocket(url);
+    ws.on('open', () => {
+      attempt = 0;
+      console.log(`[federation] Outbound connected: ${url}`);
+      fedAttachSocket(ws, 'outbound');
+      // fedAttachSocket also sends hello — but we want presence sent after
+      // the peer responds with its hello (so we know the domain). Send now
+      // anyway — the peer accepts presence without requiring hello order.
+      fedSendLocalPresence(ws);
+    });
+    ws.on('close', () => {
+      attempt++;
+      const delay = Math.min(1000 * Math.pow(2, Math.min(attempt, 6)), 60000);
+      console.log(`[federation] Disconnected from ${url} — retry in ${Math.round(delay/1000)}s`);
+      setTimeout(open, delay);
+    });
+    ws.on('error', () => {
+      // 'close' will fire after 'error' — reconnect is handled there.
+    });
+  };
+  open();
+}
+
+if (FEDERATION_ENABLED) {
+  for (const url of FEDERATION_PEERS) fedConnectPeer(url);
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
