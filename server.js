@@ -1751,9 +1751,14 @@ io.on('connection', (socket) => {
     const recipient    = lobbyUsers[to];
     const federatedTo  = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
     if (!recipient && !federatedTo) {
+      const visiblePeers = Object.entries(federationPeers)
+        .filter(([, p]) => p.connected)
+        .map(([d, p]) => `${d}(${p.users.size})`).join(', ') || 'none';
+      console.warn(`[text] @${from} → @${to}: recipient not found locally and not in federated peers [${visiblePeers}]`);
       socket.emit('lobby-dm-error', `@${to} is not online`);
       return;
     }
+    console.log(`[text] @${from} → @${to}: routing ${recipient ? 'local' : `federated via ${federatedTo.domain}`}`);
 
     // Fetch recipient's rates and resolve applicable text rate for this sender
     const calleeRates = await fetchRates(to);
@@ -2630,6 +2635,106 @@ function fedShouldInitiate(peerDomain) {
   return SERVER_DOMAIN.toLowerCase().localeCompare(peerDomain.toLowerCase()) < 0;
 }
 
+// ── Peer verification via signed /.well-known/v4call-server.json ─────────────
+// During the hello handshake, fetch the peer's signed ownership file from its
+// claimed domain and verify it was signed by the Hive account it claims to
+// belong to. This ties Hive identity to domain control: a squatter can spoof
+// hello but can't serve a matching file with a valid signature on a domain
+// they don't control. Results cache to avoid hammering peers on every connect.
+const PEER_VERIFY_TTL_OK   = 60 * 60 * 1000;   // 1h for positive results
+const PEER_VERIFY_TTL_FAIL = 5  * 60 * 1000;   // 5min for failures
+const peerVerifyCache = {};                    // domain → { result, cachedAt }
+
+async function _fetchPeerVerifyFile(domain) {
+  const url = `https://${domain}/.well-known/v4call-server.json`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+async function _lookupPostingPubKey(account) {
+  const data = await hivePost({
+    jsonrpc: '2.0', method: 'condenser_api.get_accounts',
+    params: [[account]], id: 1
+  });
+  if (!data?.result?.length) return null;
+  return data.result[0].posting?.key_auths?.[0]?.[0] || null;
+}
+
+function _verifyPayloadString(obj) {
+  return [
+    obj.claim, obj.domain, obj.hive_account,
+    obj.escrow, obj.fee_account, obj.federation_ws,
+    obj.issued, obj.expires || '', obj.nonce
+  ].join('|');
+}
+
+async function verifyPeer(domain, claimedAccount) {
+  const cached = peerVerifyCache[domain];
+  if (cached) {
+    const ttl = cached.result.verified ? PEER_VERIFY_TTL_OK : PEER_VERIFY_TTL_FAIL;
+    if ((Date.now() - cached.cachedAt) < ttl) return cached.result;
+  }
+
+  const fail = (reason) => {
+    const r = { verified: false, reason };
+    peerVerifyCache[domain] = { result: r, cachedAt: Date.now() };
+    return r;
+  };
+
+  let obj;
+  try { obj = await _fetchPeerVerifyFile(domain); }
+  catch(e) { return fail(`Cannot fetch verify.json: ${e.message}`); }
+
+  // Shape + field-consistency checks
+  if (obj.claim !== 'v4call-server-ownership')                 return fail('wrong claim');
+  if (!obj.domain || !obj.hive_account || !obj.signature)      return fail('missing required fields');
+  if (obj.domain.toLowerCase() !== domain.toLowerCase())       return fail(`domain mismatch (file claims ${obj.domain})`);
+  if (claimedAccount && obj.hive_account.toLowerCase() !== claimedAccount.toLowerCase()) {
+    return fail(`account mismatch: hello says @${claimedAccount} but file signed by @${obj.hive_account}`);
+  }
+
+  // Expiry — only enforce if operator set one
+  if (obj.expires) {
+    const exp = Date.parse(obj.expires);
+    if (Number.isFinite(exp) && Date.now() > exp) return fail(`expired on ${obj.expires}`);
+  }
+  // Reject far-future issued (tolerates 5min clock skew)
+  if (obj.issued) {
+    const iss = Date.parse(obj.issued);
+    if (Number.isFinite(iss) && iss > Date.now() + 5 * 60 * 1000) return fail(`issued timestamp in future: ${obj.issued}`);
+  }
+
+  // Signature verification
+  let pubKeyStr;
+  try { pubKeyStr = await _lookupPostingPubKey(obj.hive_account); }
+  catch(e) { return fail(`Hive lookup error: ${e.message}`); }
+  if (!pubKeyStr) return fail(`no posting key found for @${obj.hive_account}`);
+
+  try {
+    const payload = _verifyPayloadString(obj);
+    const hash    = dhive.cryptoUtils.sha256(payload);
+    const pubKey  = dhive.PublicKey.fromString(pubKeyStr);
+    const sig     = dhive.Signature.fromString(obj.signature);
+    if (!pubKey.verify(hash, sig)) return fail('signature does not match posting key');
+  } catch(e) {
+    return fail(`signature parse error: ${e.message}`);
+  }
+
+  const ok = {
+    verified:      true,
+    domain:        obj.domain,
+    hive_account:  obj.hive_account,
+    escrow:        obj.escrow,
+    fee_account:   obj.fee_account,
+    federation_ws: obj.federation_ws,
+    issued:        obj.issued,
+    expires:       obj.expires || null
+  };
+  peerVerifyCache[domain] = { result: ok, cachedAt: Date.now() };
+  return ok;
+}
+
 function fedRegisterPeer(domain, name, ws, escrow) {
   const existing = federationPeers[domain];
   const isOutbound = ws._isOutbound === true;
@@ -2672,26 +2777,53 @@ function fedSendLocalPresence(ws) {
 function fedAnnounceUserOnline(username) {
   const u = lobbyUsers[username];
   if (!u || u.invisible) return;
+  const peerCount = Object.values(federationPeers).filter(p => p.connected).length;
+  console.log(`[federation] → user-online @${username} → ${peerCount} peer(s)`);
   fedBroadcast({ type: 'user-online', username, pubKey: u.pubKey });
 }
 
 function fedAnnounceUserOffline(username) {
+  const peerCount = Object.values(federationPeers).filter(p => p.connected).length;
+  console.log(`[federation] → user-offline @${username} → ${peerCount} peer(s)`);
   fedBroadcast({ type: 'user-offline', username });
 }
 
-function fedHandleMessage(ws, raw) {
+async function fedHandleMessage(ws, raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch(e) { return; }
   if (!msg || !msg.type) return;
 
   switch (msg.type) {
     case 'hello': {
-      const domain = (msg.domain || '').toLowerCase();
+      const domain         = (msg.domain || '').toLowerCase();
+      const claimedAccount = (msg.hive_account || '').toLowerCase();
       if (!domain) return;
       ws._domain = domain;
-      const registered = fedRegisterPeer(domain, msg.name, ws, msg.escrow || null);
-      if (!registered) return; // duplicate rejected
-      console.log(`[federation] Peer identified: @${domain} (${msg.name || 'v4call'}, v${msg.version || '?'}, escrow: @${msg.escrow || '?'})`);
+
+      // Cryptographic proof-of-ownership. Fails closed — unverified peers
+      // cannot federate. See verifyPeer() for the rules.
+      const vr = await verifyPeer(domain, claimedAccount);
+      if (!vr.verified) {
+        console.error(`[federation] ✗ Peer verification failed for ${domain}: ${vr.reason}`);
+        try { ws.close(1008, 'verification failed'); } catch(_) {}
+        return;
+      }
+
+      // Use the SIGNED values as authoritative — hello fields are unsigned.
+      const registered = fedRegisterPeer(domain, msg.name, ws, vr.escrow);
+      if (!registered) return; // duplicate rejected by tiebreaker
+      const peer = federationPeers[domain];
+      peer.verified      = true;
+      peer.hive_account  = vr.hive_account;
+      peer.fee_account   = vr.fee_account;
+      peer.issued        = vr.issued;
+      peer.expires       = vr.expires;
+
+      if (msg.escrow && msg.escrow !== vr.escrow) {
+        console.warn(`[federation] ⚠ ${domain}: hello.escrow=@${msg.escrow} but verify.json.escrow=@${vr.escrow} — using signed value`);
+      }
+
+      console.log(`[federation] ✓ Peer verified: @${domain} (signer: @${vr.hive_account}, escrow: @${vr.escrow}${vr.expires ? `, expires ${vr.expires}` : ''})`);
       fedSendLocalPresence(ws);
       broadcastLobby();
       break;
@@ -2711,8 +2843,11 @@ function fedHandleMessage(ws, raw) {
     case 'user-online': {
       if (!ws._domain) return;
       const peer = federationPeers[ws._domain];
-      if (!peer) return;
-      if (msg.username) peer.users.set(msg.username, { pubKey: msg.pubKey || '' });
+      if (!peer) { console.warn(`[federation] ← user-online from ${ws._domain} dropped (peer not yet registered)`); return; }
+      if (msg.username) {
+        peer.users.set(msg.username, { pubKey: msg.pubKey || '' });
+        console.log(`[federation] ← user-online @${msg.username}@${ws._domain} (now ${peer.users.size} federated user(s))`);
+      }
       broadcastLobby();
       break;
     }
@@ -2721,6 +2856,7 @@ function fedHandleMessage(ws, raw) {
       const peer = federationPeers[ws._domain];
       if (!peer) return;
       peer.users.delete(msg.username);
+      console.log(`[federation] ← user-offline @${msg.username}@${ws._domain}`);
       broadcastLobby();
       break;
     }
@@ -2983,7 +3119,17 @@ function fedHandleMessage(ws, raw) {
 }
 
 function fedAttachSocket(ws, label) {
-  ws.on('message', (data) => fedHandleMessage(ws, data.toString()));
+  // fedHandleMessage is async (hello awaits verifyPeer). We chain handlers in
+  // a per-socket Promise queue so messages are processed STRICTLY in order —
+  // a presence/user-online arriving while hello's verification is still in
+  // flight waits for hello to finish registering the peer, instead of being
+  // silently dropped by "federationPeers[ws._domain] not yet set".
+  ws._processQueue = Promise.resolve();
+  ws.on('message', (data) => {
+    ws._processQueue = ws._processQueue
+      .then(() => fedHandleMessage(ws, data.toString()))
+      .catch(e => console.error('[federation] handler error:', e.message));
+  });
   ws.on('close',   () => {
     if (ws._domain && federationPeers[ws._domain]?.ws === ws) {
       federationPeers[ws._domain].connected = false;
@@ -2995,14 +3141,15 @@ function fedAttachSocket(ws, label) {
     console.warn(`[federation] ${label} error (${ws._domain || 'unidentified'}): ${e.message}`);
   });
   // Say hello immediately. Include our ESCROW_ACCOUNT so peers can detect
-  // rates-post escrow mismatches (if a user's rates post declares an escrow
-  // that isn't controlled by their home server, paid flows won't work).
+  // rates-post escrow mismatches, and our SERVER_HIVE_ACCOUNT so peers can
+  // pin their verify.json check to the correct signer.
   fedSend(ws, {
-    type:    'hello',
-    domain:  SERVER_DOMAIN,
-    name:    SERVER_NAME,
-    version: FEDERATION_VERSION,
-    escrow:  ESCROW_ACCOUNT
+    type:         'hello',
+    domain:       SERVER_DOMAIN,
+    name:         SERVER_NAME,
+    version:      FEDERATION_VERSION,
+    escrow:       ESCROW_ACCOUNT,
+    hive_account: SERVER_HIVE_ACCOUNT
   });
 }
 
