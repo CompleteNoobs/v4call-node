@@ -1777,6 +1777,18 @@ io.on('connection', (socket) => {
     const cur          = textCurrency || applicable?.currency || 'HBD';
     const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
 
+    // For paid federated DMs, the callee's rates-post escrow MUST match the
+    // peer server's own ESCROW_ACCOUNT — otherwise the peer holds no key to
+    // disburse from it. Fail loudly instead of silently dropping the message.
+    if (federatedTo && textRate >= 0.001 && federatedTo.escrow && federatedTo.escrow !== calleeEscrow) {
+      socket.emit('lobby-dm-error',
+        `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ` +
+        `${federatedTo.domain} controls @${federatedTo.escrow}. They need to ` +
+        `update their rates post to point at @${federatedTo.escrow} (or switch servers) ` +
+        `for paid DMs to work across federation.`);
+      return;
+    }
+
     if (textRate >= 0.001) {
       // ── Payment required ─────────────────────────────────────────────────
       if (!textPaid || !textMemo || !msgId) {
@@ -2196,6 +2208,26 @@ io.on('connection', (socket) => {
     // Determine where the callee lives — local socket or federated peer.
     const federatedCallee = lobbyUsers[callee] ? null : (FEDERATION_ENABLED ? peerForUser(callee) : null);
 
+    // Escrow-mismatch guard for paid federated calls — same reason as for DMs
+    // (see comment in lobby-dm handler). We only bother checking when a ring
+    // fee was paid; free calls don't care about disbursement.
+    if (federatedCallee && ringFeePaid > 0) {
+      // Use an async lookup inline — we already fetched rates client-side for
+      // the payment flow, but double-check here before routing the invite.
+      fetchRates(callee).then(r => {
+        const declaredEscrow = r?.escrow || null;
+        if (declaredEscrow && federatedCallee.escrow && declaredEscrow !== federatedCallee.escrow) {
+          socket.emit('call-failed', {
+            reason: `⚠ @${callee}'s rates post declares escrow @${declaredEscrow}, ` +
+              `but ${federatedCallee.domain} controls @${federatedCallee.escrow}. ` +
+              `Funds paid cannot be disbursed. Contact @${callee} to update their rates.`
+          });
+        }
+      }).catch(() => {});
+      // Let the rest of the flow proceed — worst case the clean error reaches
+      // the user before the callee's server rejects the on-chain re-verify.
+    }
+
     // Callee must be online (locally or on a federated peer)
     if (!lobbyUsers[callee] && !federatedCallee) {
       if (ringFeePaid && ringFeePaid > 0 && callId) {
@@ -2589,18 +2621,45 @@ function fedBroadcast(msg) {
   }
 }
 
-function fedRegisterPeer(domain, name, ws) {
-  // Close any existing connection for this domain — most recent wins.
+// Tiebreaker: when both peers initiate outbound connections at the same time,
+// only the lexicographically-smaller domain keeps its outbound. The other peer
+// closes its own outbound and accepts the inbound from the smaller-domain side.
+// Both ends use the same comparison, so they agree on which TCP connection
+// survives — no flapping.
+function fedShouldInitiate(peerDomain) {
+  return SERVER_DOMAIN.toLowerCase().localeCompare(peerDomain.toLowerCase()) < 0;
+}
+
+function fedRegisterPeer(domain, name, ws, escrow) {
   const existing = federationPeers[domain];
-  if (existing && existing.ws && existing.ws !== ws) {
-    try { existing.ws.close(); } catch(_) {}
+  const isOutbound = ws._isOutbound === true;
+
+  if (existing && existing.ws && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
+    // We already have a healthy connection for this peer. Decide which one
+    // survives based on domain tiebreaker so both sides agree.
+    const wePreferOutbound = fedShouldInitiate(domain);
+    const newMatchesPref      = (isOutbound === wePreferOutbound);
+    const existingMatchesPref = (existing.isOutbound === wePreferOutbound);
+
+    if (newMatchesPref && !existingMatchesPref) {
+      // Replace the existing socket — new one is the preferred direction.
+      try { existing.ws.close(1000, 'superseded'); } catch(_) {}
+    } else {
+      // Reject duplicate — keep the existing.
+      try { ws.close(1000, 'duplicate'); } catch(_) {}
+      return false;
+    }
   }
+
   federationPeers[domain] = {
     ws,
     connected: true,
-    name: name || domain,
-    users: existing ? existing.users : new Map()
+    name:     name   || domain,
+    escrow:   escrow || (existing ? existing.escrow : null),
+    users:    existing ? existing.users : new Map(),
+    isOutbound
   };
+  return true;
 }
 
 function fedSendLocalPresence(ws) {
@@ -2630,8 +2689,9 @@ function fedHandleMessage(ws, raw) {
       const domain = (msg.domain || '').toLowerCase();
       if (!domain) return;
       ws._domain = domain;
-      fedRegisterPeer(domain, msg.name, ws);
-      console.log(`[federation] Peer identified: @${domain} (${msg.name || 'v4call'}, v${msg.version || '?'})`);
+      const registered = fedRegisterPeer(domain, msg.name, ws, msg.escrow || null);
+      if (!registered) return; // duplicate rejected
+      console.log(`[federation] Peer identified: @${domain} (${msg.name || 'v4call'}, v${msg.version || '?'}, escrow: @${msg.escrow || '?'})`);
       fedSendLocalPresence(ws);
       broadcastLobby();
       break;
@@ -2934,18 +2994,22 @@ function fedAttachSocket(ws, label) {
   ws.on('error', (e) => {
     console.warn(`[federation] ${label} error (${ws._domain || 'unidentified'}): ${e.message}`);
   });
-  // Say hello immediately.
+  // Say hello immediately. Include our ESCROW_ACCOUNT so peers can detect
+  // rates-post escrow mismatches (if a user's rates post declares an escrow
+  // that isn't controlled by their home server, paid flows won't work).
   fedSend(ws, {
     type:    'hello',
     domain:  SERVER_DOMAIN,
     name:    SERVER_NAME,
-    version: FEDERATION_VERSION
+    version: FEDERATION_VERSION,
+    escrow:  ESCROW_ACCOUNT
   });
 }
 
 // Inbound WebSocket server (peers connect to us at /federation)
 const federationWss = new WebSocket.Server({ noServer: true });
 federationWss.on('connection', (ws) => {
+  ws._isOutbound = false;
   console.log('[federation] Inbound peer connection — waiting for hello');
   fedAttachSocket(ws, 'inbound');
 });
@@ -2961,18 +3025,35 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 // Outbound connections to configured peers, with exponential-backoff reconnect.
+// Only the lexicographically-smaller domain initiates outbound — the other side
+// just accepts inbound. Both servers can keep FEDERATION_PEERS set; the higher-
+// domain side simply skips its outbound attempts (passive mode).
 function fedConnectPeer(url) {
+  let peerHost;
+  try { peerHost = new URL(url).host.toLowerCase(); }
+  catch(e) { console.warn(`[federation] Bad peer URL: ${url}`); return; }
+
+  if (!fedShouldInitiate(peerHost)) {
+    console.log(`[federation] Passive mode for ${peerHost} (domain tiebreaker — peer will initiate)`);
+    return;
+  }
+
   let attempt = 0;
   const open = () => {
+    // If a healthy connection (e.g. inbound from the same peer) already exists,
+    // hold off and check again later — saves a connect/reject round trip.
+    const existing = federationPeers[peerHost];
+    if (existing && existing.ws && existing.ws.readyState === WebSocket.OPEN) {
+      setTimeout(open, 30000);
+      return;
+    }
     console.log(`[federation] Connecting to ${url}...`);
     const ws = new WebSocket(url);
+    ws._isOutbound = true;
     ws.on('open', () => {
       attempt = 0;
       console.log(`[federation] Outbound connected: ${url}`);
       fedAttachSocket(ws, 'outbound');
-      // fedAttachSocket also sends hello — but we want presence sent after
-      // the peer responds with its hello (so we know the domain). Send now
-      // anyway — the peer accepts presence without requiring hello order.
       fedSendLocalPresence(ws);
     });
     ws.on('close', () => {
