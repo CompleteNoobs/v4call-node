@@ -2917,9 +2917,12 @@ function parseV4CallServerPost(body) {
 
 async function scanV4CallDirectory() {
   console.log('[discovery] Scanning Hive tag "v4call-server" for federation peers…');
+  // get_discussions_by_created returns posts under the tag sorted by recency.
+  // (get_discussions_by_tag doesn't exist on Hive's condenser API — that was
+  // a wrong method name that returned an assert exception silently.)
   const data = await hivePost({
     jsonrpc: '2.0',
-    method:  'condenser_api.get_discussions_by_tag',
+    method:  'condenser_api.get_discussions_by_created',
     params:  [{ tag: 'v4call-server', limit: 50 }],
     id: 1
   });
@@ -2927,6 +2930,7 @@ async function scanV4CallDirectory() {
     console.warn('[discovery] No response from Hive tag query');
     return;
   }
+  console.log(`[discovery] Hive returned ${data.result.length} post(s) under v4call-server tag`);
 
   // Keep only the most recent post PER AUTHOR with title "v4call-server".
   // Stray tag usage (random posts that happen to include the tag) is filtered
