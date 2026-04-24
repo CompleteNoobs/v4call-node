@@ -390,6 +390,39 @@ const rooms      = {}; // roomName → { creator, allowlist(Set), members[], isC
 // domain → { ws, connected, name, users: Map(username → { pubKey }) }
 const federationPeers = {};
 
+// ── Discovery state (populated by scanV4CallDirectory) ──────────────────────
+// domain → { post_author, post_permlink, post_created, parsed, verified,
+//            verify_reason, last_seen }
+const discoveredPeers = {};
+
+// Domains the operator has explicitly approved to federate. Approval is
+// required for both inbound acceptance and outbound initiation. Seeded from
+// FEDERATION_PEERS env (auto-approved, backwards compat) + loaded from
+// /app/logs/approved-peers.json on startup. Persisted on mutation.
+const approvedPeers = new Set();
+
+function _approvedPeersFile() { return path.join(LOG_DIR, 'approved-peers.json'); }
+
+function loadApprovedPeers() {
+  // 1. Seed from FEDERATION_PEERS env — operator-declared trust is implicit.
+  for (const url of FEDERATION_PEERS) {
+    try { approvedPeers.add(new URL(url).host.toLowerCase()); }
+    catch(e) { /* bad URL, ignore */ }
+  }
+  // 2. Load persisted approvals from previous runs.
+  try {
+    const raw  = fs.readFileSync(_approvedPeersFile(), 'utf8');
+    const list = JSON.parse(raw);
+    if (Array.isArray(list)) for (const d of list) if (typeof d === 'string') approvedPeers.add(d.toLowerCase());
+  } catch(e) { /* file doesn't exist yet — first run, fine */ }
+}
+
+function persistApprovedPeers() {
+  try {
+    fs.writeFileSync(_approvedPeersFile(), JSON.stringify([...approvedPeers].sort(), null, 2));
+  } catch(e) { console.error('[peers] Failed to persist approval list:', e.message); }
+}
+
 function federatedUserSnapshot() {
   const out = [];
   for (const [domain, peer] of Object.entries(federationPeers)) {
@@ -1593,6 +1626,121 @@ app.get('/admin/balance', async (req, res) => {
   res.json({ account: ESCROW_ACCOUNT, balance_hbd: balance });
 });
 
+// Express needs the urlencoded parser for POST bodies (we use query params
+// for admin calls but this keeps things robust if anyone sends a form body).
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+// ── Federation peer admin ─────────────────────────────────────────────────
+// GET  /admin/peers?key=ADMIN_KEY
+//      Lists every discovered v4call server with verification + approval
+//      status, plus the set of currently-connected federation peers.
+//
+// POST /admin/peers/approve?key=ADMIN_KEY&domain=example.com
+//      Adds domain to the approved set, persists, and kicks off an outbound
+//      connection if we're the lower-domain tiebreaker initiator.
+//
+// POST /admin/peers/revoke?key=ADMIN_KEY&domain=example.com
+//      Removes domain from approved set, drops any active connection.
+//
+// POST /admin/peers/rescan?key=ADMIN_KEY
+//      Forces an immediate Hive-tag rescan (normally runs every 2h).
+// ─────────────────────────────────────────────────────────────────────────
+function _requireAdmin(req, res) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey || req.query.key !== adminKey) {
+    res.status(403).json({ error: 'Forbidden' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/admin/peers', (req, res) => {
+  if (!_requireAdmin(req, res)) return;
+  const nowMs = Date.now();
+  const peers = Object.entries(discoveredPeers).map(([domain, p]) => ({
+    domain,
+    hive_account:  p.parsed.hive_account,
+    escrow:        p.parsed.escrow,
+    fee_account:   p.parsed.fee_account,
+    federation_ws: p.parsed.federation_ws,
+    software:      p.parsed.software || 'unknown',
+    protocol:      p.parsed.protocol || 'unknown',
+    declared:      p.parsed.declared || null,
+    verified:      p.verified,
+    verify_reason: p.verify_reason,
+    approved:      approvedPeers.has(domain),
+    connected:     !!federationPeers[domain]?.connected,
+    post_author:   p.post_author,
+    post_permlink: p.post_permlink,
+    post_created:  p.post_created,
+    post_age_h:    p.post_created ? +((nowMs - Date.parse(p.post_created)) / 3600000).toFixed(1) : null,
+    last_seen:     p.last_seen
+  }));
+  const connectedUsers = Object.fromEntries(
+    Object.entries(federationPeers)
+      .filter(([, p]) => p.connected)
+      .map(([d, p]) => [d, p.users ? p.users.size : 0])
+  );
+  res.json({
+    our_domain:        SERVER_DOMAIN,
+    discovered:        peers,
+    approved_domains:  [...approvedPeers].sort(),
+    connected_peers:   connectedUsers
+  });
+});
+
+app.post('/admin/peers/approve', (req, res) => {
+  if (!_requireAdmin(req, res)) return;
+  const domain = (req.query.domain || '').toLowerCase().trim();
+  if (!domain) return res.status(400).json({ error: 'domain query parameter required' });
+  const candidate = discoveredPeers[domain];
+  if (!candidate) return res.status(404).json({ error: `domain not found in discovery cache — rescan first`, hint: 'POST /admin/peers/rescan' });
+  if (!candidate.verified) return res.status(400).json({ error: `domain is not verified: ${candidate.verify_reason}` });
+
+  approvedPeers.add(domain);
+  persistApprovedPeers();
+  console.log(`[peers] ✓ Approved @${domain} (via admin endpoint)`);
+
+  // If we're the lower-domain tiebreaker for this peer, open an outbound
+  // connection now so the link comes up without waiting for a restart.
+  let initiating = false;
+  if (candidate.parsed.federation_ws && fedShouldInitiate(domain)) {
+    fedConnectPeer(candidate.parsed.federation_ws);
+    initiating = true;
+  }
+  res.json({
+    approved:   domain,
+    ws:         candidate.parsed.federation_ws,
+    initiating,
+    note:       initiating
+                  ? 'outbound connection starting — watch logs'
+                  : 'we are the higher-domain peer; waiting for inbound from ' + domain
+  });
+});
+
+app.post('/admin/peers/revoke', (req, res) => {
+  if (!_requireAdmin(req, res)) return;
+  const domain = (req.query.domain || '').toLowerCase().trim();
+  if (!domain) return res.status(400).json({ error: 'domain query parameter required' });
+  const wasApproved = approvedPeers.delete(domain);
+  persistApprovedPeers();
+  // Drop any existing connection.
+  const peer = federationPeers[domain];
+  if (peer?.ws) {
+    try { peer.ws.close(1000, 'revoked'); } catch(_) {}
+  }
+  delete federationPeers[domain];
+  console.log(`[peers] ✗ Revoked @${domain} (via admin endpoint)`);
+  res.json({ revoked: domain, was_approved: wasApproved });
+});
+
+app.post('/admin/peers/rescan', async (req, res) => {
+  if (!_requireAdmin(req, res)) return;
+  res.json({ scanning: true });
+  scanV4CallDirectory().catch(e => console.error('[discovery] manual scan error:', e.message));
+});
+
 // GET /debug-state — shows current lobby and room state (no auth, safe info only)
 app.get('/debug-state', (req, res) => {
   res.json({
@@ -2735,6 +2883,90 @@ async function verifyPeer(domain, claimedAccount) {
   return ok;
 }
 
+// ── Directory scanner: Hive-tag discovery of other v4call servers ────────────
+// Parses [V4CALL-SERVER-V1] blocks out of posts tagged "v4call-server" on Hive,
+// keeps the most recent post per author, verifies each candidate via the same
+// verifyPeer() used at handshake, and populates discoveredPeers for the admin
+// UI. Does NOT auto-approve — operator reviews and calls /admin/peers/approve.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseV4CallServerPost(body) {
+  if (!body) return null;
+  const m = body.match(/\[V4CALL-SERVER-V1\]([\s\S]*?)\[\/V4CALL-SERVER-V1\]/i);
+  if (!m) return null;
+  const block = m[1];
+  const grab = (key) => {
+    const re = new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, 'mi');
+    const mm = block.match(re);
+    return mm ? mm[1].trim() : '';
+  };
+  const out = {
+    domain:        grab('DOMAIN').toLowerCase(),
+    hive_account:  grab('HIVE-ACCOUNT').toLowerCase().replace(/^@/, ''),
+    escrow:        grab('ESCROW').toLowerCase().replace(/^@/, ''),
+    fee_account:   grab('FEE-ACCOUNT').toLowerCase().replace(/^@/, ''),
+    federation_ws: grab('FEDERATION-WS'),
+    verify_url:    grab('VERIFY-URL'),
+    software:      grab('SOFTWARE'),
+    protocol:      grab('PROTOCOL'),
+    declared:      grab('DECLARED')
+  };
+  if (!out.domain || !out.hive_account) return null;
+  return out;
+}
+
+async function scanV4CallDirectory() {
+  console.log('[discovery] Scanning Hive tag "v4call-server" for federation peers…');
+  const data = await hivePost({
+    jsonrpc: '2.0',
+    method:  'condenser_api.get_discussions_by_tag',
+    params:  [{ tag: 'v4call-server', limit: 50 }],
+    id: 1
+  });
+  if (!data?.result) {
+    console.warn('[discovery] No response from Hive tag query');
+    return;
+  }
+
+  // Keep only the most recent post PER AUTHOR with title "v4call-server".
+  // Stray tag usage (random posts that happen to include the tag) is filtered
+  // out here — we insist the canonical title as a sanity check.
+  const byAuthor = {};
+  for (const post of data.result) {
+    if (!post.title || post.title.toLowerCase() !== 'v4call-server') continue;
+    const existing = byAuthor[post.author];
+    if (!existing || new Date(post.created) > new Date(existing.created)) {
+      byAuthor[post.author] = post;
+    }
+  }
+
+  let parsedCount = 0, verifiedCount = 0;
+  const now = new Date().toISOString();
+  for (const post of Object.values(byAuthor)) {
+    const parsed = parseV4CallServerPost(post.body);
+    if (!parsed) continue;
+    parsedCount++;
+    if (parsed.hive_account !== post.author.toLowerCase()) {
+      console.warn(`[discovery] Post author mismatch: @${post.author} claims HIVE-ACCOUNT @${parsed.hive_account} — ignored`);
+      continue;
+    }
+    // Re-verify each discovered peer. verifyPeer is cached (1h positive / 5m
+    // negative) so rescans are cheap for unchanged peers.
+    const vr = await verifyPeer(parsed.domain, parsed.hive_account);
+    discoveredPeers[parsed.domain] = {
+      post_author:   post.author,
+      post_permlink: post.permlink,
+      post_created:  post.created,
+      parsed,
+      verified:      !!vr.verified,
+      verify_reason: vr.verified ? null : (vr.reason || 'unknown'),
+      last_seen:     now
+    };
+    if (vr.verified) verifiedCount++;
+  }
+  console.log(`[discovery] Scan complete — ${parsedCount} v4call-server post(s), ${verifiedCount} verified`);
+}
+
 function fedRegisterPeer(domain, name, ws, escrow) {
   const existing = federationPeers[domain];
   const isOutbound = ws._isOutbound === true;
@@ -2806,6 +3038,16 @@ async function fedHandleMessage(ws, raw) {
       if (!vr.verified) {
         console.error(`[federation] ✗ Peer verification failed for ${domain}: ${vr.reason}`);
         try { ws.close(1008, 'verification failed'); } catch(_) {}
+        return;
+      }
+
+      // Approval gate — verified peers must also be explicitly trusted by
+      // this operator before they can federate. Seeded from FEDERATION_PEERS
+      // env; additions via POST /admin/peers/approve after reviewing the
+      // discovered-peers list.
+      if (!approvedPeers.has(domain)) {
+        console.warn(`[federation] ✗ Peer verified but NOT APPROVED: ${domain} — approve via POST /admin/peers/approve?domain=${domain}&key=<ADMIN_KEY>`);
+        try { ws.close(1008, 'not approved'); } catch(_) {}
         return;
       }
 
@@ -3217,7 +3459,16 @@ function fedConnectPeer(url) {
 }
 
 if (FEDERATION_ENABLED) {
+  loadApprovedPeers();
+  console.log(`[federation] Approved peers: ${[...approvedPeers].join(', ') || '(none)'}`);
   for (const url of FEDERATION_PEERS) fedConnectPeer(url);
+  // Kick off discovery shortly after startup (non-blocking), then every 2 hours.
+  setTimeout(() => {
+    scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
+  }, 5000);
+  setInterval(() => {
+    scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
+  }, 2 * 60 * 60 * 1000);
 }
 
 
