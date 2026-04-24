@@ -1208,6 +1208,36 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   payment._processing = true;
   stopCreditBurn(callId);
 
+  // Federated call: we host the room but the callee's escrow holds the funds.
+  // Hand off to the callee's server, which will disburse from its own escrow
+  // and send back a receipt for our caller.
+  const room = rooms[roomName];
+  if (room?.federated && payment.calleeServer) {
+    const peer = federationPeers[payment.calleeServer];
+    const now        = Date.now();
+    const durationMs = payment.startTime ? (now - payment.startTime) : 0;
+    if (peer?.connected) {
+      fedSend(peer.ws, {
+        type: 'call-ended',
+        callId,
+        durationMs,
+        endReason,
+        callerServer: SERVER_DOMAIN
+      });
+      console.log(`[billing] Federated call ${callId} → handed off to ${payment.calleeServer} for disbursement`);
+    } else {
+      console.error(`[billing] ⚠ Federated call ${callId} ended but peer ${payment.calleeServer} unreachable — funds stuck in their escrow`);
+    }
+    ledgerCallUpdate(callId, {
+      ended_at:     new Date(now).toISOString(),
+      duration_min: parseFloat((durationMs / 60000).toFixed(2)),
+      status:       'ended_federated',
+      end_reason:   endReason
+    });
+    delete activePayments[callId];
+    return;
+  }
+
   const now         = Date.now();
   const startTime   = payment.startTime || now;
   const durationMs  = payment.startTime ? (now - startTime) : 0;
@@ -1321,6 +1351,125 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     } else {
       console.error(`[billing] Platform fee FAILED: ${feeResult.reason}`);
     }
+  }
+
+  delete activePayments[callId];
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Federated Call End — disburse on the callee's server ─────────────────────
+//
+// Runs on the CALLEE's server when the caller's server signals `call-ended`.
+// Uses the payment state we've been accumulating from `payment-verified`
+// messages, then disburses from OUR escrow (which is where the caller actually
+// paid, since callee's rates post points at us):
+//
+//   callee-net   → local callee (on-chain transfer, our escrow is the source)
+//   platform-cut → our SERVER_HIVE_ACCOUNT (platform fee goes to us)
+//   refund       → remote caller (cross-server Hive transfer from our escrow)
+//
+// Sends a `call-receipt-fed` back to the caller's server so it can show the
+// caller their receipt; emits `call-receipt` locally to the callee.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function processFederatedCallEnd(callId, durationMs, endReason, callerServer) {
+  const payment = activePayments[callId];
+  if (!payment) {
+    console.warn(`[fed-billing] No payment state for ${callId} — skipping disbursement`);
+    return;
+  }
+  if (payment._processing) return;
+  payment._processing = true;
+
+  const now         = Date.now();
+  const durationMin = Math.min((durationMs || 0) / 60000, MAX_CALL_DURATION_MIN);
+  const durationHr  = durationMin / 60;
+
+  const ratePerHour = payment.ratePerHour || 0;
+  const depositPaid = payment.depositPaid || 0;
+  const connectPaid = payment.connectPaid || 0;
+  const ringPaid    = payment.ringPaid    || 0;
+  // Use OUR server's minimum, matching what the callee's rates post promised —
+  // this is the "callee's server takes the platform fee" rule in Model 3.
+  const platformFee = PLATFORM_FEE;
+  const currency    = payment.currency    || 'HBD';
+
+  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(3));
+  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(3));
+  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(3));
+  const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(3));
+  const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(3));
+  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(3));
+
+  console.log(`[fed-billing] Call ${callId} ended (${endReason}) — disbursing`);
+  console.log(`[fed-billing]   Duration:   ${durationMin.toFixed(2)} min`);
+  console.log(`[fed-billing]   Callee net: ${calleeNet} ${currency} → @${payment.callee}`);
+  console.log(`[fed-billing]   Platform:   ${platformTotal} ${currency} → @${SERVER_HIVE_ACCOUNT}`);
+  console.log(`[fed-billing]   Refund:     ${refundAmount} ${currency} → @${payment.caller}@${callerServer}`);
+
+  const receipt = {
+    callId,
+    caller: payment.caller, callee: payment.callee,
+    startTime: payment.startTime ? new Date(payment.startTime).toISOString() : null,
+    endTime:   new Date(now).toISOString(),
+    durationMin: parseFloat(durationMin.toFixed(2)),
+    ringPaid, connectPaid, depositPaid, durationCost, refundAmount,
+    calleeNet, platformTotal, platformOnCall, currency, endReason,
+    federated: true, callerServer
+  };
+
+  ledgerCallUpdate(callId, {
+    ended_at:      new Date(now).toISOString(),
+    duration_min:  parseFloat(durationMin.toFixed(2)),
+    ring_paid:     ringPaid,
+    connect_paid:  connectPaid,
+    duration_cost: durationCost,
+    callee_net:    calleeNet,
+    platform_cut:  platformTotal,
+    status:        'ended',
+    end_reason:    endReason
+  });
+
+  // 1. Callee payout (local user, our escrow)
+  if (calleeNet >= 0.001) {
+    const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
+    ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
+    const r = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
+    if (r.success) ledgerPaymentUpdate(callId, 'payout', 'sent', r.txId);
+    else           console.error(`[fed-billing] Payout FAILED: ${r.reason}`);
+  }
+
+  // 2. Refund to remote caller (our escrow → their Hive account)
+  if (refundAmount >= 0.001) {
+    const refundMemo = `v4call:refund:${callId}:unused-credit`;
+    ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
+    const r = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
+    if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
+    else           console.error(`[fed-billing] Refund FAILED to @${payment.caller}: ${r.reason}`);
+  }
+
+  // 3. Platform fee to us
+  if (platformTotal >= 0.001) {
+    const feeMemo = `v4call:fee:${callId}:ring+cut`;
+    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
+    const r = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
+    if (r.success) ledgerPaymentUpdate(callId, 'platform_fee', 'sent', r.txId);
+    else           console.error(`[fed-billing] Fee FAILED: ${r.reason}`);
+  }
+
+  // Emit receipt to local callee
+  const calleeSid = lobbyUsers[payment.callee]?.socketId;
+  if (calleeSid) io.to(calleeSid).emit('call-receipt', { ...receipt, perspective: 'callee' });
+
+  // Send receipt for caller back to caller's server
+  const peer = federationPeers[callerServer];
+  if (peer?.connected) {
+    fedSend(peer.ws, {
+      type: 'call-receipt-fed',
+      callId,
+      receipt: { ...receipt, perspective: 'caller' }
+    });
   }
 
   delete activePayments[callId];
@@ -1624,18 +1773,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const textRate = applicable?.flat || 0;
-    const cur      = textCurrency || applicable?.currency || 'HBD';
-
-    // v0.2 federation limitation: paid DMs across servers aren't yet supported
-    // because disbursement requires the recipient's server to hold the escrow
-    // key for the destination account. Free DMs work; paid ones fail clearly.
-    if (federatedTo && textRate >= 0.001) {
-      socket.emit('lobby-dm-error',
-        `@${to} is on ${federatedTo.domain}. Paid DMs across federated servers are not yet supported. ` +
-        `Either contact @${to} on ${federatedTo.domain} directly, or wait for them to reduce their text rate to free.`);
-      return;
-    }
+    const textRate     = applicable?.flat || 0;
+    const cur          = textCurrency || applicable?.currency || 'HBD';
+    const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
 
     if (textRate >= 0.001) {
       // ── Payment required ─────────────────────────────────────────────────
@@ -1644,51 +1784,57 @@ io.on('connection', (socket) => {
           to,
           rate:     textRate,
           currency: cur,
-          escrow:   calleeRates?.escrow || ESCROW_ACCOUNT
+          escrow:   calleeEscrow
         });
         return;
       }
 
-      // Verify the transfer — route to correct verifier based on currency
+      // Verify the transfer against the CALLEE's escrow (their rates post says
+      // where to pay) — for federated recipients this is the peer's escrow,
+      // not ours. We're only the verifier; disbursement happens on the
+      // recipient's server (it owns the escrow key).
       const ok = (cur !== 'HBD' && cur !== 'HIVE')
-        ? await verifyHiveEnginePayment(from, ESCROW_ACCOUNT, textPaid, cur, textMemo)
-        : await verifyHivePayment(from, ESCROW_ACCOUNT, textPaid, textMemo);
+        ? await verifyHiveEnginePayment(from, calleeEscrow, textPaid, cur, textMemo)
+        : await verifyHivePayment(from, calleeEscrow, textPaid, textMemo);
       if (!ok) {
         socket.emit('lobby-dm-error', `Payment not found on blockchain — message not sent. Funds are safe if ${cur} left your account.`);
         return;
       }
 
-      ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, textPaid, textMemo, 'verified');
+      ledgerPayment(msgId, 'text', from, calleeEscrow, textPaid, textMemo, 'verified');
 
-      // ── Disburse ─────────────────────────────────────────────────────────
-      const platformFee  = applicable.platformFee || PLATFORM_FEE;
-      const platformCut  = parseFloat((textPaid * platformFee).toFixed(3));
-      const recipientNet = parseFloat((textPaid - platformCut).toFixed(3));
+      // For LOCAL recipients we disburse from our own escrow; for FEDERATED
+      // recipients we forward the payment info and let their server disburse.
+      if (recipient) {
+        const platformFee  = applicable.platformFee || PLATFORM_FEE;
+        const platformCut  = parseFloat((textPaid * platformFee).toFixed(3));
+        const recipientNet = parseFloat((textPaid - platformCut).toFixed(3));
 
-      if (recipientNet >= 0.001) {
-        const payoutMemo = `v4call:text-payout:${msgId}`;
-        ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
-        sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
-          if (r.success) {
-            ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
-            io.to(recipient.socketId).emit('text-payment-received', {
-              from, amount: recipientNet, currency: cur, msgId
-            });
-          } else {
-            console.error(`[text] Payout failed to @${to}: ${r.reason}`);
-          }
-        });
+        if (recipientNet >= 0.001) {
+          const payoutMemo = `v4call:text-payout:${msgId}`;
+          ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
+          sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+            if (r.success) {
+              ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+              io.to(recipient.socketId).emit('text-payment-received', {
+                from, amount: recipientNet, currency: cur, msgId
+              });
+            } else {
+              console.error(`[text] Payout failed to @${to}: ${r.reason}`);
+            }
+          });
+        }
+
+        if (platformCut >= 0.001) {
+          const feeMemo = `v4call:text-fee:${msgId}`;
+          ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
+          sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+            if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+          });
+        }
+
+        console.log(`[text] @${from} → @${to}: paid ${textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
       }
-
-      if (platformCut >= 0.001) {
-        const feeMemo = `v4call:text-fee:${msgId}`;
-        ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
-        sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
-          if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
-        });
-      }
-
-      console.log(`[text] @${from} → @${to}: paid ${textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
     }
 
     // ── Relay the message ─────────────────────────────────────────────────
@@ -1698,9 +1844,11 @@ io.on('connection', (socket) => {
       fedSend(federatedTo.ws, {
         type: 'dm',
         from, to, ciphertext, signature, timestamp,
-        textPaid:  textPaid || 0,
-        msgId:     msgId    || null,
-        fromServer: SERVER_DOMAIN
+        textPaid:    textPaid    || 0,
+        textMemo:    textMemo    || null,
+        textCurrency: cur,
+        msgId:       msgId       || null,
+        fromServer:  SERVER_DOMAIN
       });
     }
     socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0 });
@@ -1866,49 +2014,71 @@ io.on('connection', (socket) => {
 
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
 
-  socket.on('verify-ring-payment', async ({ callId, callee, amount, memo, currency }, cb) => {
+  socket.on('verify-ring-payment', async ({ callId, callee, amount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb({ verified: false, reason: 'Not authenticated' });
     const cur = currency || 'HBD';
+    // Verify against the actual escrow the caller paid — for federated callees
+    // this is the peer's escrow account, not our local one.
+    const targetEscrow = escrow || ESCROW_ACCOUNT;
 
-    console.log(`[payment] Verifying ring payment: @${caller} paid ${amount} ${cur} (memo: ${memo})`);
+    console.log(`[payment] Verifying ring: @${caller} → @${targetEscrow} ${amount} ${cur} (memo: ${memo})`);
     const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(caller, ESCROW_ACCOUNT, amount, cur, memo)
-      : await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
+      ? await verifyHiveEnginePayment(caller, targetEscrow, amount, cur, memo)
+      : await verifyHivePayment(caller, targetEscrow, amount, memo);
 
     if (ok) {
       if (!activePayments[callId]) activePayments[callId] = {};
-      activePayments[callId].ringPaid = amount;
-      activePayments[callId].ringMemo = memo;
-      activePayments[callId].caller   = caller;
-      activePayments[callId].callee   = callee;
-      activePayments[callId].currency = cur;
+      activePayments[callId].ringPaid    = amount;
+      activePayments[callId].ringMemo    = memo;
+      activePayments[callId].caller      = caller;
+      activePayments[callId].callee      = callee;
+      activePayments[callId].currency    = cur;
+      activePayments[callId].escrow      = targetEscrow;
 
       // Fetch and store rate info for billing at call end
       const rates = await fetchRates(callee);
       if (rates) {
         const applicable = await getRatesForCaller(rates, caller, 'voice', new Date());
-        if (applicable && !applicable.blocked) {
+        if (applicable && !applicable.blocked && !applicable.feeRejected) {
           activePayments[callId].ratePerHour = applicable.rate       || 0;
           activePayments[callId].minDeposit  = applicable.minDeposit || 0;
-          activePayments[callId].platformFee = rates.platformFee     || PLATFORM_FEE;
+          activePayments[callId].platformFee = applicable.platformFee || PLATFORM_FEE;
         }
       }
       console.log(`[payment] Ring fee verified for ${callId} — rate: ${activePayments[callId].ratePerHour} ${cur}/hr`);
+
+      // If callee is on a federated peer, forward verified payment so peer can settle at end.
+      if (FEDERATION_ENABLED) {
+        const peer = peerForUser(callee);
+        if (peer) {
+          activePayments[callId].calleeServer = peer.domain;
+          fedSend(peer.ws, {
+            type: 'payment-verified',
+            paymentType: 'ring',
+            callId, from: caller, to: callee, amount, currency: cur, memo,
+            ratePerHour: activePayments[callId].ratePerHour,
+            platformFee: activePayments[callId].platformFee,
+            callType: 'voice',
+            callerServer: SERVER_DOMAIN
+          });
+        }
+      }
     }
 
     cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
   });
 
-  socket.on('verify-deposit-payment', async ({ callId, callee, totalAmount, depositAmount, connectAmount, memo, currency }, cb) => {
+  socket.on('verify-deposit-payment', async ({ callId, callee, totalAmount, depositAmount, connectAmount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false, reason: 'Not authenticated' });
     const cur = currency || 'HBD';
+    const targetEscrow = escrow || ESCROW_ACCOUNT;
 
-    console.log(`[payment] Verifying deposit: @${caller} paid ${totalAmount} ${cur} (memo: ${memo})`);
+    console.log(`[payment] Verifying deposit: @${caller} → @${targetEscrow} ${totalAmount} ${cur} (memo: ${memo})`);
     const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(caller, ESCROW_ACCOUNT, totalAmount, cur, memo)
-      : await verifyHivePayment(caller, ESCROW_ACCOUNT, totalAmount, memo);
+      ? await verifyHiveEnginePayment(caller, targetEscrow, totalAmount, cur, memo)
+      : await verifyHivePayment(caller, targetEscrow, totalAmount, memo);
 
     if (ok) {
       if (!activePayments[callId]) activePayments[callId] = {};
@@ -1918,17 +2088,39 @@ io.on('connection', (socket) => {
       activePayments[callId].caller          = caller;
       activePayments[callId].callee          = callee;
       activePayments[callId].currency        = cur;
+      activePayments[callId].escrow          = targetEscrow;
       console.log(`[payment] ✓ Deposit verified ${callId}: total=${totalAmount} connect=${connectAmount} deposit=${depositAmount} ${cur}`);
-      ledgerPayment(callId, 'deposit', caller, ESCROW_ACCOUNT, totalAmount, memo, 'verified');
+      ledgerPayment(callId, 'deposit', caller, targetEscrow, totalAmount, memo, 'verified');
+
+      if (FEDERATION_ENABLED) {
+        const peer = peerForUser(callee);
+        if (peer) {
+          activePayments[callId].calleeServer = peer.domain;
+          fedSend(peer.ws, {
+            type: 'payment-verified',
+            paymentType: 'deposit',
+            callId, from: caller, to: callee,
+            amount: totalAmount, depositAmount, connectAmount: connectAmount || 0,
+            currency: cur, memo,
+            callerServer: SERVER_DOMAIN
+          });
+        }
+      }
     }
 
     if (cb) cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
   });
 
-  socket.on('verify-topup-payment', async ({ callId, amount, memo }, cb) => {
+  socket.on('verify-topup-payment', async ({ callId, amount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false });
-    const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
+    const cur = currency || 'HBD';
+    const targetEscrow = escrow || activePayments[callId]?.escrow || ESCROW_ACCOUNT;
+
+    const ok = (cur !== 'HBD' && cur !== 'HIVE')
+      ? await verifyHiveEnginePayment(caller, targetEscrow, amount, cur, memo)
+      : await verifyHivePayment(caller, targetEscrow, amount, memo);
+
     if (ok && activePayments[callId]) {
       activePayments[callId].depositPaid     = (activePayments[callId].depositPaid     || 0) + amount;
       activePayments[callId].creditRemaining = (activePayments[callId].creditRemaining || 0) + amount;
@@ -1937,8 +2129,21 @@ io.on('connection', (socket) => {
       if (room) io.to(room).emit('credit-topup', {
         amount, creditRemaining: activePayments[callId].creditRemaining, minutesLeft: minLeft
       });
-      ledgerPayment(callId, 'topup', caller, ESCROW_ACCOUNT, amount, memo, 'verified');
-      console.log(`[payment] Top-up ${amount} HBD for call ${callId}`);
+      ledgerPayment(callId, 'topup', caller, targetEscrow, amount, memo, 'verified');
+      console.log(`[payment] Top-up ${amount} ${cur} for call ${callId}`);
+
+      if (FEDERATION_ENABLED && activePayments[callId].calleeServer) {
+        const peer = federationPeers[activePayments[callId].calleeServer];
+        if (peer?.connected) {
+          fedSend(peer.ws, {
+            type: 'payment-verified',
+            paymentType: 'topup',
+            callId, from: caller, to: activePayments[callId].callee,
+            amount, currency: cur, memo,
+            callerServer: SERVER_DOMAIN
+          });
+        }
+      }
     }
     if (cb) cb({ verified: ok });
   });
@@ -2463,20 +2668,73 @@ function fedHandleMessage(ws, raw) {
       // Incoming DM for one of our local users — ciphertext only.
       // The recipient's server (us) stores the recipient's copy; the sender's
       // server stores the sender's copy. We never see plaintext.
-      const { from, to, ciphertext, signature, timestamp, textPaid, fromServer } = msg;
+      // Paid DMs include payment fields; we verify on-chain against OUR escrow
+      // (the destination per recipient's rates post) and disburse from it.
+      const { from, to, ciphertext, signature, timestamp,
+              textPaid, textMemo, textCurrency, msgId, fromServer } = msg;
       if (!from || !to || !ciphertext) return;
       const recipient = lobbyUsers[to];
-      if (recipient) {
-        io.to(recipient.socketId).emit('lobby-dm', {
-          from, ciphertext, signature, timestamp,
-          textPaid: textPaid || 0,
-          fromServer: fromServer || ws._domain
+      const cur       = textCurrency || 'HBD';
+      const paid      = textPaid || 0;
+
+      const deliver = () => {
+        if (recipient) {
+          io.to(recipient.socketId).emit('lobby-dm', {
+            from, ciphertext, signature, timestamp,
+            textPaid: paid,
+            fromServer: fromServer || ws._domain
+          });
+        }
+        chatStoreDm(from, to, ciphertext, null, signature, timestamp, paid);
+        fedSend(ws, { type: 'dm-delivered', from, to, msgId: msgId || null });
+      };
+
+      if (paid >= 0.001 && textMemo && msgId) {
+        // Re-verify on-chain (caller's server already verified, but trust-but-verify)
+        const verifier = (cur !== 'HBD' && cur !== 'HIVE')
+          ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
+          : verifyHivePayment(from, ESCROW_ACCOUNT, paid, textMemo);
+        verifier.then(ok => {
+          if (!ok) {
+            console.warn(`[fed-text] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo})`);
+            fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: 'payment not on chain' });
+            return;
+          }
+          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified');
+
+          // Disburse from our escrow — recipient gets net, we keep platform cut.
+          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(3));
+          const recipientNet = parseFloat((paid - platformCut).toFixed(3));
+
+          if (recipientNet >= 0.001) {
+            const payoutMemo = `v4call:text-payout:${msgId}`;
+            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
+            sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+                if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
+                  from, amount: recipientNet, currency: cur, msgId
+                });
+              } else {
+                console.error(`[fed-text] Payout to @${to} failed: ${r.reason}`);
+              }
+            });
+          }
+          if (platformCut >= 0.001) {
+            const feeMemo = `v4call:text-fee:${msgId}`;
+            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
+            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+              if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+            });
+          }
+
+          console.log(`[fed-text] @${from}@${fromServer || ws._domain} → @${to}: paid ${paid} ${cur} | net ${recipientNet} | fee ${platformCut}`);
+          deliver();
         });
+      } else {
+        deliver();
+        console.log(`[federation] DM relayed: @${from}@${fromServer || ws._domain} → @${to}`);
       }
-      // Store recipient's copy regardless of online status (so they see it on next login)
-      chatStoreDm(from, to, ciphertext, null, signature, timestamp, textPaid || 0);
-      fedSend(ws, { type: 'dm-delivered', from, to, msgId: msg.msgId || null });
-      console.log(`[federation] DM relayed: @${from}@${fromServer || ws._domain} → @${to}`);
       break;
     }
     case 'dm-delivered': {
@@ -2583,6 +2841,82 @@ function fedHandleMessage(ws, raw) {
         delete calleeUser.inCall;
         delete calleeUser.pendingFederatedCall;
       }
+      break;
+    }
+
+    case 'payment-verified': {
+      // Caller's server forwarded a verified payment. We re-verify on-chain
+      // (the payment should have landed in OUR escrow since we host the callee)
+      // and record it in activePayments so processFederatedCallEnd can settle.
+      const { paymentType, callId, from, to, amount, currency, memo } = msg;
+      if (!callId || !from || !to) break;
+      const cur = currency || 'HBD';
+      const verifier = (cur !== 'HBD' && cur !== 'HIVE')
+        ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, amount, cur, memo)
+        : verifyHivePayment(from, ESCROW_ACCOUNT, amount, memo);
+      verifier.then(ok => {
+        if (!ok) {
+          console.warn(`[fed-payment] ✗ Re-verify failed for ${paymentType} ${callId} (@${from} → @${ESCROW_ACCOUNT} ${amount} ${cur})`);
+          fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: 'on-chain not found' });
+          return;
+        }
+        if (!activePayments[callId]) activePayments[callId] = {};
+        const p = activePayments[callId];
+        p.caller        = from;
+        p.callee        = to;
+        p.currency      = cur;
+        p.callerServer  = msg.callerServer || ws._domain;
+        if (!p.startTime) p.startTime = Date.now();
+
+        if (paymentType === 'ring') {
+          p.ringPaid    = amount;
+          p.ringMemo    = memo;
+          if (msg.ratePerHour !== undefined) p.ratePerHour = msg.ratePerHour;
+          if (msg.platformFee !== undefined) p.posterPlatformFee = msg.platformFee;
+          if (msg.callType    !== undefined) p.callType    = msg.callType;
+          ledgerCallCreate(callId, from, to, msg.callType || 'voice');
+          ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+        } else if (paymentType === 'deposit') {
+          p.depositPaid     = msg.depositAmount || amount;
+          p.connectPaid     = msg.connectAmount || 0;
+          p.creditRemaining = p.depositPaid;
+          ledgerPayment(callId, 'deposit', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+        } else if (paymentType === 'topup') {
+          p.depositPaid     = (p.depositPaid     || 0) + amount;
+          p.creditRemaining = (p.creditRemaining || 0) + amount;
+          ledgerPayment(callId, 'topup', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+          // Let the local callee's UI know the caller added more credit.
+          const calleeSid = lobbyUsers[to]?.socketId;
+          if (calleeSid) io.to(calleeSid).emit('credit-topup', {
+            amount, creditRemaining: p.creditRemaining, minutesLeft: null
+          });
+        }
+        console.log(`[fed-payment] Recorded ${paymentType} for ${callId}: @${from} paid ${amount} ${cur}`);
+      });
+      break;
+    }
+
+    case 'payment-rejected': {
+      console.warn(`[fed-payment] Peer rejected our payment forward: ${msg.callId} ${msg.paymentType} — ${msg.reason}`);
+      break;
+    }
+
+    case 'call-ended': {
+      // Caller's server signalling end of a federated call — we disburse.
+      const { callId, durationMs, endReason, callerServer } = msg;
+      processFederatedCallEnd(callId, durationMs || 0, endReason || 'unknown', callerServer || ws._domain)
+        .catch(e => console.error(`[fed-billing] processFederatedCallEnd failed: ${e.message}`));
+      break;
+    }
+
+    case 'call-receipt-fed': {
+      // Callee's server sent us the caller's receipt after disbursing.
+      const { callId, receipt } = msg;
+      if (!receipt) break;
+      const caller = receipt.caller;
+      const callerSid = lobbyUsers[caller]?.socketId;
+      if (callerSid) io.to(callerSid).emit('call-receipt', receipt);
+      console.log(`[fed-billing] Forwarded caller receipt for ${callId} to @${caller}`);
       break;
     }
   }
