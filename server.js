@@ -90,7 +90,8 @@ if (FEDERATION_ENABLED) {
 // ── v0.13 Lobby Notice + Anti-Spam Gate (env only; no federation bump) ──────
 const LOBBY_NOTICE_RAW = process.env.LOBBY_NOTICE || '';
 const LOBBY_REQUIREMENTS_RAW = process.env.LOBBY_REQUIREMENTS_TEXT || '';
-const LOBBY_POST_MIN_HP = parseFloat(process.env.LOBBY_POST_MIN_HP || '0') || 0;
+const LOBBY_POST_MIN_HP   = parseFloat(process.env.LOBBY_POST_MIN_HP   || '0') || 0;
+const LOBBY_POST_MIN_HIVE = parseFloat(process.env.LOBBY_POST_MIN_HIVE || '0') || 0;
 const LOBBY_POST_MIN_TOKEN_RAW = (process.env.LOBBY_POST_MIN_TOKEN || '').trim();
 const LOBBY_POST_GATE_MODE = (process.env.LOBBY_POST_GATE_MODE || 'or').toLowerCase() === 'and' ? 'and' : 'or';
 let LOBBY_POST_MIN_TOKEN_SYMBOL = null;
@@ -104,8 +105,9 @@ const LOBBY_NOTICE_RESOLVED = LOBBY_NOTICE_RAW ||
   `${SERVER_DOMAIN} — local lobby. For federated contacts use rooms / DMs / calls.`;
 const LOBBY_REQUIREMENTS_RESOLVED = LOBBY_REQUIREMENTS_RAW || (() => {
   const parts = [];
-  if (LOBBY_POST_MIN_HP > 0) parts.push(`${LOBBY_POST_MIN_HP} HP`);
-  if (LOBBY_POST_MIN_TOKEN_SYMBOL) parts.push(`${LOBBY_POST_MIN_TOKEN_AMOUNT} ${LOBBY_POST_MIN_TOKEN_SYMBOL}`);
+  if (LOBBY_POST_MIN_HP   > 0)         parts.push(`${LOBBY_POST_MIN_HP} HP`);
+  if (LOBBY_POST_MIN_HIVE > 0)         parts.push(`${LOBBY_POST_MIN_HIVE} HIVE`);
+  if (LOBBY_POST_MIN_TOKEN_SYMBOL)     parts.push(`${LOBBY_POST_MIN_TOKEN_AMOUNT} ${LOBBY_POST_MIN_TOKEN_SYMBOL}`);
   if (parts.length === 0) return '';
   if (parts.length === 1) return `Posting requires ${parts[0]}.`;
   return `Posting requires ${parts.join(LOBBY_POST_GATE_MODE === 'and' ? ' AND ' : ' OR ')}.`;
@@ -594,29 +596,37 @@ async function getHivePerVest() {
   return hivePerVest;
 }
 
-async function getHivePower(username) {
+// Single account fetch populates both HP (computed from vesting_shares) and
+// liquid HIVE (the `balance` field). v0.13 added the liquid-HIVE gate; doing
+// both off one API call keeps the cache + Hive node load constant.
+async function getAccountStats(username) {
   const cached = hpCache[username];
-  if (cached && (Date.now() - cached.fetchedAt) < HP_CACHE_TTL) return cached.hp;
+  if (cached && (Date.now() - cached.fetchedAt) < HP_CACHE_TTL) return cached.stats;
   const data = await hivePost({
     jsonrpc: '2.0',
     method: 'condenser_api.get_accounts',
     params: [[username]], id: 1
   });
   if (!data?.result?.[0]) {
-    console.warn(`[hp] account @${username} not found — treating HP as 0 (not cached)`);
-    return 0;
+    console.warn(`[hp] account @${username} not found — treating HP and HIVE as 0 (not cached)`);
+    return { hp: 0, liquidHive: 0 };
   }
   const acct = data.result[0];
   const ownedVests = parseFloat(acct.vesting_shares); // "12345.678901 VESTS"
+  const liquidHive = parseFloat(acct.balance);        // "33.000 HIVE"
   const hivePerVest = await getHivePerVest();
   if (!hivePerVest) {
-    console.warn(`[hp] hive_per_vest unavailable — treating HP as 0 (not cached)`);
-    return 0;
+    console.warn(`[hp] hive_per_vest unavailable — treating HP as 0 (HIVE balance still resolved, not cached)`);
+    return { hp: 0, liquidHive };
   }
   const hp = ownedVests * hivePerVest;
-  hpCache[username] = { hp, fetchedAt: Date.now() };
-  return hp;
+  const stats = { hp, liquidHive };
+  hpCache[username] = { stats, fetchedAt: Date.now() };
+  return stats;
 }
+
+async function getHivePower(username)  { return (await getAccountStats(username)).hp; }
+async function getLiquidHive(username) { return (await getAccountStats(username)).liquidHive; }
 
 // Periodic cache cleanup (mirror tokenBalanceCache pattern)
 setInterval(() => {
@@ -625,17 +635,24 @@ setInterval(() => {
 }, 15 * 60 * 1000);
 
 async function checkLobbyPostGate(username) {
-  if (LOBBY_POST_MIN_HP <= 0 && !LOBBY_POST_MIN_TOKEN_SYMBOL) {
+  // Fast-path when no gate is configured — no Hive API calls per message.
+  if (LOBBY_POST_MIN_HP <= 0 && LOBBY_POST_MIN_HIVE <= 0 && !LOBBY_POST_MIN_TOKEN_SYMBOL) {
     return { allowed: true };
   }
+  // If HP and/or HIVE is configured, fetch the account once and reuse both.
+  let stats = null;
+  if (LOBBY_POST_MIN_HP > 0 || LOBBY_POST_MIN_HIVE > 0) {
+    stats = await getAccountStats(username);
+  }
   const checks = [];
-  let hp = null, tokenBal = null;
   if (LOBBY_POST_MIN_HP > 0) {
-    hp = await getHivePower(username);
-    checks.push({ kind: 'hp', actual: hp, required: LOBBY_POST_MIN_HP, pass: hp >= LOBBY_POST_MIN_HP });
+    checks.push({ kind: 'hp', actual: stats.hp, required: LOBBY_POST_MIN_HP, pass: stats.hp >= LOBBY_POST_MIN_HP });
+  }
+  if (LOBBY_POST_MIN_HIVE > 0) {
+    checks.push({ kind: 'hive', actual: stats.liquidHive, required: LOBBY_POST_MIN_HIVE, pass: stats.liquidHive >= LOBBY_POST_MIN_HIVE });
   }
   if (LOBBY_POST_MIN_TOKEN_SYMBOL) {
-    tokenBal = await getHiveEngineTokenBalance(username, LOBBY_POST_MIN_TOKEN_SYMBOL);
+    const tokenBal = await getHiveEngineTokenBalance(username, LOBBY_POST_MIN_TOKEN_SYMBOL);
     checks.push({
       kind: 'token', symbol: LOBBY_POST_MIN_TOKEN_SYMBOL,
       actual: tokenBal, required: LOBBY_POST_MIN_TOKEN_AMOUNT,
@@ -646,14 +663,14 @@ async function checkLobbyPostGate(username) {
     ? checks.every(c => c.pass)
     : checks.some(c => c.pass);
   if (passed) return { allowed: true };
-  const required = checks.map(c => c.kind === 'hp'
-    ? `${c.required} HP`
-    : `${c.required} ${c.symbol}`
-  ).join(LOBBY_POST_GATE_MODE === 'and' ? ' AND ' : ' OR ');
-  const actual = checks.map(c => c.kind === 'hp'
-    ? `${c.actual.toFixed(1)} HP`
-    : `${c.actual} ${c.symbol}`
-  ).join(', ');
+  const fmtRequired = c => c.kind === 'hp'   ? `${c.required} HP`
+                         : c.kind === 'hive' ? `${c.required} HIVE`
+                         :                     `${c.required} ${c.symbol}`;
+  const fmtActual   = c => c.kind === 'hp'   ? `${c.actual.toFixed(1)} HP`
+                         : c.kind === 'hive' ? `${c.actual.toFixed(3)} HIVE`
+                         :                     `${c.actual} ${c.symbol}`;
+  const required = checks.map(fmtRequired).join(LOBBY_POST_GATE_MODE === 'and' ? ' AND ' : ' OR ');
+  const actual   = checks.map(fmtActual).join(', ');
   return {
     allowed: false,
     message: `This server requires ${required} to post in the lobby. You have ${actual}.`

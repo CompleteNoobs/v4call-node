@@ -23,3 +23,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# that thing, server signing thingly 
+public/.well-known/v4call-server.json
