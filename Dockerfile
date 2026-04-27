@@ -1,8 +1,9 @@
 # ── v4call Dockerfile ─────────────────────────────────────────────────────────
 FROM node:20-alpine
 
-# Install build tools needed for better-sqlite3 native module
-RUN apk add --no-cache python3 make g++ sqlite
+# Install build tools needed for better-sqlite3 native module + curl for the
+# /admin/discovery-test diagnostic endpoint (alpine ships wget but not curl).
+RUN apk add --no-cache python3 make g++ sqlite curl
 
 WORKDIR /app
 

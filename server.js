@@ -48,12 +48,15 @@ const BIND_HOST           = process.env.BIND_HOST            || '127.0.0.1';
 
 // Hive API nodes — can override the primary node via HIVE_API env var.
 // Server tries each in order and falls back automatically on failure.
+// Refreshed 2026-04: dropped anyx.io and hived.emre.sh (intermittent/dead),
+// added arcange / openhive / techcoderx as known-reliable fallbacks.
 const HIVE_API       = process.env.HIVE_API || 'https://api.hive.blog';
 const HIVE_API_NODES = [
   HIVE_API,
-  'https://anyx.io',
   'https://api.deathwing.me',
-  'https://hived.emre.sh'
+  'https://hive-api.arcange.eu',
+  'https://api.openhive.network',
+  'https://techcoderx.com'
 ].filter((v, i, a) => a.indexOf(v) === i); // deduplicate if HIVE_API matches a fallback
 
 // Call behaviour — tunable via .env
@@ -185,21 +188,27 @@ chatDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_room_created  ON room_messages(created_at);
 `);
 
+// Migration: paid-DM badge needs the actual currency. Older rows back-default
+// to 'HBD' which is wrong for token DMs but unfixable without payment metadata.
+try { chatDb.exec(`ALTER TABLE dm_messages ADD COLUMN currency TEXT DEFAULT 'HBD'`); }
+catch(e) { /* duplicate column = already migrated */ }
+
 console.log('[chat] SQLite ready:', path.join(LOG_DIR, 'v4call-chat.db'));
 
 // ── Chat DB helpers ──────────────────────────────────────────────────────────
 
-function chatStoreDm(fromUser, toUser, ciphertextForRecipient, ciphertextForSender, signature, timestamp, textPaid) {
+function chatStoreDm(fromUser, toUser, ciphertextForRecipient, ciphertextForSender, signature, timestamp, textPaid, currency) {
   try {
+    const cur = currency || 'HBD';
     const stmt = chatDb.prepare(`
-      INSERT INTO dm_messages (from_user, to_user, owner, ciphertext, signature, timestamp, text_paid)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO dm_messages (from_user, to_user, owner, ciphertext, signature, timestamp, text_paid, currency)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     // Store recipient's copy (encrypted to recipient's key)
-    stmt.run(fromUser, toUser, toUser, ciphertextForRecipient, signature, timestamp, textPaid || 0);
+    stmt.run(fromUser, toUser, toUser, ciphertextForRecipient, signature, timestamp, textPaid || 0, cur);
     // Store sender's copy (encrypted to sender's key)
     if (ciphertextForSender) {
-      stmt.run(fromUser, toUser, fromUser, ciphertextForSender, signature, timestamp, textPaid || 0);
+      stmt.run(fromUser, toUser, fromUser, ciphertextForSender, signature, timestamp, textPaid || 0, cur);
     }
   } catch(e) {
     console.error('[chat] DM store failed:', e.message);
@@ -245,7 +254,7 @@ function chatGetDmPreviews(username, countPerUser) {
 
     const previews = [];
     const stmt = chatDb.prepare(`
-      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, created_at
+      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, currency, created_at
       FROM dm_messages
       WHERE owner = ? AND (
         (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
@@ -266,7 +275,7 @@ function chatGetDmPreviews(username, countPerUser) {
 function chatGetDmHistory(username, withUser) {
   try {
     return chatDb.prepare(`
-      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, created_at
+      SELECT from_user, to_user, ciphertext, signature, timestamp, text_paid, currency, created_at
       FROM dm_messages
       WHERE owner = ? AND (
         (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
@@ -504,14 +513,26 @@ async function getHiveEngineTokenBalance(account, symbol) {
       }),
       signal: AbortSignal.timeout(8000)
     });
-    const data    = await res.json();
-    const balance = (data.result && data.result.length > 0)
+    if (!res.ok) {
+      console.warn(`[token] Balance check ${symbol}/@${account} → HTTP ${res.status} — treating as 0 (not cached)`);
+      return 0;
+    }
+    const data = await res.json();
+    if (data.error) {
+      console.warn(`[token] Balance check ${symbol}/@${account} → API error: ${JSON.stringify(data.error).slice(0, 200)} — treating as 0 (not cached)`);
+      return 0;
+    }
+    if (!Array.isArray(data.result)) {
+      console.warn(`[token] Balance check ${symbol}/@${account} → unexpected response shape: ${JSON.stringify(data).slice(0, 200)} — treating as 0 (not cached)`);
+      return 0;
+    }
+    const balance = (data.result.length > 0)
       ? parseFloat(data.result[0].balance) || 0
       : 0;
     tokenBalanceCache[cacheKey] = { balance, fetchedAt: Date.now() };
     return balance;
   } catch(e) {
-    console.warn(`[token] Balance check failed ${symbol}/@${account}: ${e.message}`);
+    console.warn(`[token] Balance check failed ${symbol}/@${account}: ${e.message} — treating as 0 (not cached)`);
     return 0; // safe fallback — treat as not holding the token
   }
 }
@@ -1055,6 +1076,7 @@ setInterval(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function hivePost(body, nodes = HIVE_API_NODES) {
+  const method = body && body.method ? body.method : 'unknown';
   for (const node of nodes) {
     try {
       const res  = await fetch(node, {
@@ -1063,12 +1085,25 @@ async function hivePost(body, nodes = HIVE_API_NODES) {
         body:    JSON.stringify(body),
         signal:  AbortSignal.timeout(8000)
       });
+      if (!res.ok) {
+        console.warn(`[hive] ${node} → HTTP ${res.status} for ${method} — trying next`);
+        continue;
+      }
       const data = await res.json();
       if (data.result !== undefined) return data;
+      // 200 OK but no result — log what we got back so the operator can see why
+      // (Hive nodes that return JSON-RPC errors or empty bodies were silently
+      // skipped before, making "discovery returned 0" look like a network bug.)
+      const errMsg = data.error
+        ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error).slice(0, 200))
+        : 'no `result` field in response';
+      const preview = JSON.stringify(data).slice(0, 200);
+      console.warn(`[hive] ${node} returned 200 but no result for ${method}: ${errMsg} — body: ${preview} — trying next`);
     } catch(e) {
       console.warn(`[hive] Node ${node} failed: ${e.message} — trying next`);
     }
   }
+  console.warn(`[hive] All nodes exhausted for ${method} (tried ${nodes.length})`);
   return null;
 }
 
@@ -1741,6 +1776,56 @@ app.post('/admin/peers/rescan', async (req, res) => {
   scanV4CallDirectory().catch(e => console.error('[discovery] manual scan error:', e.message));
 });
 
+// GET /admin/discovery-test?key=ADMIN_KEY
+// Diagnostic: hits each Hive node directly with the discovery query and
+// returns the raw per-node response, then the parsed peer list. Run with
+// `docker exec` to see what the running container actually sees.
+app.get('/admin/discovery-test', async (req, res) => {
+  if (!_requireAdmin(req, res)) return;
+  const body = {
+    jsonrpc: '2.0',
+    method:  'condenser_api.get_discussions_by_created',
+    params:  [{ tag: 'v4call-server', limit: 20 }],
+    id: 1
+  };
+  const perNode = [];
+  for (const node of HIVE_API_NODES) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(node, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+        signal:  AbortSignal.timeout(8000)
+      });
+      const ms = Date.now() - t0;
+      let parsed = null, raw = null;
+      try { parsed = await r.json(); } catch(je) { raw = `non-JSON body: ${je.message}`; }
+      perNode.push({
+        node,
+        http_status: r.status,
+        elapsed_ms:  ms,
+        ok:          r.ok && parsed && parsed.result !== undefined,
+        result_count: parsed && Array.isArray(parsed.result) ? parsed.result.length : null,
+        error:       parsed && parsed.error ? parsed.error : null,
+        raw_preview: parsed ? JSON.stringify(parsed).slice(0, 400) : raw
+      });
+    } catch(e) {
+      perNode.push({ node, error: e.message, elapsed_ms: Date.now() - t0 });
+    }
+  }
+  // Also report what discovery has stored right now (no rescan triggered).
+  const cached = Object.entries(discoveredPeers).map(([domain, d]) => ({
+    domain, hive_account: d.parsed?.hive_account, verified: d.verified,
+    verify_reason: d.verify_reason, last_seen: d.last_seen
+  }));
+  res.json({
+    hive_nodes_tried: HIVE_API_NODES,
+    per_node_response: perNode,
+    discovered_peers_cached: cached
+  });
+});
+
 // GET /debug-state — shows current lobby and room state (no auth, safe info only)
 app.get('/debug-state', (req, res) => {
   res.json({
@@ -1771,7 +1856,39 @@ app.get('/debug-rates/:username', async (req, res) => {
   const caller    = req.query.caller || 'unknown';
   const callType  = req.query.type   || 'voice';
   const applicable = await getRatesForCaller(rates, caller, callType, new Date());
-  res.json({ found: true, version: rates.version, rates, applicable, testedWith: { caller, callType, time: new Date().toISOString() } });
+
+  // Also report what the multi-currency picker would actually show — the
+  // single-best `applicable` answer above can hide why the picker UI is empty
+  // (e.g. token balance returned 0 from a Hive-Engine hiccup).
+  const tokenBalances = [];
+  for (const tok of (rates.tokens || [])) {
+    // bypass cache so we see fresh balances
+    delete tokenBalanceCache[`${caller}:${tok.symbol}`];
+    const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
+    tokenBalances.push({
+      symbol:  tok.symbol,
+      caller_balance: bal,
+      qualifies: bal > 0,
+      has_text:  !!tok.text,
+      has_voice: !!tok.voiceRate,
+      has_video: !!tok.videoRate
+    });
+  }
+
+  res.json({
+    found:           true,
+    version:         rates.version,
+    rates,
+    applicable,
+    picker_diagnostics: {
+      caller,
+      callType,
+      token_balances:  tokenBalances,
+      tokens_in_post:  (rates.tokens || []).map(t => t.symbol),
+      hbd_lists:       (rates.lists || []).map(l => ({ name: l.name, users: l.users, windowCount: l.windows.length }))
+    },
+    testedWith: { caller, callType, time: new Date().toISOString() }
+  });
 });
 
 // GET /rates/:username — client fetches callee rates before showing payment modal
@@ -2004,7 +2121,7 @@ io.on('connection', (socket) => {
 
     // ── Relay the message ─────────────────────────────────────────────────
     if (recipient) {
-      io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0 });
+      io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0, textCurrency: cur });
     } else if (federatedTo) {
       fedSend(federatedTo.ws, {
         type: 'dm',
@@ -2016,11 +2133,11 @@ io.on('connection', (socket) => {
         fromServer:  SERVER_DOMAIN
       });
     }
-    socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0 });
+    socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0, textCurrency: cur });
 
     // ── Store in chat DB (sender's local copy) ────────────────────────────
     // For federated recipients, the peer server stores the recipient's copy.
-    chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, textPaid || 0);
+    chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, textPaid || 0, cur);
   });
 
   // ── DM HISTORY (on demand) ───────────────────────────────────────────────
@@ -2920,10 +3037,14 @@ async function scanV4CallDirectory() {
   // get_discussions_by_created returns posts under the tag sorted by recency.
   // (get_discussions_by_tag doesn't exist on Hive's condenser API — that was
   // a wrong method name that returned an assert exception silently.)
+  // Hive nodes enforce a max `limit` of 20 (Assert Exception otherwise) — so
+  // the most recent 20 v4call-server posts get scanned each cycle. Once there
+  // are more than ~20 active v4call servers, swap in start_author/permlink
+  // pagination here.
   const data = await hivePost({
     jsonrpc: '2.0',
     method:  'condenser_api.get_discussions_by_created',
-    params:  [{ tag: 'v4call-server', limit: 50 }],
+    params:  [{ tag: 'v4call-server', limit: 20 }],
     id: 1
   });
   if (!data?.result) {
@@ -3124,10 +3245,11 @@ async function fedHandleMessage(ws, raw) {
           io.to(recipient.socketId).emit('lobby-dm', {
             from, ciphertext, signature, timestamp,
             textPaid: paid,
+            textCurrency: cur,
             fromServer: fromServer || ws._domain
           });
         }
-        chatStoreDm(from, to, ciphertext, null, signature, timestamp, paid);
+        chatStoreDm(from, to, ciphertext, null, signature, timestamp, paid, cur);
         fedSend(ws, { type: 'dm-delivered', from, to, msgId: msgId || null });
       };
 
