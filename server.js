@@ -87,6 +87,30 @@ if (FEDERATION_ENABLED) {
   console.log(`[config] Federation: disabled (no FEDERATION_PEERS set)`);
 }
 
+// ── v0.13 Lobby Notice + Anti-Spam Gate (env only; no federation bump) ──────
+const LOBBY_NOTICE_RAW = process.env.LOBBY_NOTICE || '';
+const LOBBY_REQUIREMENTS_RAW = process.env.LOBBY_REQUIREMENTS_TEXT || '';
+const LOBBY_POST_MIN_HP = parseFloat(process.env.LOBBY_POST_MIN_HP || '0') || 0;
+const LOBBY_POST_MIN_TOKEN_RAW = (process.env.LOBBY_POST_MIN_TOKEN || '').trim();
+const LOBBY_POST_GATE_MODE = (process.env.LOBBY_POST_GATE_MODE || 'or').toLowerCase() === 'and' ? 'and' : 'or';
+let LOBBY_POST_MIN_TOKEN_SYMBOL = null;
+let LOBBY_POST_MIN_TOKEN_AMOUNT = 0;
+if (LOBBY_POST_MIN_TOKEN_RAW.includes(':')) {
+  const [sym, amt] = LOBBY_POST_MIN_TOKEN_RAW.split(':');
+  LOBBY_POST_MIN_TOKEN_SYMBOL = sym.trim().toUpperCase();
+  LOBBY_POST_MIN_TOKEN_AMOUNT = parseFloat(amt) || 0;
+}
+const LOBBY_NOTICE_RESOLVED = LOBBY_NOTICE_RAW ||
+  `${SERVER_DOMAIN} — local lobby. For federated contacts use rooms / DMs / calls.`;
+const LOBBY_REQUIREMENTS_RESOLVED = LOBBY_REQUIREMENTS_RAW || (() => {
+  const parts = [];
+  if (LOBBY_POST_MIN_HP > 0) parts.push(`${LOBBY_POST_MIN_HP} HP`);
+  if (LOBBY_POST_MIN_TOKEN_SYMBOL) parts.push(`${LOBBY_POST_MIN_TOKEN_AMOUNT} ${LOBBY_POST_MIN_TOKEN_SYMBOL}`);
+  if (parts.length === 0) return '';
+  if (parts.length === 1) return `Posting requires ${parts[0]}.`;
+  return `Posting requires ${parts.join(LOBBY_POST_GATE_MODE === 'and' ? ' AND ' : ' OR ')}.`;
+})();
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── SQLite Ledger ─────────────────────────────────────────────────────────────
@@ -544,6 +568,97 @@ setInterval(() => {
     if (tokenBalanceCache[k].fetchedAt < cutoff) delete tokenBalanceCache[k];
   }
 }, 15 * 60 * 1000);
+
+
+// ── v0.13 Hive Power lookup (owned HP only, for lobby post gate) ─────────────
+const hpCache = {}; // username → { hp, fetchedAt }
+const HP_CACHE_TTL = 5 * 60 * 1000;
+let hivePerVestCache = { value: null, fetchedAt: 0 };
+const HIVE_PER_VEST_TTL = 60 * 60 * 1000; // hive_per_vest moves slowly; 1h is fine
+
+async function getHivePerVest() {
+  if (hivePerVestCache.value && (Date.now() - hivePerVestCache.fetchedAt) < HIVE_PER_VEST_TTL) {
+    return hivePerVestCache.value;
+  }
+  const data = await hivePost({
+    jsonrpc: '2.0',
+    method: 'condenser_api.get_dynamic_global_properties',
+    params: [], id: 1
+  });
+  if (!data?.result) return null;
+  const totalVesting = parseFloat(data.result.total_vesting_fund_hive);
+  const totalVestingShares = parseFloat(data.result.total_vesting_shares);
+  if (!totalVesting || !totalVestingShares) return null;
+  const hivePerVest = totalVesting / totalVestingShares;
+  hivePerVestCache = { value: hivePerVest, fetchedAt: Date.now() };
+  return hivePerVest;
+}
+
+async function getHivePower(username) {
+  const cached = hpCache[username];
+  if (cached && (Date.now() - cached.fetchedAt) < HP_CACHE_TTL) return cached.hp;
+  const data = await hivePost({
+    jsonrpc: '2.0',
+    method: 'condenser_api.get_accounts',
+    params: [[username]], id: 1
+  });
+  if (!data?.result?.[0]) {
+    console.warn(`[hp] account @${username} not found — treating HP as 0 (not cached)`);
+    return 0;
+  }
+  const acct = data.result[0];
+  const ownedVests = parseFloat(acct.vesting_shares); // "12345.678901 VESTS"
+  const hivePerVest = await getHivePerVest();
+  if (!hivePerVest) {
+    console.warn(`[hp] hive_per_vest unavailable — treating HP as 0 (not cached)`);
+    return 0;
+  }
+  const hp = ownedVests * hivePerVest;
+  hpCache[username] = { hp, fetchedAt: Date.now() };
+  return hp;
+}
+
+// Periodic cache cleanup (mirror tokenBalanceCache pattern)
+setInterval(() => {
+  const cutoff = Date.now() - HP_CACHE_TTL;
+  for (const k in hpCache) if (hpCache[k].fetchedAt < cutoff) delete hpCache[k];
+}, 15 * 60 * 1000);
+
+async function checkLobbyPostGate(username) {
+  if (LOBBY_POST_MIN_HP <= 0 && !LOBBY_POST_MIN_TOKEN_SYMBOL) {
+    return { allowed: true };
+  }
+  const checks = [];
+  let hp = null, tokenBal = null;
+  if (LOBBY_POST_MIN_HP > 0) {
+    hp = await getHivePower(username);
+    checks.push({ kind: 'hp', actual: hp, required: LOBBY_POST_MIN_HP, pass: hp >= LOBBY_POST_MIN_HP });
+  }
+  if (LOBBY_POST_MIN_TOKEN_SYMBOL) {
+    tokenBal = await getHiveEngineTokenBalance(username, LOBBY_POST_MIN_TOKEN_SYMBOL);
+    checks.push({
+      kind: 'token', symbol: LOBBY_POST_MIN_TOKEN_SYMBOL,
+      actual: tokenBal, required: LOBBY_POST_MIN_TOKEN_AMOUNT,
+      pass: tokenBal >= LOBBY_POST_MIN_TOKEN_AMOUNT
+    });
+  }
+  const passed = LOBBY_POST_GATE_MODE === 'and'
+    ? checks.every(c => c.pass)
+    : checks.some(c => c.pass);
+  if (passed) return { allowed: true };
+  const required = checks.map(c => c.kind === 'hp'
+    ? `${c.required} HP`
+    : `${c.required} ${c.symbol}`
+  ).join(LOBBY_POST_GATE_MODE === 'and' ? ' AND ' : ' OR ');
+  const actual = checks.map(c => c.kind === 'hp'
+    ? `${c.actual.toFixed(1)} HP`
+    : `${c.actual} ${c.symbol}`
+  ).join(', ');
+  return {
+    allowed: false,
+    message: `This server requires ${required} to post in the lobby. You have ${actual}.`
+  };
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1920,6 +2035,12 @@ io.on('connection', (socket) => {
 
     socket.emit('lobby-users', lobbySnapshot());
     socket.emit('lobby-rooms', roomsSnapshot());
+    socket.emit('lobby-config', {
+      serverName: SERVER_NAME,
+      serverDomain: SERVER_DOMAIN,
+      notice: LOBBY_NOTICE_RESOLVED,
+      requirementsText: LOBBY_REQUIREMENTS_RESOLVED
+    });
     broadcastLobby();
     broadcastRooms();
 
@@ -1962,9 +2083,11 @@ io.on('connection', (socket) => {
 
   // ── LOBBY CHAT ─────────────────────────────────────────────────────────────
 
-  socket.on('lobby-chat', ({ message, signature, timestamp }) => {
+  socket.on('lobby-chat', async ({ message, signature, timestamp }) => {
     const from = socket._username;
     if (!from) return;
+    const gate = await checkLobbyPostGate(from);
+    if (!gate.allowed) { socket.emit('lobby-post-rejected', { reason: gate.message }); return; }
     io.emit('lobby-chat', { from, message, signature, timestamp });
   });
 
@@ -1975,9 +2098,11 @@ io.on('connection', (socket) => {
   // Ephemeral: server only relays, no billing, no storage, no verification.
   // The ciphertext is encrypted with the recipient's public key — server never sees plaintext.
 
-  socket.on('lobby-encrypted', ({ to, ciphertext, senderCiphertext, signature, timestamp }) => {
+  socket.on('lobby-encrypted', async ({ to, ciphertext, senderCiphertext, signature, timestamp }) => {
     const from = socket._username;
     if (!from) return;
+    const gate = await checkLobbyPostGate(from);
+    if (!gate.allowed) { socket.emit('lobby-post-rejected', { reason: gate.message }); return; }
     const recipient = lobbyUsers[to];
     if (recipient) {
       io.to(recipient.socketId).emit('lobby-encrypted', { from, ciphertext, signature, timestamp });
