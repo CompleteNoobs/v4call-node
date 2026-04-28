@@ -2607,12 +2607,35 @@ io.on('connection', (socket) => {
   socket.on('call-end', async ({ callId }) => {
     const username = socket._username;
     const room     = socket._room;
-    if (room && rooms[room]) {
+    if (!room || !rooms[room]) return;
+    if (rooms[room].isCall) {
+      // Real 1:1 call — `peer-hung-up` cascades to the other party so they
+      // also leave (which is the correct behaviour for a 2-person call).
       socket.to(room).emit('peer-hung-up', { by: username });
       const cid = rooms[room].callId || callId;
       if (cid) await processCallEnd(cid, room, io, lobbyUsers);
+      console.log(`📵 @${username} ended 1:1 call in #${room}`);
+    } else {
+      // Defensive: someone hit `call-end` in a multi-party room. Treat it as a
+      // normal leave for just this user — do NOT kick everyone. Mirrors the
+      // `leave-room` handler's cleanup. Without this gate the original bug
+      // (one user leaves → everyone kicked to lobby) reappears.
+      rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
+      socket.to(room).emit('user-left', socket.id);
+      if (lobbyUsers[username]) delete lobbyUsers[username].inRoom;
+      socket.leave(room);
+      socket._room = null;
+      if (rooms[room].members.length === 0) {
+        if (rooms[room]._capTimer)  clearTimeout(rooms[room]._capTimer);
+        if (rooms[room]._warnTimer) clearTimeout(rooms[room]._warnTimer);
+        delete rooms[room];
+        chatDeleteRoom(room);
+        console.log(`Room #${room} closed (last member left via call-end-on-non-call)`);
+      } else {
+        console.log(`@${username} call-end on multi-party room #${room} — treated as leave-room (${rooms[room].members.length} remaining)`);
+      }
+      broadcastRooms();
     }
-    console.log(`📵 @${username} ended call`);
   });
 
   // ── DIRECT CALL — initiate ─────────────────────────────────────────────────
@@ -2948,6 +2971,15 @@ io.on('connection', (socket) => {
 
     socket.join(room);
     socket._room = room;
+    // Drop any stale entry for this username before pushing the fresh one.
+    // Socket.io reconnects mint a new socketId for the same client; without
+    // this dedup, the server's member count drifts upward over reconnects
+    // (and rooms never delete because length never reaches 0).
+    const staleBefore = r.members.length;
+    r.members = r.members.filter(u => u.username !== username);
+    if (r.members.length !== staleBefore) {
+      console.log(`[join] dropped ${staleBefore - r.members.length} stale member entry/entries for @${username} in #${room}`);
+    }
     r.members.push({ socketId: socket.id, username, pubKey, joinedVia });
     if (lobbyUsers[username]) lobbyUsers[username].inRoom = room;
 
@@ -3026,6 +3058,26 @@ io.on('connection', (socket) => {
     r.banlist.delete(target);
     emitRoomInfoToMembers(r, room);
     console.log(`[ban] @${target} unbanned from #${room} by @${socket._username}`);
+  });
+
+  // ── END ROOM FOR EVERYONE (v0.14 admin feature) ───────────────────────────
+  // Admin closes the whole room — every member receives a `kicked` event with
+  // a clear reason and the room (plus its stored messages) is deleted.
+
+  socket.on('room-end-all', () => {
+    const room = socket._room;
+    const r    = rooms[room];
+    if (!r || r.creator !== socket._username) return;
+    for (const m of [...r.members]) {
+      io.to(m.socketId).emit('kicked', { room, reason: `Room #${room} was ended by the admin (@${r.creator}).` });
+    }
+    if (r._capTimer)  clearTimeout(r._capTimer);
+    if (r._warnTimer) clearTimeout(r._warnTimer);
+    r.members = [];
+    delete rooms[room];
+    chatDeleteRoom(room);
+    broadcastRooms();
+    console.log(`Room #${room} ended-for-all by admin @${socket._username}`);
   });
 
   // ── RESYNC ─────────────────────────────────────────────────────────────────
