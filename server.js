@@ -419,7 +419,7 @@ function ledgerPaymentUpdate(callId, type, status, txId = null) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const lobbyUsers = {}; // username → { socketId, pubKey, invisible, inCall? }
-const rooms      = {}; // roomName → { creator, allowlist(Set), members[], isCall?, callId?, ... }
+const rooms      = {}; // roomName → { creator, allowlist(Set), banlist(Set), tokenGate:{symbol,amount}|null, banlistVisibility:'admin'|'all', paidInvitees:Map, members[], createdAt, isCall?, callId?, ... }
 
 // Federation state — populated by federation message handlers (see below).
 // domain → { ws, connected, name, users: Map(username → { pubKey }) }
@@ -495,12 +495,31 @@ function roomsSnapshot() {
     creator:     r.creator,
     memberCount: r.members.length,
     isCall:      r.isCall || false,
+    tokenGate:   r.tokenGate || null,
     allowlist:   [...r.allowlist].map(username => ({
       username,
       online: !!lobbyUsers[username] || r.members.some(m => m.username === username)
     }))
   }));
 }
+
+// Per-member room-info emit so banlist visibility can differ per recipient
+// (creator always sees full banlist; other members see it only when
+// banlistVisibility === 'all').
+function emitRoomInfoToMembers(r, roomName) {
+  for (const m of r.members) {
+    const visibleBanlist = (m.username === r.creator || r.banlistVisibility === 'all')
+      ? [...r.banlist] : null;
+    io.to(m.socketId).emit('room-info', {
+      creator:           r.creator,
+      allowlist:         [...r.allowlist],
+      tokenGate:         r.tokenGate || null,
+      banlist:           visibleBanlist,
+      banlistVisibility: r.banlistVisibility
+    });
+  }
+}
+
 function broadcastRooms() { io.emit('lobby-rooms', roomsSnapshot()); }
 
 
@@ -2845,7 +2864,7 @@ io.on('connection', (socket) => {
 
   socket.on('room-check', (roomName, cb) => { cb({ available: !rooms[roomName] }); });
 
-  socket.on('room-create', ({ roomName, invitees }) => {
+  socket.on('room-create', ({ roomName, invitees = [], tokenGateSymbol = '', tokenGateAmount = 0, banlistVisibility = 'admin' }) => {
     const creator = socket._username;
     if (!creator) return;
     if (rooms[roomName]) {
@@ -2853,7 +2872,20 @@ io.on('connection', (socket) => {
       return;
     }
     const allowlist = new Set([creator, ...invitees]);
-    rooms[roomName] = { creator, allowlist, members: [], createdAt: new Date() };
+    const sym = (tokenGateSymbol || '').trim().toUpperCase();
+    const amt = parseFloat(tokenGateAmount) || 0;
+    const tokenGate  = (sym && amt > 0) ? { symbol: sym, amount: amt } : null;
+    const visibility = (banlistVisibility === 'all') ? 'all' : 'admin';
+    rooms[roomName] = {
+      creator,
+      allowlist,
+      banlist:           new Set(),
+      tokenGate,
+      banlistVisibility: visibility,
+      paidInvitees:      new Map(), // v0.17 forward-compat — never populated in v0.14
+      members:           [],
+      createdAt:         new Date()
+    };
     for (const invitee of invitees) {
       if (invitee === creator) continue;
       const lu = lobbyUsers[invitee];
@@ -2861,7 +2893,7 @@ io.on('connection', (socket) => {
     }
     broadcastRooms();
     socket.emit('room-created', { roomName, invitees: [...invitees] });
-    console.log(`@${creator} created #${roomName}`);
+    console.log(`@${creator} created #${roomName}${tokenGate ? ` [tokenGate: ${tokenGate.amount} ${tokenGate.symbol}]` : ''}${visibility === 'all' ? ' [banlist: public]' : ''}`);
   });
 
   socket.on('request-join-token', ({ roomName }, cb) => {
@@ -2873,22 +2905,63 @@ io.on('connection', (socket) => {
 
   // ── ROOM JOINING ───────────────────────────────────────────────────────────
 
-  socket.on('join', ({ room, username, pubKey }) => {
-    if (rooms[room] && !rooms[room].allowlist.has(username)) {
-      socket.emit('join-rejected', { room, reason: `You are not on the allowlist for room "${room}".` });
+  socket.on('join', async ({ room, username, pubKey }) => {
+    // 1. Banlist takes precedence over everything else.
+    if (rooms[room] && rooms[room].banlist.has(username)) {
+      socket.emit('join-rejected', { room, reason: 'You are banned from this room.' });
       return;
     }
+
+    // 2. Auto-create room on first join (matches v0.13 behaviour).
     if (!rooms[room]) {
-      rooms[room] = { creator: username, allowlist: new Set([username]), members: [], createdAt: new Date() };
+      rooms[room] = {
+        creator:           username,
+        allowlist:         new Set([username]),
+        banlist:           new Set(),
+        tokenGate:         null,
+        banlistVisibility: 'admin',
+        paidInvitees:      new Map(),
+        members:           [],
+        createdAt:         new Date()
+      };
     }
+    const r = rooms[room];
+
+    // 3. Authorisation: allowlist OR (v0.17 forward-compat) paidInvitees OR
+    // tokenGate-with-balance. paidInvitees is always empty in v0.14, so the
+    // line is a no-op now — but having it here means v0.17's diff is purely
+    // additive (no refactor of the join flow).
+    let joinedVia = null;
+    if      (r.allowlist.has(username))      joinedVia = 'allowlist';
+    else if (r.paidInvitees.has(username))   joinedVia = 'paid';        // v0.17 hook
+    else if (r.tokenGate) {
+      const bal = await getHiveEngineTokenBalance(username, r.tokenGate.symbol);
+      if (bal >= r.tokenGate.amount)         joinedVia = 'token';
+    }
+    if (!joinedVia) {
+      const need = r.tokenGate
+        ? `allowlist or ${r.tokenGate.amount} ${r.tokenGate.symbol}`
+        : 'allowlist';
+      socket.emit('join-rejected', { room, reason: `Not authorised — needs ${need}.` });
+      return;
+    }
+
     socket.join(room);
     socket._room = room;
-    rooms[room].members.push({ socketId: socket.id, username, pubKey });
+    r.members.push({ socketId: socket.id, username, pubKey, joinedVia });
     if (lobbyUsers[username]) lobbyUsers[username].inRoom = room;
 
-    const everyone = rooms[room].members.map(u => ({ socketId: u.socketId, username: u.username, pubKey: u.pubKey }));
+    const everyone = r.members.map(u => ({
+      socketId: u.socketId, username: u.username, pubKey: u.pubKey, joinedVia: u.joinedVia
+    }));
     socket.emit('room-users', everyone);
-    socket.emit('room-info', { creator: rooms[room].creator, allowlist: [...rooms[room].allowlist] });
+    socket.emit('room-info', {
+      creator:           r.creator,
+      allowlist:         [...r.allowlist],
+      tokenGate:         r.tokenGate || null,
+      banlist:           (username === r.creator || r.banlistVisibility === 'all') ? [...r.banlist] : null,
+      banlistVisibility: r.banlistVisibility
+    });
 
     // Send room history (broadcasts + messages encrypted to this user)
     const history = chatGetRoomHistory(room, username);
@@ -2896,9 +2969,9 @@ io.on('connection', (socket) => {
       socket.emit('room-history', history);
     }
 
-    socket.to(room).emit('user-joined', { socketId: socket.id, username, pubKey });
+    socket.to(room).emit('user-joined', { socketId: socket.id, username, pubKey, joinedVia });
     broadcastRooms();
-    console.log(`@${username} joined #${room} (${rooms[room].members.length} members)`);
+    console.log(`@${username} joined #${room} via ${joinedVia} (${r.members.length} members)`);
   });
 
   // ── ALLOWLIST MANAGEMENT ───────────────────────────────────────────────────
@@ -2909,7 +2982,7 @@ io.on('connection', (socket) => {
     r.allowlist.add(targetUser);
     const lu = lobbyUsers[targetUser];
     if (lu) io.to(lu.socketId).emit('room-invite', { roomName: room, from: socket._username, invitees: [...r.allowlist] });
-    io.to(room).emit('room-info', { creator: r.creator, allowlist: [...r.allowlist] });
+    emitRoomInfoToMembers(r, room);
     broadcastRooms();
   });
 
@@ -2920,8 +2993,39 @@ io.on('connection', (socket) => {
     r.allowlist.delete(targetUser);
     const member = r.members.find(m => m.username === targetUser);
     if (member) io.to(member.socketId).emit('kicked', { room, reason: 'You were removed from this room.' });
-    io.to(room).emit('room-info', { creator: r.creator, allowlist: [...r.allowlist] });
+    emitRoomInfoToMembers(r, room);
     broadcastRooms();
+  });
+
+  // ── BANLIST (v0.14) — admin-only; overrides allowlist + tokenGate ─────────
+
+  socket.on('room-ban', ({ room, username, reason }) => {
+    const r = rooms[room];
+    if (!r || r.creator !== socket._username) return;
+    const target = (username || '').trim().toLowerCase().replace(/^@/, '');
+    if (!target || target === r.creator) return; // can't ban self
+    r.banlist.add(target);
+    // Auto-kick if currently in the room.
+    const memberIdx = r.members.findIndex(m => m.username === target);
+    if (memberIdx >= 0) {
+      const targetSocketId = r.members[memberIdx].socketId;
+      io.to(targetSocketId).emit('kicked', { room, reason: `You have been banned from #${room}.` });
+      r.members.splice(memberIdx, 1);
+      io.to(room).emit('user-left', targetSocketId);
+    }
+    emitRoomInfoToMembers(r, room);
+    broadcastRooms();
+    console.log(`[ban] @${target} banned from #${room} by @${socket._username}${reason ? ' — ' + reason : ''}`);
+  });
+
+  socket.on('room-unban', ({ room, username }) => {
+    const r = rooms[room];
+    if (!r || r.creator !== socket._username) return;
+    const target = (username || '').trim().toLowerCase().replace(/^@/, '');
+    if (!target) return;
+    r.banlist.delete(target);
+    emitRoomInfoToMembers(r, room);
+    console.log(`[ban] @${target} unbanned from #${room} by @${socket._username}`);
   });
 
   // ── RESYNC ─────────────────────────────────────────────────────────────────
@@ -2929,7 +3033,9 @@ io.on('connection', (socket) => {
   socket.on('resync', () => {
     const room = socket._room;
     if (!room || !rooms[room]) return;
-    const everyone = rooms[room].members.map(u => ({ socketId: u.socketId, username: u.username, pubKey: u.pubKey }));
+    const everyone = rooms[room].members.map(u => ({
+      socketId: u.socketId, username: u.username, pubKey: u.pubKey, joinedVia: u.joinedVia
+    }));
     socket.emit('room-users-resync', everyone);
   });
 
