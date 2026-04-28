@@ -337,6 +337,21 @@ function chatDeleteRoom(roomName) {
   }
 }
 
+// v0.14.5 — every row for a room, regardless of recipient. Used by the
+// .v4room export endpoint; per-recipient filtering happens client-side at
+// decryption time (since the ciphertext is what's stored).
+function chatGetRoomMessagesAll(roomName) {
+  try {
+    return chatDb.prepare(`
+      SELECT from_user, to_user, ciphertext, signature, timestamp, is_broadcast, created_at
+      FROM room_messages WHERE room_name = ? ORDER BY created_at ASC
+    `).all(roomName);
+  } catch(e) {
+    console.error('[chat] Room export query failed:', e.message);
+    return [];
+  }
+}
+
 function chatUpdateSeen(username) {
   try {
     chatDb.prepare(`
@@ -3078,6 +3093,130 @@ io.on('connection', (socket) => {
     chatDeleteRoom(room);
     broadcastRooms();
     console.log(`Room #${room} ended-for-all by admin @${socket._username}`);
+  });
+
+  // ── ROOM EXPORT (.v4room) — v0.14.5 ───────────────────────────────────────
+  // Any current member can export a snapshot of the room's metadata + every
+  // stored message (ciphertext only — we never had plaintext). The file is
+  // self-contained and can be re-imported on the same or a different v4call
+  // server. Recipients of the imported messages can decrypt only the ones
+  // addressed to their key, exactly like the original room.
+
+  socket.on('room-export', ({ roomName }, cb) => {
+    const username = socket._username;
+    if (typeof cb !== 'function') return;
+    if (!username)               return cb({ error: 'Not authenticated' });
+    if (!roomName)               return cb({ error: 'Room name required' });
+    const r = rooms[roomName];
+    if (!r)                                                      return cb({ error: `Room #${roomName} does not exist on this server` });
+    if (!r.members.some(m => m.username === username))           return cb({ error: 'Only current room members can export' });
+
+    const messages = chatGetRoomMessagesAll(roomName);
+    const file = {
+      file_type:      'v4room',
+      format_version: 1,
+      source_server:  SERVER_DOMAIN,
+      exported_at:    new Date().toISOString(),
+      exported_by:    username,
+      room: {
+        name:              roomName,
+        creator:           r.creator,
+        allowlist:         [...r.allowlist],
+        tokenGate:         r.tokenGate || null,
+        banlist:           [...r.banlist],
+        banlistVisibility: r.banlistVisibility,
+        created_at:        (r.createdAt instanceof Date) ? r.createdAt.toISOString() : r.createdAt
+      },
+      messages: messages.map(m => ({
+        from_user:    m.from_user,
+        to_user:      m.to_user,
+        ciphertext:   m.ciphertext,
+        signature:    m.signature,
+        timestamp:    m.timestamp,
+        created_at:   m.created_at,
+        is_broadcast: m.is_broadcast
+      }))
+    };
+    console.log(`[export] @${username} exported #${roomName} (${messages.length} messages)`);
+    cb({ ok: true, file });
+  });
+
+  // ── ROOM IMPORT (.v4room) — v0.14.5 ───────────────────────────────────────
+  // Any logged-in user can import. The destination room is owned by the
+  // *importer* (not the original creator), preserves the file's allowlist
+  // (importer auto-added), and preserves token-gate / banlist / visibility.
+  // Server only does structural validation — cryptographic signature checks
+  // stay client-side at decryption time.
+
+  socket.on('room-import', ({ file, roomName: requestedName }, cb) => {
+    const username = socket._username;
+    if (typeof cb !== 'function') return;
+    if (!username)                                                                                return cb({ error: 'Not authenticated' });
+    if (!file || typeof file !== 'object')                                                        return cb({ error: 'Missing file' });
+    if (file.file_type !== 'v4room')                                                              return cb({ error: 'Not a v4room file (file_type mismatch)' });
+    if (file.format_version !== 1)                                                                return cb({ error: `Unsupported format_version ${file.format_version}` });
+    if (!file.room || typeof file.room !== 'object')                                              return cb({ error: 'Malformed file — missing room metadata' });
+    if (!Array.isArray(file.messages))                                                            return cb({ error: 'Malformed file — missing messages array' });
+
+    const newName = String(requestedName || file.room.name || '').trim();
+    if (!newName)                                                                                 return cb({ error: 'Invalid room name' });
+    if (newName.length > 64)                                                                      return cb({ error: 'Room name too long (max 64 chars)' });
+    if (!/^[a-zA-Z0-9_-]+$/.test(newName))                                                        return cb({ error: 'Room name may only contain a–z, 0–9, _ and -' });
+    if (rooms[newName])                                                                           return cb({ error: `Room #${newName} already exists on this server`, collision: true });
+
+    // Build allowlist (importer auto-added)
+    const allowSrc = Array.isArray(file.room.allowlist) ? file.room.allowlist : [];
+    const allowlist = new Set(allowSrc.filter(u => typeof u === 'string').map(u => u.toLowerCase()));
+    allowlist.add(username);
+
+    // Banlist
+    const banSrc = Array.isArray(file.room.banlist) ? file.room.banlist : [];
+    const banlist = new Set(banSrc.filter(u => typeof u === 'string').map(u => u.toLowerCase()));
+
+    // Token gate
+    let tokenGate = null;
+    if (file.room.tokenGate && typeof file.room.tokenGate === 'object') {
+      const sym = String(file.room.tokenGate.symbol || '').trim().toUpperCase();
+      const amt = parseFloat(file.room.tokenGate.amount) || 0;
+      if (sym && amt > 0) tokenGate = { symbol: sym, amount: amt };
+    }
+
+    rooms[newName] = {
+      creator:           username, // importer becomes the new admin
+      allowlist,
+      banlist,
+      tokenGate,
+      banlistVisibility: file.room.banlistVisibility === 'all' ? 'all' : 'admin',
+      paidInvitees:      new Map(),
+      members:           [],
+      createdAt:         new Date()
+    };
+
+    // Restore messages — defensive, skip rows that don't look right
+    let restored = 0, skipped = 0;
+    for (const m of file.messages) {
+      if (!m || typeof m.ciphertext !== 'string' || typeof m.from_user !== 'string') {
+        skipped++; continue;
+      }
+      try {
+        chatStoreRoomMsg(
+          newName,
+          m.from_user,
+          (typeof m.to_user === 'string') ? m.to_user : '',
+          m.ciphertext,
+          (typeof m.signature === 'string') ? m.signature : '',
+          (typeof m.timestamp === 'string') ? m.timestamp : '',
+          m.is_broadcast ? 1 : 0
+        );
+        restored++;
+      } catch(e) {
+        skipped++;
+      }
+    }
+
+    broadcastRooms();
+    console.log(`[import] @${username} imported #${newName} from ${file.source_server || 'unknown'} (${restored} messages restored, ${skipped} skipped, original creator: @${file.room.creator || 'unknown'})`);
+    cb({ ok: true, roomName: newName, messagesImported: restored, messagesSkipped: skipped });
   });
 
   // ── RESYNC ─────────────────────────────────────────────────────────────────
