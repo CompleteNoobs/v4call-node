@@ -3039,6 +3039,33 @@ io.on('connection', (socket) => {
     socket.emit('room-users-resync', everyone);
   });
 
+  // ── LEAVE ROOM (explicit, from the Leave Room button) ─────────────────────
+  // Without this, the server only learned a user left via socket disconnect,
+  // which could be much later (or never, if they navigated away). Other room
+  // members would see stale membership in the user list. Now the client emits
+  // this whenever leaveRoom() runs and the server cleans up immediately.
+
+  socket.on('leave-room', () => {
+    const room     = socket._room;
+    const username = socket._username;
+    if (!room || !rooms[room]) return;
+    rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
+    socket.to(room).emit('user-left', socket.id);
+    if (lobbyUsers[username]) delete lobbyUsers[username].inRoom;
+    socket.leave(room);
+    socket._room = null;
+    if (rooms[room].members.length === 0) {
+      if (rooms[room]._capTimer)  clearTimeout(rooms[room]._capTimer);
+      if (rooms[room]._warnTimer) clearTimeout(rooms[room]._warnTimer);
+      delete rooms[room];
+      chatDeleteRoom(room);
+      console.log(`Room #${room} closed (last member left via leave-room)`);
+    } else {
+      console.log(`@${username} left #${room} via leave-room (${rooms[room].members.length} remaining)`);
+    }
+    broadcastRooms();
+  });
+
   // ── WebRTC Signalling ──────────────────────────────────────────────────────
 
   socket.on('offer',         ({ to, offer })     => { io.to(to).emit('offer',         { from: socket.id, offer }); });
@@ -3080,11 +3107,14 @@ io.on('connection', (socket) => {
       socket.to(room).emit('user-left', socket.id);
 
       if (rooms[room].isCall) {
+        console.log(`[disconnect] @${username} disconnected from 1:1 call room #${room} → emitting peer-hung-up`);
         socket.to(room).emit('peer-hung-up', { by: username });
         const callId = rooms[room].callId;
         if (callId && activePayments[callId]) {
           processCallEnd(callId, room, io, lobbyUsers);
         }
+      } else {
+        console.log(`[disconnect] @${username} disconnected from multi-party room #${room} (${rooms[room].members.length} remaining) — no peer-hung-up emitted`);
       }
 
       if (rooms[room].members.length === 0) {
