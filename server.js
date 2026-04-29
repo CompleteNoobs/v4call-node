@@ -3025,11 +3025,24 @@ io.on('connection', (socket) => {
 
   // ── ROOM JOINING ───────────────────────────────────────────────────────────
 
-  socket.on('join', async ({ room, username, pubKey }) => {
-    // 1. Banlist takes precedence over everything else.
-    if (rooms[room] && rooms[room].banlist.has(username)) {
-      socket.emit('join-rejected', { room, reason: 'You are banned from this room.' });
-      return;
+  socket.on('join', async ({ room, username, pubKey, homeServer }) => {
+    // v0.16 Part B — federated joiners send homeServer (their own server's
+    // domain). The host server validates against the allowlist's canonical
+    // form ('user@server.com'). Token-gate (chain check) uses the bare
+    // username — Hive identity is server-agnostic.
+    const myDomain = SERVER_DOMAIN.toLowerCase();
+    const fedHome  = (typeof homeServer === 'string' && homeServer.trim().toLowerCase()) || null;
+    const isFed    = !!fedHome && fedHome !== myDomain;
+    const canonicalUser = isFed ? `${username}@${fedHome}` : username;
+
+    // 1. Banlist — check both canonical form (federated) and bare (local /
+    // legacy ban entries). Banlist always wins.
+    if (rooms[room]) {
+      const b = rooms[room].banlist;
+      if (b.has(canonicalUser) || (isFed && b.has(username))) {
+        socket.emit('join-rejected', { room, reason: 'You are banned from this room.' });
+        return;
+      }
     }
 
     // 2. Auto-create room on first join (matches v0.13 behaviour).
@@ -3049,12 +3062,11 @@ io.on('connection', (socket) => {
     const r = rooms[room];
 
     // 3. Authorisation: allowlist OR (v0.17 forward-compat) paidInvitees OR
-    // tokenGate-with-balance. paidInvitees is always empty in v0.14, so the
-    // line is a no-op now — but having it here means v0.17's diff is purely
-    // additive (no refactor of the join flow).
+    // tokenGate-with-balance. Federated joiners match canonical form for
+    // allowlist; tokenGate balance check uses bare username.
     let joinedVia = null;
-    if      (r.allowlist.has(username))      joinedVia = 'allowlist';
-    else if (r.paidInvitees.has(username))   joinedVia = 'paid';        // v0.17 hook
+    if      (r.allowlist.has(canonicalUser)) joinedVia = 'allowlist';
+    else if (r.paidInvitees.has(canonicalUser)) joinedVia = 'paid';     // v0.17 hook
     else if (r.tokenGate) {
       const bal = await getHiveEngineTokenBalance(username, r.tokenGate.symbol);
       if (bal >= r.tokenGate.amount)         joinedVia = 'token';
@@ -3069,27 +3081,31 @@ io.on('connection', (socket) => {
 
     socket.join(room);
     socket._room = room;
+    socket._homeServer = isFed ? fedHome : null; // remembered for disconnect cleanup
     // Drop any stale entry for this username before pushing the fresh one.
     // Socket.io reconnects mint a new socketId for the same client; without
-    // this dedup, the server's member count drifts upward over reconnects
-    // (and rooms never delete because length never reaches 0).
+    // this dedup, the server's member count drifts upward over reconnects.
+    // Use canonical form for the dedup key so a local @user can't accidentally
+    // displace a federated @user@peer.com.
+    const memberKey = m => (m.homeServer ? `${m.username}@${m.homeServer}` : m.username);
     const staleBefore = r.members.length;
-    r.members = r.members.filter(u => u.username !== username);
+    r.members = r.members.filter(u => memberKey(u) !== canonicalUser);
     if (r.members.length !== staleBefore) {
-      console.log(`[join] dropped ${staleBefore - r.members.length} stale member entry/entries for @${username} in #${room}`);
+      console.log(`[join] dropped ${staleBefore - r.members.length} stale member entry/entries for ${canonicalUser} in #${room}`);
     }
-    r.members.push({ socketId: socket.id, username, pubKey, joinedVia });
-    if (lobbyUsers[username]) lobbyUsers[username].inRoom = room;
+    r.members.push({ socketId: socket.id, username, pubKey, joinedVia, homeServer: isFed ? fedHome : null });
+    if (!isFed && lobbyUsers[username]) lobbyUsers[username].inRoom = room;
 
     const everyone = r.members.map(u => ({
-      socketId: u.socketId, username: u.username, pubKey: u.pubKey, joinedVia: u.joinedVia
+      socketId: u.socketId, username: u.username, pubKey: u.pubKey,
+      joinedVia: u.joinedVia, homeServer: u.homeServer || null
     }));
     socket.emit('room-users', everyone);
     socket.emit('room-info', {
       creator:           r.creator,
       allowlist:         [...r.allowlist],
       tokenGate:         r.tokenGate || null,
-      banlist:           (username === r.creator || r.banlistVisibility === 'all') ? [...r.banlist] : null,
+      banlist:           (canonicalUser === r.creator || r.banlistVisibility === 'all') ? [...r.banlist] : null,
       banlistVisibility: r.banlistVisibility,
       spotlight:         r.spotlight || null
     });
@@ -3100,9 +3116,12 @@ io.on('connection', (socket) => {
       socket.emit('room-history', history);
     }
 
-    socket.to(room).emit('user-joined', { socketId: socket.id, username, pubKey, joinedVia });
+    socket.to(room).emit('user-joined', {
+      socketId: socket.id, username, pubKey, joinedVia,
+      homeServer: isFed ? fedHome : null
+    });
     broadcastRooms();
-    console.log(`@${username} joined #${room} via ${joinedVia} (${r.members.length} members)`);
+    console.log(`@${canonicalUser} joined #${room} via ${joinedVia} (${r.members.length} members)`);
   });
 
   // ── ALLOWLIST MANAGEMENT ───────────────────────────────────────────────────
@@ -3204,9 +3223,14 @@ io.on('connection', (socket) => {
   socket.on('allowlist-remove', ({ room, username: targetUser }) => {
     const r = rooms[room];
     if (!r || r.creator !== socket._username) return;
-    if (targetUser === r.creator) return;
-    r.allowlist.delete(targetUser);
-    const member = r.members.find(m => m.username === targetUser);
+    const target = (targetUser || '').trim().toLowerCase().replace(/^@/, '');
+    if (!target || target === r.creator) return;
+    r.allowlist.delete(target);
+    // Auto-kick the matching member — same canonical-or-bare match as room-ban.
+    const member = r.members.find(m => {
+      const canonical = m.homeServer ? `${m.username}@${m.homeServer}` : m.username;
+      return canonical === target || m.username === target;
+    });
     if (member) io.to(member.socketId).emit('kicked', { room, reason: 'You were removed from this room.' });
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
@@ -3220,8 +3244,14 @@ io.on('connection', (socket) => {
     const target = (username || '').trim().toLowerCase().replace(/^@/, '');
     if (!target || target === r.creator) return; // can't ban self
     r.banlist.add(target);
-    // Auto-kick if currently in the room.
-    const memberIdx = r.members.findIndex(m => m.username === target);
+    // Auto-kick if currently in the room. Match against canonical form for
+    // federated members (so banning 'noblemage@hive-book.com' kicks the right
+    // user) and also bare username (so banning '@noblemage' still works for
+    // local members + as a fallback for federated when there's no name clash).
+    const memberIdx = r.members.findIndex(m => {
+      const canonical = m.homeServer ? `${m.username}@${m.homeServer}` : m.username;
+      return canonical === target || m.username === target;
+    });
     if (memberIdx >= 0) {
       const targetSocketId = r.members[memberIdx].socketId;
       io.to(targetSocketId).emit('kicked', { room, reason: `You have been banned from #${room}.` });
@@ -3438,7 +3468,8 @@ io.on('connection', (socket) => {
     const room = socket._room;
     if (!room || !rooms[room]) return;
     const everyone = rooms[room].members.map(u => ({
-      socketId: u.socketId, username: u.username, pubKey: u.pubKey, joinedVia: u.joinedVia
+      socketId: u.socketId, username: u.username, pubKey: u.pubKey,
+      joinedVia: u.joinedVia, homeServer: u.homeServer || null
     }));
     socket.emit('room-users-resync', everyone);
   });
@@ -3567,6 +3598,40 @@ function fedSend(ws, msg) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify(msg)); } catch(e) { /* ignore — peer will reconnect */ }
   }
+}
+
+// v0.16 Part B — when a federation peer drops, kick every federated member
+// whose homeServer matches that domain from every room hosted on this server.
+// Per the (a) immediate-eviction design call: rooms have no payment to refund
+// and the temp Socket.io can survive a federation drop, but we choose clean
+// state over zombie members. The kicked event reaches the federated user via
+// their (still-alive) temp Socket.io, their client closes the temp socket,
+// and they end up back in their home server's lobby.
+function cleanupFederatedMembersForPeer(domain) {
+  let totalRemoved = 0;
+  for (const [roomName, r] of Object.entries(rooms)) {
+    const removed = r.members.filter(m => m.homeServer === domain);
+    if (removed.length === 0) continue;
+    const survivors = r.members.filter(m => m.homeServer !== domain);
+    for (const m of removed) {
+      io.to(m.socketId).emit('kicked', { room: roomName, reason: `Federation connection to ${domain} was lost — you've been removed from this room.` });
+      io.to(roomName).emit('user-left', m.socketId);
+      clearSpotlightIfMember(r, roomName, m.username);
+      totalRemoved++;
+    }
+    r.members = survivors;
+    if (r.members.length === 0) {
+      if (r._capTimer)  clearTimeout(r._capTimer);
+      if (r._warnTimer) clearTimeout(r._warnTimer);
+      delete rooms[roomName];
+      chatDeleteRoom(roomName);
+      console.log(`[federation] Room #${roomName} closed after federation drop to ${domain}`);
+    } else {
+      emitRoomInfoToMembers(r, roomName);
+      console.log(`[federation] Removed ${removed.length} federated member(s) from #${roomName} after federation drop to ${domain}`);
+    }
+  }
+  if (totalRemoved > 0) broadcastRooms();
 }
 
 // True if the peer is currently connected AND advertised protocol_version >= 0.4.
@@ -4293,8 +4358,10 @@ function fedAttachSocket(ws, label) {
   });
   ws.on('close',   () => {
     if (ws._domain && federationPeers[ws._domain]?.ws === ws) {
-      federationPeers[ws._domain].connected = false;
-      console.log(`[federation] ${label} to ${ws._domain} closed`);
+      const domain = ws._domain;
+      federationPeers[domain].connected = false;
+      console.log(`[federation] ${label} to ${domain} closed`);
+      cleanupFederatedMembersForPeer(domain); // v0.16 Part B
       broadcastLobby();
     }
   });
