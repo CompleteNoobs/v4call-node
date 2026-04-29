@@ -530,8 +530,18 @@ function emitRoomInfoToMembers(r, roomName) {
       allowlist:         [...r.allowlist],
       tokenGate:         r.tokenGate || null,
       banlist:           visibleBanlist,
-      banlistVisibility: r.banlistVisibility
+      banlistVisibility: r.banlistVisibility,
+      spotlight:         r.spotlight || null
     });
+  }
+}
+
+// v0.15 — clear the room's broadcast spotlight if `username` is the current
+// target. Called whenever a member leaves (leave-room / disconnect / ban).
+function clearSpotlightIfMember(r, room, username) {
+  if (r.spotlight && r.spotlight === username) {
+    r.spotlight = null;
+    io.to(room).emit('room-spotlight-changed', { target: null, targetSocketId: null });
   }
 }
 
@@ -2922,6 +2932,7 @@ io.on('connection', (socket) => {
       banlistVisibility: visibility,
       paidInvitees:      new Map(), // v0.17 forward-compat — never populated in v0.14
       members:           [],
+      spotlight:         null,      // v0.15 — admin-broadcast spotlight target (username or null)
       createdAt:         new Date()
     };
     for (const invitee of invitees) {
@@ -2960,6 +2971,7 @@ io.on('connection', (socket) => {
         banlistVisibility: 'admin',
         paidInvitees:      new Map(),
         members:           [],
+        spotlight:         null,
         createdAt:         new Date()
       };
     }
@@ -3007,7 +3019,8 @@ io.on('connection', (socket) => {
       allowlist:         [...r.allowlist],
       tokenGate:         r.tokenGate || null,
       banlist:           (username === r.creator || r.banlistVisibility === 'all') ? [...r.banlist] : null,
-      banlistVisibility: r.banlistVisibility
+      banlistVisibility: r.banlistVisibility,
+      spotlight:         r.spotlight || null
     });
 
     // Send room history (broadcasts + messages encrypted to this user)
@@ -3059,6 +3072,7 @@ io.on('connection', (socket) => {
       io.to(targetSocketId).emit('kicked', { room, reason: `You have been banned from #${room}.` });
       r.members.splice(memberIdx, 1);
       io.to(room).emit('user-left', targetSocketId);
+      clearSpotlightIfMember(r, room, target);
     }
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
@@ -3093,6 +3107,50 @@ io.on('connection', (socket) => {
     chatDeleteRoom(room);
     broadcastRooms();
     console.log(`Room #${room} ended-for-all by admin @${socket._username}`);
+  });
+
+  // ── v0.15 SPOTLIGHT BROADCAST (admin-only) ────────────────────────────────
+  // Admin sets a room-wide spotlight target. Stored as username (stable across
+  // socket reconnects) and re-resolved to socketId at broadcast time. Soft
+  // override on the client side — users with a local pin keep it and see a
+  // "↺ Follow room spotlight" affordance instead of being yanked.
+
+  socket.on('room-spotlight-set', ({ room, target }) => {
+    const r = rooms[room];
+    if (!r || r.creator !== socket._username) return;
+    let normalised = null;
+    let targetSocketId = null;
+    if (target) {
+      normalised = String(target).trim().toLowerCase().replace(/^@/, '');
+      const member = r.members.find(m => m.username === normalised);
+      if (!member) return;
+      targetSocketId = member.socketId;
+    }
+    r.spotlight = normalised;
+    io.to(room).emit('room-spotlight-changed', { target: normalised, targetSocketId });
+    console.log(`[spotlight] @${socket._username} set #${room} spotlight → ${normalised || '(cleared)'}`);
+  });
+
+  // ── v0.15 ADMIN ROLE TRANSFER ─────────────────────────────────────────────
+  // Current admin hands off to another current member. Target is forced onto
+  // the allowlist (so they can re-join if they later leave + come back).
+
+  socket.on('room-transfer-admin', ({ room, username }) => {
+    const r = rooms[room];
+    if (!r || r.creator !== socket._username) return;
+    const target = String(username || '').trim().toLowerCase().replace(/^@/, '');
+    if (!target) return;
+    if (target === r.creator) return;
+    if (!r.members.some(m => m.username === target)) {
+      socket.emit('room-admin-transfer-failed', { reason: `@${target} must be a current room member to receive admin.` });
+      return;
+    }
+    const previous = r.creator;
+    r.creator = target;
+    r.allowlist.add(target);
+    emitRoomInfoToMembers(r, room);
+    broadcastRooms();
+    console.log(`[admin] #${room} transferred from @${previous} → @${target}`);
   });
 
   // ── ROOM EXPORT (.v4room) — v0.14.5 ───────────────────────────────────────
@@ -3242,6 +3300,7 @@ io.on('connection', (socket) => {
     if (!room || !rooms[room]) return;
     rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
     socket.to(room).emit('user-left', socket.id);
+    clearSpotlightIfMember(rooms[room], room, username);
     if (lobbyUsers[username]) delete lobbyUsers[username].inRoom;
     socket.leave(room);
     socket._room = null;
@@ -3296,6 +3355,7 @@ io.on('connection', (socket) => {
     if (room && rooms[room]) {
       rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
       socket.to(room).emit('user-left', socket.id);
+      clearSpotlightIfMember(rooms[room], room, username);
 
       if (rooms[room].isCall) {
         console.log(`[disconnect] @${username} disconnected from 1:1 call room #${room} → emitting peer-hung-up`);
