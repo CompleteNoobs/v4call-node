@@ -2927,7 +2927,43 @@ io.on('connection', (socket) => {
       socket.emit('room-create-error', `Room "${roomName}" already exists.`);
       return;
     }
-    const allowlist = new Set([creator, ...invitees]);
+
+    // Resolve each invitee to either a local username, a federated 'user@server'
+    // form, or skip if unresolvable. Two paths are honoured for federated:
+    //   1. Caller passed canonical 'user@server.com' explicitly
+    //   2. Caller passed bare 'user' but no local lobby user with that name
+    //      exists AND a federation peer has them online (v0.13+ presence)
+    // Path 2 covers the lobby user-picker UX, where federated users in the list
+    // get added to lobbySelected as bare names. Without this fallback, the
+    // bare name fails the local lookup and silently drops the invite.
+    const resolved = []; // each: { local: bool, user, server, canonical, peer? }
+    for (const raw of invitees) {
+      if (raw === creator) continue;
+      const handle = parseFederatedHandle(raw);
+      if (!handle) continue;
+
+      if (handle.server && handle.server !== SERVER_DOMAIN.toLowerCase()) {
+        if (!approvedPeers.has(handle.server))     continue;
+        const peer = federationPeers[handle.server];
+        if (!peer || !peer.connected)              continue;
+        if (!peerSupportsV04(handle.server))       continue;
+        resolved.push({ local: false, user: handle.user, server: handle.server, canonical: `${handle.user}@${handle.server}`, peer });
+        continue;
+      }
+
+      // Local-typed name — but maybe a federated user via lobby-picker fallback.
+      if (lobbyUsers[handle.user]) {
+        resolved.push({ local: true, user: handle.user, canonical: handle.user });
+        continue;
+      }
+      const fedPeer = peerForUser(handle.user);
+      if (fedPeer && peerSupportsV04(fedPeer.domain)) {
+        resolved.push({ local: false, user: handle.user, server: fedPeer.domain, canonical: `${handle.user}@${fedPeer.domain}`, peer: fedPeer });
+      }
+      // else: unresolvable, drop silently (matches existing behaviour for unknown locals).
+    }
+
+    const allowlist = new Set([creator, ...resolved.map(r => r.canonical)]);
     const sym = (tokenGateSymbol || '').trim().toUpperCase();
     const amt = parseFloat(tokenGateAmount) || 0;
     const tokenGate  = (sym && amt > 0) ? { symbol: sym, amount: amt } : null;
@@ -2943,13 +2979,40 @@ io.on('connection', (socket) => {
       spotlight:         null,      // v0.15 — admin-broadcast spotlight target (username or null)
       createdAt:         new Date()
     };
-    for (const invitee of invitees) {
-      if (invitee === creator) continue;
-      const lu = lobbyUsers[invitee];
-      if (lu) io.to(lu.socketId).emit('room-invite', { roomName, from: creator, invitees });
+
+    const allInviteCanonical = [creator, ...resolved.map(r => r.canonical)];
+    for (const r of resolved) {
+      if (r.local) {
+        const lu = lobbyUsers[r.user];
+        if (lu) io.to(lu.socketId).emit('room-invite', { roomName, from: creator, invitees: allInviteCanonical });
+        continue;
+      }
+      // Federated — fire room-invite over the federation socket. Same envelope
+      // shape and pendingFederatedInvites bookkeeping as the allowlist-add path.
+      const inviteId = crypto.randomBytes(12).toString('hex');
+      pendingFederatedInvites[inviteId] = {
+        dir:           'outgoing',
+        room:          roomName,
+        from_user:     creator,
+        target_user:   r.user,
+        target_server: r.server,
+        created_at:    Date.now()
+      };
+      fedSend(r.peer.ws, {
+        type:          'room-invite',
+        invite_id:     inviteId,
+        from_user:     creator,
+        to_user:       r.user,
+        room_name:     roomName,
+        source_server: SERVER_DOMAIN,
+        payload:       {}
+      });
+      console.log(`[federation] → room-invite @${creator} → @${r.user}@${r.server} #${roomName} (id ${inviteId})`);
+      io.to(socket.id).emit('lobby-info', { text: `📨 Invite sent to @${r.user}@${r.server}.` });
     }
+
     broadcastRooms();
-    socket.emit('room-created', { roomName, invitees: [...invitees] });
+    socket.emit('room-created', { roomName, invitees: resolved.map(r => r.canonical) });
     console.log(`@${creator} created #${roomName}${tokenGate ? ` [tokenGate: ${tokenGate.amount} ${tokenGate.symbol}]` : ''}${visibility === 'all' ? ' [banlist: public]' : ''}`);
   });
 
