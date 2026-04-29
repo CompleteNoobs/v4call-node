@@ -2747,14 +2747,23 @@ io.on('connection', (socket) => {
     const effectiveCallId = callId || roomName;
 
     rooms[roomName] = {
-      creator:   caller,
-      allowlist: new Set([caller, callee]),
-      members:   [],
-      createdAt: new Date(),
-      isCall:    true,
-      callType:  callType || 'voice',
-      callId:    effectiveCallId,
-      federated: federatedCallee ? { calleeServer: federatedCallee.domain } : null
+      creator:           caller,
+      allowlist:         new Set([caller, callee]),
+      // v0.16 Part B.6 — 1:1 call rooms must initialise the same fields the
+      // generic join/leave/info/ban code expects on multi-party rooms; without
+      // these the join handler crashed (banlist undefined, paidInvitees undefined,
+      // [...r.banlist] crash for the creator's room-info path, etc.).
+      banlist:           new Set(),
+      tokenGate:         null,
+      banlistVisibility: 'admin',
+      paidInvitees:      new Map(),
+      spotlight:         null,
+      members:           [],
+      createdAt:         new Date(),
+      isCall:            true,
+      callType:          callType || 'voice',
+      callId:            effectiveCallId,
+      federated:         federatedCallee ? { calleeServer: federatedCallee.domain } : null
     };
 
     ledgerCallCreate(effectiveCallId, caller, callee, callType || 'voice');
@@ -3036,10 +3045,12 @@ io.on('connection', (socket) => {
     const canonicalUser = isFed ? `${username}@${fedHome}` : username;
 
     // 1. Banlist — check both canonical form (federated) and bare (local /
-    // legacy ban entries). Banlist always wins.
+    // legacy ban entries). Banlist always wins. 1:1 call rooms are created
+    // without a banlist field (see the call-invite handler), so guard with `b &&`
+    // — without this guard, joining a 1:1 call room crashes the whole server.
     if (rooms[room]) {
       const b = rooms[room].banlist;
-      if (b.has(canonicalUser) || (isFed && b.has(username))) {
+      if (b && (b.has(canonicalUser) || (isFed && b.has(username)))) {
         socket.emit('join-rejected', { room, reason: 'You are banned from this room.' });
         return;
       }
