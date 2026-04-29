@@ -4331,10 +4331,8 @@ async function fedHandleMessage(ws, raw) {
 
       const adminLu = lobbyUsers[entry.from_user];
       if (response === 'accepted' && adminLu) {
-        // Notify the inviting admin. Cross-server *join* lands in v0.16 Part B —
-        // for now just confirm the response was received.
         io.to(adminLu.socketId).emit('lobby-info', {
-          text: `✓ @${entry.target_user}@${entry.target_server} accepted invite to #${entry.room}. (Cross-server join arrives in v0.16 Part B.)`
+          text: `✓ @${entry.target_user}@${entry.target_server} accepted invite to #${entry.room}.`
         });
       } else if (response === 'declined' && reason === 'offline' && adminLu) {
         // Offline auto-decline — surface so admin knows it didn't reach the user.
