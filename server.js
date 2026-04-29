@@ -74,7 +74,7 @@ const DM_PREVIEW_COUNT          = parseInt(process.env.DM_PREVIEW_COUNT         
 const FEDERATION_PEERS = (process.env.FEDERATION_PEERS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const FEDERATION_ENABLED = FEDERATION_PEERS.length > 0;
-const FEDERATION_VERSION = '0.2';
+const FEDERATION_VERSION = '0.4';
 
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
@@ -437,8 +437,16 @@ const lobbyUsers = {}; // username → { socketId, pubKey, invisible, inCall? }
 const rooms      = {}; // roomName → { creator, allowlist(Set), banlist(Set), tokenGate:{symbol,amount}|null, banlistVisibility:'admin'|'all', paidInvitees:Map, members[], createdAt, isCall?, callId?, ... }
 
 // Federation state — populated by federation message handlers (see below).
-// domain → { ws, connected, name, users: Map(username → { pubKey }) }
+// domain → { ws, connected, name, users: Map(username → { pubKey }), protocolVersion }
 const federationPeers = {};
+
+// In-flight federated room invites (v0.16, fed v0.4). One map serves both
+// directions; `dir` distinguishes:
+//   outgoing — admin on this server invited a user on another server
+//   incoming — peer server invited a local user to a room on the peer
+// Pruned by ttl-sweep (see start of fedHandleMessage section).
+const pendingFederatedInvites = {};
+const FED_INVITE_TTL_MS = 15 * 60 * 1000;
 
 // ── Discovery state (populated by scanV4CallDirectory) ──────────────────────
 // domain → { post_author, post_permlink, post_created, parsed, verified,
@@ -3039,11 +3047,95 @@ io.on('connection', (socket) => {
   socket.on('allowlist-add', ({ room, username: targetUser }) => {
     const r = rooms[room];
     if (!r || r.creator !== socket._username) return;
-    r.allowlist.add(targetUser);
-    const lu = lobbyUsers[targetUser];
+
+    const handle = parseFederatedHandle(targetUser);
+    if (!handle) {
+      socket.emit('allowlist-error', { room, reason: 'Invalid username — expected @user or @user@server.com.' });
+      return;
+    }
+
+    if (handle.server) {
+      // Federated invite (v0.16 / fed v0.4): target lives on another server.
+      if (handle.server === SERVER_DOMAIN.toLowerCase()) {
+        // User typed our own domain — treat as a local invite.
+        handle.server = null;
+      }
+    }
+
+    if (handle.server) {
+      // ── Federated path ─────────────────────────────────────────────────────
+      if (!approvedPeers.has(handle.server)) {
+        socket.emit('allowlist-error', { room, reason: `${handle.server} is not an approved federation peer. Approve it at /admin-peers.html first.` });
+        return;
+      }
+      const peer = federationPeers[handle.server];
+      if (!peer || !peer.connected) {
+        socket.emit('allowlist-error', { room, reason: `Not currently connected to ${handle.server}. Wait for federation to reconnect, then retry.` });
+        return;
+      }
+      if (!peerSupportsV04(handle.server)) {
+        socket.emit('allowlist-error', { room, reason: `${handle.server} is on an older federation protocol — cross-server room invites need v0.4. Ask the operator to update.` });
+        return;
+      }
+      const canonical = `${handle.user}@${handle.server}`;
+      r.allowlist.add(canonical);
+
+      const inviteId = crypto.randomBytes(12).toString('hex');
+      pendingFederatedInvites[inviteId] = {
+        dir:           'outgoing',
+        room,
+        from_user:     socket._username,
+        target_user:   handle.user,
+        target_server: handle.server,
+        created_at:    Date.now()
+      };
+
+      fedSend(peer.ws, {
+        type:          'room-invite',
+        invite_id:     inviteId,
+        from_user:     socket._username,
+        to_user:       handle.user,
+        room_name:     room,
+        source_server: SERVER_DOMAIN,
+        payload:       {} // v0.17 paid-invite hook — empty in v0.16
+      });
+
+      console.log(`[federation] → room-invite @${socket._username} → @${handle.user}@${handle.server} #${room} (id ${inviteId})`);
+      socket.emit('allowlist-info', { room, message: `📨 Invite sent to @${handle.user}@${handle.server}.` });
+      emitRoomInfoToMembers(r, room);
+      broadcastRooms();
+      return;
+    }
+
+    // ── Local path (unchanged behaviour) ─────────────────────────────────────
+    r.allowlist.add(handle.user);
+    const lu = lobbyUsers[handle.user];
     if (lu) io.to(lu.socketId).emit('room-invite', { roomName: room, from: socket._username, invitees: [...r.allowlist] });
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
+  });
+
+  // v0.16 / fed v0.4 — local user's accept/decline of a federated room invite.
+  // The receiving server forwards the response back over the federation socket
+  // to the source server so it can clean up its outgoing-pending entry.
+  socket.on('room-invite-respond', ({ invite_id, response }) => {
+    const entry = pendingFederatedInvites[invite_id];
+    if (!entry || entry.dir !== 'incoming') return;
+    if (entry.target_user !== socket._username) {
+      console.warn(`[room-invite-respond] @${socket._username} responded to invite ${invite_id} owned by @${entry.target_user} — dropped`);
+      return;
+    }
+    const peer = federationPeers[entry.from_server];
+    if (!peer || !peer.connected) {
+      console.warn(`[room-invite-respond] Lost connection to ${entry.from_server} — response not relayed for ${invite_id}`);
+      socket.emit('lobby-info', { text: `⚠ Lost connection to ${entry.from_server}; your response wasn't delivered.` });
+      delete pendingFederatedInvites[invite_id];
+      return;
+    }
+    const finalResponse = (response === 'accepted') ? 'accepted' : 'declined';
+    fedSend(peer.ws, { type: 'room-response', invite_id, response: finalResponse });
+    delete pendingFederatedInvites[invite_id];
+    console.log(`[federation] → room-response ${finalResponse} for invite_id ${invite_id} → ${entry.from_server}`);
   });
 
   socket.on('allowlist-remove', ({ room, username: targetUser }) => {
@@ -3414,6 +3506,29 @@ function fedSend(ws, msg) {
   }
 }
 
+// True if the peer is currently connected AND advertised protocol_version >= 0.4.
+// v0.3 peers don't send protocol_version, so they fail this check — that's the
+// gate for v0.4-only features (cross-server room invites + responses).
+function peerSupportsV04(domain) {
+  const peer = federationPeers[domain];
+  if (!peer || !peer.connected) return false;
+  const n = parseFloat(peer.protocolVersion);
+  return !isNaN(n) && n >= 0.4;
+}
+
+// Lower-case, strip leading @, split on '@'. For local form returns server=null.
+// For 'cnoobz@hive-book.com' returns { user:'cnoobz', server:'hive-book.com' }.
+// Returns null on malformed input (empty user, empty server, multiple @s).
+function parseFederatedHandle(input) {
+  const norm = (input || '').trim().toLowerCase().replace(/^@/, '');
+  if (!norm) return null;
+  const parts = norm.split('@');
+  if (parts.length === 1) return { user: parts[0], server: null };
+  if (parts.length !== 2) return null;
+  if (!parts[0] || !parts[1]) return null;
+  return { user: parts[0], server: parts[1] };
+}
+
 function fedBroadcast(msg) {
   for (const peer of Object.values(federationPeers)) {
     if (peer.connected) fedSend(peer.ws, msg);
@@ -3709,11 +3824,12 @@ async function fedHandleMessage(ws, raw) {
       const registered = fedRegisterPeer(domain, msg.name, ws, vr.escrow);
       if (!registered) return; // duplicate rejected by tiebreaker
       const peer = federationPeers[domain];
-      peer.verified      = true;
-      peer.hive_account  = vr.hive_account;
-      peer.fee_account   = vr.fee_account;
-      peer.issued        = vr.issued;
-      peer.expires       = vr.expires;
+      peer.verified        = true;
+      peer.hive_account    = vr.hive_account;
+      peer.fee_account     = vr.fee_account;
+      peer.issued          = vr.issued;
+      peer.expires         = vr.expires;
+      peer.protocolVersion = (typeof msg.protocol_version === 'string') ? msg.protocol_version : null;
 
       if (msg.escrow && msg.escrow !== vr.escrow) {
         console.warn(`[federation] ⚠ ${domain}: hello.escrow=@${msg.escrow} but verify.json.escrow=@${vr.escrow} — using signed value`);
@@ -4012,8 +4128,93 @@ async function fedHandleMessage(ws, raw) {
       console.log(`[fed-billing] Forwarded caller receipt for ${callId} to @${caller}`);
       break;
     }
+
+    // ── v0.4 — Cross-server room invites ────────────────────────────────────
+    case 'room-invite': {
+      if (!ws._domain) return;
+      const { invite_id, from_user, to_user, room_name, source_server, payload } = msg;
+      if (!invite_id || !from_user || !to_user || !room_name || !source_server) {
+        console.warn(`[federation] ← room-invite from ${ws._domain} dropped — missing required fields`);
+        return;
+      }
+      if (source_server.toLowerCase() !== ws._domain) {
+        console.warn(`[federation] ← room-invite source_server ${source_server} ≠ wire peer ${ws._domain} — dropped`);
+        return;
+      }
+      const target = (to_user || '').toLowerCase();
+      const lu = lobbyUsers[target];
+      if (!lu) {
+        // Target offline — auto-decline so the inviting admin gets feedback.
+        fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'offline' });
+        console.log(`[federation] ← room-invite for offline @${target} from @${from_user}@${ws._domain} — auto-declined`);
+        return;
+      }
+      pendingFederatedInvites[invite_id] = {
+        dir:         'incoming',
+        target_user: target,
+        from_user,
+        from_server: ws._domain,
+        room:        room_name,
+        payload:     payload || {},
+        created_at:  Date.now()
+      };
+      io.to(lu.socketId).emit('room-invite', {
+        roomName:    room_name,
+        from:        from_user,
+        invitees:    [from_user, target],
+        from_server: ws._domain,
+        invite_id
+      });
+      console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} #${room_name} (id ${invite_id})`);
+      break;
+    }
+
+    case 'room-response': {
+      if (!ws._domain) return;
+      const { invite_id, response, reason } = msg;
+      const entry = pendingFederatedInvites[invite_id];
+      if (!entry || entry.dir !== 'outgoing') {
+        console.warn(`[federation] ← room-response for unknown invite_id ${invite_id} from ${ws._domain}`);
+        return;
+      }
+      if (entry.target_server !== ws._domain) {
+        console.warn(`[federation] ← room-response from ${ws._domain} but invite was for ${entry.target_server} — dropped`);
+        return;
+      }
+      delete pendingFederatedInvites[invite_id];
+      console.log(`[federation] ← room-response ${response} for #${entry.room} (@${entry.target_user}@${entry.target_server})${reason ? ' — ' + reason : ''}`);
+
+      const adminLu = lobbyUsers[entry.from_user];
+      if (response === 'accepted' && adminLu) {
+        // Notify the inviting admin. Cross-server *join* lands in v0.16 Part B —
+        // for now just confirm the response was received.
+        io.to(adminLu.socketId).emit('lobby-info', {
+          text: `✓ @${entry.target_user}@${entry.target_server} accepted invite to #${entry.room}. (Cross-server join arrives in v0.16 Part B.)`
+        });
+      } else if (response === 'declined' && reason === 'offline' && adminLu) {
+        // Offline auto-decline — surface so admin knows it didn't reach the user.
+        io.to(adminLu.socketId).emit('lobby-info', {
+          text: `⚠ @${entry.target_user}@${entry.target_server} is offline — invite to #${entry.room} not delivered.`
+        });
+      }
+      // Explicit user decline is silent on the inviter side (matches local invite behaviour).
+      break;
+    }
   }
 }
+
+// Periodic prune of pending federated invites — drops any that have been
+// outstanding longer than FED_INVITE_TTL_MS (e.g. peer disconnected mid-flow,
+// user never responded). Logs each expiry so debugging mid-flight drops is easy.
+setInterval(() => {
+  const cutoff = Date.now() - FED_INVITE_TTL_MS;
+  for (const [id, entry] of Object.entries(pendingFederatedInvites)) {
+    if (entry.created_at < cutoff) {
+      console.log(`[federation] Pending invite ${id} (${entry.dir}) expired after ${Math.round((Date.now() - entry.created_at) / 60000)}m`);
+      delete pendingFederatedInvites[id];
+    }
+  }
+}, 5 * 60 * 1000).unref?.();
 
 function fedAttachSocket(ws, label) {
   // fedHandleMessage is async (hello awaits verifyPeer). We chain handlers in
@@ -4041,12 +4242,13 @@ function fedAttachSocket(ws, label) {
   // rates-post escrow mismatches, and our SERVER_HIVE_ACCOUNT so peers can
   // pin their verify.json check to the correct signer.
   fedSend(ws, {
-    type:         'hello',
-    domain:       SERVER_DOMAIN,
-    name:         SERVER_NAME,
-    version:      FEDERATION_VERSION,
-    escrow:       ESCROW_ACCOUNT,
-    hive_account: SERVER_HIVE_ACCOUNT
+    type:             'hello',
+    domain:           SERVER_DOMAIN,
+    name:             SERVER_NAME,
+    version:          FEDERATION_VERSION,
+    protocol_version: FEDERATION_VERSION, // explicit gate field for v0.4+ features (cross-server room invites etc.)
+    escrow:           ESCROW_ACCOUNT,
+    hive_account:     SERVER_HIVE_ACCOUNT
   });
 }
 
