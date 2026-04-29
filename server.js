@@ -3062,14 +3062,20 @@ io.on('connection', (socket) => {
     const r = rooms[room];
 
     // 3. Authorisation: allowlist OR (v0.17 forward-compat) paidInvitees OR
-    // tokenGate-with-balance. Federated joiners match canonical form for
-    // allowlist; tokenGate balance check uses bare username.
+    // tokenGate-with-balance. Federated joiners try the canonical form first;
+    // for legacy 1:1 call rooms (created with `new Set([caller, callee])`,
+    // both BARE names — see the call-invite handler) we fall back to the bare
+    // username so a federated callee can still join the call room hosted on
+    // the caller's server. v0.16 federated rooms always have canonical entries
+    // so the canonical match wins; the bare-fallback is only for 1:1 calls.
     let joinedVia = null;
-    if      (r.allowlist.has(canonicalUser)) joinedVia = 'allowlist';
-    else if (r.paidInvitees.has(canonicalUser)) joinedVia = 'paid';     // v0.17 hook
+    if      (r.allowlist.has(canonicalUser))            joinedVia = 'allowlist';
+    else if (isFed && r.allowlist.has(username))        joinedVia = 'allowlist'; // 1:1 call legacy path
+    else if (r.paidInvitees.has(canonicalUser))         joinedVia = 'paid';      // v0.17 hook
+    else if (isFed && r.paidInvitees.has(username))     joinedVia = 'paid';      // v0.17 hook (1:1)
     else if (r.tokenGate) {
       const bal = await getHiveEngineTokenBalance(username, r.tokenGate.symbol);
-      if (bal >= r.tokenGate.amount)         joinedVia = 'token';
+      if (bal >= r.tokenGate.amount)                    joinedVia = 'token';
     }
     if (!joinedVia) {
       const need = r.tokenGate
