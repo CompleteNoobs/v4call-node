@@ -2160,42 +2160,16 @@ io.on('connection', (socket) => {
     io.emit('lobby-chat', { from, message, signature, timestamp });
   });
 
-  // ── LOBBY DM — rate-checked and payment-enforced ──────────────────────────
-  // Free DMs: emitted with no payment fields → relayed immediately.
-  // ── LOBBY ENCRYPTED — toggle path ─────────────────────────────────────────
-  // Sent when a user has another user toggled on in the lobby user list.
-  // Ephemeral: server only relays, no billing, no storage, no verification.
-  // The ciphertext is encrypted with the recipient's public key — server never sees plaintext.
-
-  socket.on('lobby-encrypted', async ({ to, ciphertext, senderCiphertext, signature, timestamp }) => {
-    const from = socket._username;
-    if (!from) return;
-    const gate = await checkLobbyPostGate(from);
-    if (!gate.allowed) { socket.emit('lobby-post-rejected', { reason: gate.message }); return; }
-    const recipient = lobbyUsers[to];
-    if (recipient) {
-      io.to(recipient.socketId).emit('lobby-encrypted', { from, ciphertext, signature, timestamp });
-    } else if (FEDERATION_ENABLED) {
-      // Toggle messages to federated users get relayed as free DMs — ephemeral,
-      // no billing, no payment verification. Store sender's copy only on this
-      // side; the peer stores the recipient's copy.
-      const peer = peerForUser(to);
-      if (peer) {
-        fedSend(peer.ws, {
-          type: 'dm',
-          from, to, ciphertext, signature, timestamp,
-          textPaid: 0,
-          fromServer: SERVER_DOMAIN
-        });
-      } else {
-        return; // recipient went offline
-      }
-    } else {
-      return;
-    }
-
-    // Store in chat DB (both copies)
-    chatStoreDm(from, to, ciphertext, senderCiphertext || null, signature, timestamp, 0);
+  // ── LOBBY ENCRYPTED — REMOVED in v0.16.5 ──────────────────────────────────
+  // Was a "send encrypted lobby message to selected users" feature that
+  // bypassed paid-DM rate enforcement. Removed entirely — for private chat,
+  // use rooms (free, allowlist-based) or DMs (paid if recipient demands).
+  // Stub stays so stale clients (cached older index.html) get a clear message
+  // instead of silent failure.
+  socket.on('lobby-encrypted', () => {
+    socket.emit('lobby-post-rejected', {
+      reason: 'Encrypted lobby messages were removed in v0.16.5. Use a room (free) or DM (paid if rates set) for private chat.'
+    });
   });
 
   // ── LOBBY DM — paid direct message path ───────────────────────────────────
