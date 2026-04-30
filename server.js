@@ -3738,7 +3738,7 @@ async function verifyPeer(domain, claimedAccount) {
 
   let obj;
   try { obj = await _fetchPeerVerifyFile(domain); }
-  catch(e) { return fail(`Cannot fetch verify.json: ${e.message}`); }
+  catch(e) { return fail(`Cannot fetch v4call-server.json: ${e.message}`); }
 
   // Shape + field-consistency checks
   if (obj.claim !== 'v4call-server-ownership')                 return fail('wrong claim');
@@ -3977,7 +3977,7 @@ async function fedHandleMessage(ws, raw) {
       peer.protocolVersion = (typeof msg.protocol_version === 'string') ? msg.protocol_version : null;
 
       if (msg.escrow && msg.escrow !== vr.escrow) {
-        console.warn(`[federation] ⚠ ${domain}: hello.escrow=@${msg.escrow} but verify.json.escrow=@${vr.escrow} — using signed value`);
+        console.warn(`[federation] ⚠ ${domain}: hello.escrow=@${msg.escrow} but v4call-server.json.escrow=@${vr.escrow} — using signed value`);
       }
 
       console.log(`[federation] ✓ Peer verified: @${domain} (signer: @${vr.hive_account}, escrow: @${vr.escrow}${vr.expires ? `, expires ${vr.expires}` : ''})`);
@@ -4385,7 +4385,7 @@ function fedAttachSocket(ws, label) {
   });
   // Say hello immediately. Include our ESCROW_ACCOUNT so peers can detect
   // rates-post escrow mismatches, and our SERVER_HIVE_ACCOUNT so peers can
-  // pin their verify.json check to the correct signer.
+  // pin their v4call-server.json check to the correct signer.
   fedSend(ws, {
     type:             'hello',
     domain:           SERVER_DOMAIN,
