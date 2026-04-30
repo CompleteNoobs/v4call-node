@@ -4022,12 +4022,51 @@ async function fedHandleMessage(ws, raw) {
         const verifier = (cur !== 'HBD' && cur !== 'HIVE')
           ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
           : verifyHivePayment(from, ESCROW_ACCOUNT, paid, textMemo);
-        verifier.then(ok => {
+        verifier.then(async ok => {
           if (!ok) {
             console.warn(`[fed-text] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo})`);
             fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: 'payment not on chain' });
             return;
           }
+
+          // v0.16.6 — Recipient-side rate enforcement.
+          // Caller's server already validated against the rates post, but a
+          // malicious or stale-cache caller server could lie. We are the
+          // recipient's home server and the only one fully trusted to enforce
+          // the recipient's own policies (block-list, rate, platform fee min).
+          // On reject: refund the caller from our escrow.
+          const recipRates = await fetchRates(to);
+          const applicable = recipRates
+            ? await getRatesForCaller(recipRates, from, 'text', new Date())
+            : null;
+          let rejectReason = null;
+          if (applicable?.blocked) {
+            rejectReason = applicable.message || 'sender is blocked by recipient';
+          } else if (applicable?.feeRejected) {
+            rejectReason = applicable.message || 'recipient platform fee below this server\'s minimum';
+          } else {
+            const requiredRate = applicable?.flat || 0;
+            if (requiredRate >= 0.001 && paid < requiredRate) {
+              rejectReason = `underpaid (required ${requiredRate} ${applicable?.currency || cur}, paid ${paid} ${cur})`;
+            }
+          }
+          if (rejectReason) {
+            console.warn(`[fed-text] ✗ Recipient-side rate check failed: @${from} → @${to}: ${rejectReason}`);
+            const refundMemo = `v4call:text-refund:${msgId}`;
+            ledgerPayment(msgId, 'text_refund', ESCROW_ACCOUNT, from, paid, refundMemo, 'pending');
+            sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
+                console.log(`[fed-text] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
+              } else {
+                ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
+                console.error(`[fed-text] Refund to @${from} failed: ${r.reason}`);
+              }
+            });
+            fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: rejectReason });
+            return;
+          }
+
           ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified');
 
           // Disburse from our escrow — recipient gets net, we keep platform cut.
@@ -4182,12 +4221,57 @@ async function fedHandleMessage(ws, raw) {
       const verifier = (cur !== 'HBD' && cur !== 'HIVE')
         ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, amount, cur, memo)
         : verifyHivePayment(from, ESCROW_ACCOUNT, amount, memo);
-      verifier.then(ok => {
+      verifier.then(async ok => {
         if (!ok) {
           console.warn(`[fed-payment] ✗ Re-verify failed for ${paymentType} ${callId} (@${from} → @${ESCROW_ACCOUNT} ${amount} ${cur})`);
           fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: 'on-chain not found' });
           return;
         }
+
+        // v0.16.6 — Recipient-side rate enforcement for paid calls.
+        // For ring fee, re-fetch our recipient's rates and validate the paid
+        // amount + compute the authoritative ratePerHour from OUR rates post
+        // (instead of trusting msg.ratePerHour from the caller's server).
+        // On reject: refund the caller from our escrow and don't create the
+        // activePayments entry — the call should never have been billed.
+        let computedRatePerHour = null;
+        let computedPlatformFee = null;
+        if (paymentType === 'ring') {
+          const recipRates = await fetchRates(to);
+          const applicable = recipRates
+            ? await getRatesForCaller(recipRates, from, msg.callType || 'voice', new Date())
+            : null;
+          let rejectReason = null;
+          if (applicable?.blocked) {
+            rejectReason = applicable.message || 'caller is blocked by recipient';
+          } else if (applicable?.feeRejected) {
+            rejectReason = applicable.message || 'recipient platform fee below this server\'s minimum';
+          } else {
+            const requiredRing = applicable?.ring || 0;
+            if (requiredRing >= 0.001 && amount < requiredRing) {
+              rejectReason = `ring fee underpaid (required ${requiredRing} ${cur}, paid ${amount} ${cur})`;
+            }
+          }
+          if (rejectReason) {
+            console.warn(`[fed-payment] ✗ Recipient-side rate check failed: ${callId} ring — ${rejectReason}`);
+            const refundMemo = `v4call:ring-refund:${callId}`;
+            ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, from, amount, refundMemo, 'pending');
+            sendFromEscrow(from, amount, refundMemo, cur, callId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(callId, 'ring_refund', 'sent', r.txId);
+                console.log(`[fed-payment] Ring refund sent to @${from}: ${amount} ${cur} (tx ${r.txId})`);
+              } else {
+                ledgerPaymentUpdate(callId, 'ring_refund', 'failed', null);
+                console.error(`[fed-payment] Ring refund to @${from} failed: ${r.reason}`);
+              }
+            });
+            fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: rejectReason });
+            return;
+          }
+          computedRatePerHour = applicable?.rate;
+          computedPlatformFee = applicable?.platformFee;
+        }
+
         if (!activePayments[callId]) activePayments[callId] = {};
         const p = activePayments[callId];
         p.caller        = from;
@@ -4199,8 +4283,13 @@ async function fedHandleMessage(ws, raw) {
         if (paymentType === 'ring') {
           p.ringPaid    = amount;
           p.ringMemo    = memo;
-          if (msg.ratePerHour !== undefined) p.ratePerHour = msg.ratePerHour;
-          if (msg.platformFee !== undefined) p.posterPlatformFee = msg.platformFee;
+          // v0.16.6: prefer OUR computed rate-per-hour over the caller's claim.
+          // computedRatePerHour comes from our own fetchRates(to) above; falls
+          // back to msg.ratePerHour only if our rates fetch returned nothing.
+          p.ratePerHour      = (computedRatePerHour !== null && computedRatePerHour !== undefined)
+            ? computedRatePerHour : msg.ratePerHour;
+          p.posterPlatformFee = (computedPlatformFee !== null && computedPlatformFee !== undefined)
+            ? computedPlatformFee : msg.platformFee;
           if (msg.callType    !== undefined) p.callType    = msg.callType;
           ledgerCallCreate(callId, from, to, msg.callType || 'voice');
           ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified');
