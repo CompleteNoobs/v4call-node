@@ -1158,6 +1158,106 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── computePaymentOptions ─────────────────────────────────────────────────────
+// Returns ALL the payment options a caller qualifies for (one per accepted
+// currency: any token section where the caller has balance, plus an HBD option
+// if a named/default list window matches). Used by the multi-currency picker
+// AND by v0.16.6 recipient-side rate enforcement on federation.
+//
+// Why a helper: getRatesForCaller returns a single applicable (first token
+// match wins, then HBD). The picker shows MULTIPLE options so the caller can
+// choose which currency to pay in. Validating "paid >= rate" on the recipient
+// side requires looking up the rate for the currency the caller ACTUALLY
+// paid in — not just the resolver's first pick.
+//
+// Returns: { options, blocked, feeRejected, message }
+//   options: [{ currency, balance?, ...buildCallRateResult fields }]
+//   blocked / feeRejected: true if the caller is blocked / fee minimum not met
+//   message: human-readable reason when blocked or feeRejected
+// ─────────────────────────────────────────────────────────────────────────────
+async function computePaymentOptions(rates, callerUsername, callType, now = new Date()) {
+  if (!rates) return { options: [], blocked: false, feeRejected: false };
+
+  const caller  = callerUsername.toLowerCase();
+  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
+  const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+  const escrow  = rates.escrow;
+
+  // Platform fee minimum — server rejects if callee's posted fee is too low
+  const calleeFee   = rates.platformFee;
+  const serverFee   = PLATFORM_FEE;
+  const platformFee = serverFee;
+  if (typeof calleeFee === 'number' && calleeFee < serverFee) {
+    return {
+      options: [],
+      blocked: false,
+      feeRejected: true,
+      message: `@${rates.account || 'this user'}'s platform fee (${(calleeFee*100).toFixed(1)}%) is below this server's minimum (${(serverFee*100).toFixed(1)}%).`
+    };
+  }
+
+  // Block-list — overrides everything unless caller holds the bypass token
+  if (rates.blocked && rates.blocked.users.includes(caller)) {
+    let bypassed = false;
+    if (rates.blocked.allowIfToken) {
+      const bal = await getHiveEngineTokenBalance(caller, rates.blocked.allowIfToken);
+      if (bal > 0) bypassed = true;
+    }
+    if (!bypassed) {
+      return {
+        options: [],
+        blocked: true,
+        feeRejected: false,
+        message: rates.blocked.message || 'You have been blocked.'
+      };
+    }
+  }
+
+  const options = [];
+
+  // Token sections — one option per token the caller holds
+  for (const tok of (rates.tokens || [])) {
+    const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
+    if (bal > 0) {
+      options.push({
+        currency: tok.symbol,
+        balance:  bal,
+        ...buildCallRateResult(tok, callType, escrow, platformFee)
+      });
+    }
+  }
+
+  // HBD option — first matching named list, else default list
+  let hbdOption = null;
+  for (const list of (rates.lists || [])) {
+    if (list.name === 'default') continue;
+    if (!list.users.includes(caller)) continue;
+    const win = list.windows.find(w =>
+      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+    );
+    if (win) {
+      hbdOption = { currency: 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
+      break;
+    }
+  }
+  if (!hbdOption) {
+    const defList = (rates.lists || []).find(l => l.name === 'default');
+    if (defList) {
+      const win = defList.windows.find(w =>
+        w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+      );
+      if (win) {
+        hbdOption = { currency: 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      }
+    }
+  }
+  if (hbdOption) options.push(hbdOption);
+
+  return { options, blocked: false, feeRejected: false };
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ── Payment tracking ──────────────────────────────────────────────────────────
 // activePayments: callId → { caller, callee, ringPaid, depositPaid, creditRemaining,
 //                            connectPaid, startTime, ratePerHour, escrow, platformFee, _processing }
@@ -2377,89 +2477,18 @@ io.on('connection', (socket) => {
     const rates = await fetchRates(callee);
     if (!rates) return cb({ found: false, free: true });
 
-    const now     = new Date();
-    const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
-    const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
-    const { escrow } = rates;
-
-    // ── Platform fee enforcement ─────────────────────────────────────────────
-    const calleeFee = rates.platformFee;
-    const serverFee = PLATFORM_FEE;
-    const platformFee = serverFee; // best price for callee
-
-    if (typeof calleeFee === 'number' && calleeFee < serverFee) {
-      const calleePct = (calleeFee * 100).toFixed(1);
-      const serverPct = (serverFee * 100).toFixed(1);
-      return cb({
-        found: true, feeRejected: true,
-        message: `@${callee}'s platform fee (${calleePct}%) is below this server's minimum (${serverPct}%). They need to set PLATFORM-FEE to at least ${serverPct}% in their rates post to receive paid contacts on this server.`
-      });
+    const result = await computePaymentOptions(rates, caller, callType, new Date());
+    if (result.feeRejected) {
+      return cb({ found: true, feeRejected: true, message: result.message });
     }
-
-    // Check blocked
-    if (rates.blocked && rates.blocked.users.includes(caller.toLowerCase())) {
-      const bypassToken = rates.blocked.allowIfToken;
-      let bypassed = false;
-      if (bypassToken) {
-        const bal = await getHiveEngineTokenBalance(caller, bypassToken);
-        if (bal > 0) bypassed = true;
-      }
-      if (!bypassed) {
-        return cb({ found: true, blocked: true, message: rates.blocked.message || 'You have been blocked.' });
-      }
+    if (result.blocked) {
+      return cb({ found: true, blocked: true, message: result.message });
     }
-
-    const options = [];
-
-    // Collect all token options the caller qualifies for
-    for (const tok of (rates.tokens || [])) {
-      const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
-      if (bal > 0) {
-        const built = buildCallRateResult(tok, callType, escrow, platformFee);
-        options.push({ currency: tok.symbol, balance: bal, ...built });
-      }
-    }
-
-    // Collect HBD default rate (from named lists or default list)
-    const callerLower = caller.toLowerCase();
-    let hbdOption = null;
-
-    // Named lists first
-    for (const list of (rates.lists || [])) {
-      if (list.name === 'default') continue;
-      if (!list.users.includes(callerLower)) continue;
-      const win = list.windows.find(w =>
-        w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-      );
-      if (win) {
-        hbdOption = { currency: 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
-        break;
-      }
-    }
-
-    // Default list fallback
-    if (!hbdOption) {
-      const defList = (rates.lists || []).find(l => l.name === 'default');
-      if (defList) {
-        const win = defList.windows.find(w =>
-          w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-        );
-        if (win) {
-          hbdOption = { currency: 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
-        }
-      }
-    }
-
-    if (hbdOption) options.push(hbdOption);
-
-    if (options.length === 0) {
+    if (result.options.length === 0) {
       return cb({ found: true, free: true });
     }
-
-    // Mark the "best" (auto-selected) option — first token match, or HBD
-    if (options.length > 0) options[0]._recommended = true;
-
-    cb({ found: true, free: false, options, escrow: escrow || ESCROW_ACCOUNT });
+    result.options[0]._recommended = true;
+    cb({ found: true, free: false, options: result.options, escrow: rates.escrow || ESCROW_ACCOUNT });
   });
 
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
@@ -4035,21 +4064,36 @@ async function fedHandleMessage(ws, raw) {
           // recipient's home server and the only one fully trusted to enforce
           // the recipient's own policies (block-list, rate, platform fee min).
           // On reject: refund the caller from our escrow.
+          //
+          // Multi-currency: the picker shows all options the caller qualifies
+          // for; the caller picks one and pays in THAT currency. Look up the
+          // option matching the actual paid currency, not the resolver's
+          // first-pick. (Original v0.16.6 used getRatesForCaller which returns
+          // a single applicable, so it wrongly rejected when the caller chose
+          // a different currency than the resolver's first-token-match.)
           const recipRates = await fetchRates(to);
-          const applicable = recipRates
-            ? await getRatesForCaller(recipRates, from, 'text', new Date())
-            : null;
+          const optResult = await computePaymentOptions(recipRates, from, 'text', new Date());
           let rejectReason = null;
-          if (applicable?.blocked) {
-            rejectReason = applicable.message || 'sender is blocked by recipient';
-          } else if (applicable?.feeRejected) {
-            rejectReason = applicable.message || 'recipient platform fee below this server\'s minimum';
-          } else {
-            const requiredRate = applicable?.flat || 0;
-            if (requiredRate >= 0.001 && paid < requiredRate) {
-              rejectReason = `underpaid (required ${requiredRate} ${applicable?.currency || cur}, paid ${paid} ${cur})`;
+          if (optResult.blocked) {
+            rejectReason = optResult.message || 'sender is blocked by recipient';
+          } else if (optResult.feeRejected) {
+            rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.options.length > 0) {
+            const opt = optResult.options.find(o => o.currency === cur);
+            if (!opt) {
+              // Caller paid in a currency the recipient doesn't accept.
+              // (E.g. recipient accepts CNOOBS + HBD; caller sent SHITCOIN.)
+              // Reject + refund — recipient hasn't agreed to this currency.
+              rejectReason = `recipient does not accept ${cur} for paid DMs`;
+            } else {
+              const requiredRate = opt.flat || 0;
+              if (requiredRate >= 0.001 && paid < requiredRate) {
+                rejectReason = `underpaid (required ${requiredRate} ${cur}, paid ${paid} ${cur})`;
+              }
             }
           }
+          // If optResult.options.length === 0: recipient has no rates post
+          // OR no matching window right now → free DM territory; let through.
           if (rejectReason) {
             console.warn(`[fed-text] ✗ Recipient-side rate check failed: @${from} → @${to}: ${rejectReason}`);
             const refundMemo = `v4call:text-refund:${msgId}`;
@@ -4229,27 +4273,32 @@ async function fedHandleMessage(ws, raw) {
         }
 
         // v0.16.6 — Recipient-side rate enforcement for paid calls.
-        // For ring fee, re-fetch our recipient's rates and validate the paid
-        // amount + compute the authoritative ratePerHour from OUR rates post
-        // (instead of trusting msg.ratePerHour from the caller's server).
-        // On reject: refund the caller from our escrow and don't create the
-        // activePayments entry — the call should never have been billed.
+        // Same multi-currency logic as the dm handler above: look up the
+        // option matching the currency the caller actually paid in, not the
+        // resolver's first-pick. Validate ring fee + use OUR computed
+        // ratePerHour from THAT currency option (so settlement billing is
+        // correct in the currency the call was opened in).
         let computedRatePerHour = null;
         let computedPlatformFee = null;
         if (paymentType === 'ring') {
           const recipRates = await fetchRates(to);
-          const applicable = recipRates
-            ? await getRatesForCaller(recipRates, from, msg.callType || 'voice', new Date())
-            : null;
+          const optResult = await computePaymentOptions(recipRates, from, msg.callType || 'voice', new Date());
           let rejectReason = null;
-          if (applicable?.blocked) {
-            rejectReason = applicable.message || 'caller is blocked by recipient';
-          } else if (applicable?.feeRejected) {
-            rejectReason = applicable.message || 'recipient platform fee below this server\'s minimum';
-          } else {
-            const requiredRing = applicable?.ring || 0;
-            if (requiredRing >= 0.001 && amount < requiredRing) {
-              rejectReason = `ring fee underpaid (required ${requiredRing} ${cur}, paid ${amount} ${cur})`;
+          if (optResult.blocked) {
+            rejectReason = optResult.message || 'caller is blocked by recipient';
+          } else if (optResult.feeRejected) {
+            rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.options.length > 0) {
+            const opt = optResult.options.find(o => o.currency === cur);
+            if (!opt) {
+              rejectReason = `recipient does not accept ${cur} for paid calls`;
+            } else {
+              const requiredRing = opt.ring || 0;
+              if (requiredRing >= 0.001 && amount < requiredRing) {
+                rejectReason = `ring fee underpaid (required ${requiredRing} ${cur}, paid ${amount} ${cur})`;
+              }
+              computedRatePerHour = opt.rate;
+              computedPlatformFee = opt.platformFee;
             }
           }
           if (rejectReason) {
@@ -4268,8 +4317,6 @@ async function fedHandleMessage(ws, raw) {
             fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: rejectReason });
             return;
           }
-          computedRatePerHour = applicable?.rate;
-          computedPlatformFee = applicable?.platformFee;
         }
 
         if (!activePayments[callId]) activePayments[callId] = {};
