@@ -393,14 +393,54 @@ setInterval(chatCleanup, 60 * 60 * 1000);
 
 // ── Ledger helpers ────────────────────────────────────────────────────────────
 
-function ledgerPayment(callId, type, fromUser, toUser, amount, memo = '', status = 'pending', txId = null) {
+function ledgerPayment(callId, type, fromUser, toUser, amount, memo = '', status = 'pending', txId = null, currency = 'HBD') {
   try {
     db.prepare(`
-      INSERT INTO payments (call_id, type, from_user, to_user, amount, memo, status, tx_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(callId, type, fromUser, toUser, amount, memo, status, txId);
+      INSERT INTO payments (call_id, type, from_user, to_user, amount, currency, memo, status, tx_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(callId, type, fromUser, toUser, amount, currency, memo, status, txId);
   } catch(e) {
     console.error('[ledger] Payment insert failed:', e.message);
+  }
+}
+
+// v0.16.9 — Refundable missed/declined/cancelled calls for the callee.
+// Returns rows where the caller paid a ring fee that's still in our escrow
+// (no refund payment row exists yet). Used by the missed-call popup on login.
+function getRefundableMissedCalls(callee, limit = 20) {
+  try {
+    return db.prepare(`
+      SELECT
+        c.call_id,
+        c.caller,
+        c.callee,
+        c.call_type,
+        c.started_at,
+        c.status,
+        c.end_reason,
+        p.amount   AS ring_paid,
+        p.currency AS ring_currency,
+        p.memo     AS ring_memo
+      FROM calls c
+      JOIN payments p
+        ON p.call_id = c.call_id
+       AND p.type    = 'ring'
+       AND p.status IN ('verified', 'sent')
+      WHERE c.callee = ?
+        AND c.status IN ('missed', 'declined', 'cancelled')
+        AND p.amount > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM payments r
+          WHERE r.call_id = c.call_id
+            AND r.type IN ('refund', 'ring_refund')
+            AND r.status IN ('pending', 'sent')
+        )
+      ORDER BY c.started_at DESC
+      LIMIT ?
+    `).all(callee, limit);
+  } catch(e) {
+    console.error('[ledger] getRefundableMissedCalls failed:', e.message);
+    return [];
   }
 }
 
@@ -2279,6 +2319,12 @@ io.on('connection', (socket) => {
       socket.emit('dm-unread-summary', { totalMessages, fromUsers });
     }
 
+    // ── v0.16.9 — Missed/declined/cancelled calls with unrefunded ring fees ──
+    const missedCalls = getRefundableMissedCalls(username);
+    if (missedCalls.length > 0) {
+      socket.emit('missed-calls-summary', { calls: missedCalls });
+    }
+
     // ── DM previews (last N per conversation) ──────────────────────────────
     if (DM_PREVIEW_COUNT > 0) {
       const previews = chatGetDmPreviews(username, DM_PREVIEW_COUNT);
@@ -2693,6 +2739,75 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── v0.16.9 — REFUND MISSED/DECLINED/CANCELLED RING FEE ────────────────────
+  // The callee clicks "refund" on a missed-call popup row. We send the ring fee
+  // back from our escrow to the caller, in the original currency. Same code
+  // path for local + federated: the funds are on the callee's home server
+  // (this server) regardless of where the caller is on Hive.
+  socket.on('refund-ring-fee', async ({ callId }, cb) => {
+    const callee = socket._username;
+    if (!callee) return cb && cb({ success: false, reason: 'Not authenticated' });
+    if (!callId || typeof callId !== 'string') return cb && cb({ success: false, reason: 'Missing callId' });
+
+    // Look up the call + ring payment + check no refund already in flight
+    let row;
+    try {
+      row = db.prepare(`
+        SELECT
+          c.call_id, c.caller, c.callee, c.status,
+          p.amount   AS ring_paid,
+          p.currency AS ring_currency
+        FROM calls c
+        JOIN payments p
+          ON p.call_id = c.call_id
+         AND p.type    = 'ring'
+         AND p.status IN ('verified', 'sent')
+        WHERE c.call_id = ?
+          AND c.callee  = ?
+          AND c.status  IN ('missed', 'declined', 'cancelled')
+          AND p.amount  > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM payments r
+            WHERE r.call_id = c.call_id
+              AND r.type IN ('refund', 'ring_refund')
+              AND r.status IN ('pending', 'sent')
+          )
+      `).get(callId, callee);
+    } catch(e) {
+      console.error('[refund-ring-fee] lookup failed:', e.message);
+      return cb && cb({ success: false, reason: 'Internal error' });
+    }
+    if (!row) {
+      return cb && cb({ success: false, reason: 'Refund not available — already refunded, no ring fee, or not yours.' });
+    }
+
+    const refundMemo = `v4call:ring-refund:${callId}:user-action`;
+    const cur        = row.ring_currency || 'HBD';
+    ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, row.caller, row.ring_paid, refundMemo, 'pending', null, cur);
+
+    try {
+      const r = await sendFromEscrow(row.caller, row.ring_paid, refundMemo, cur, callId);
+      if (r.success) {
+        ledgerPaymentUpdate(callId, 'ring_refund', 'sent', r.txId);
+        console.log(`[refund-ring-fee] @${callee} refunded ${row.ring_paid} ${cur} to @${row.caller} (${callId})`);
+        // Notify the caller if they're online on this server.
+        const callerSid = lobbyUsers[row.caller]?.socketId;
+        if (callerSid) io.to(callerSid).emit('ring-fee-refunded', {
+          callId, by: callee, amount: row.ring_paid, currency: cur
+        });
+        return cb && cb({ success: true, amount: row.ring_paid, currency: cur, txId: r.txId });
+      } else {
+        ledgerPaymentUpdate(callId, 'ring_refund', 'failed', null);
+        console.error(`[refund-ring-fee] Disbursement failed: ${r.reason}`);
+        return cb && cb({ success: false, reason: r.reason || 'Disbursement failed' });
+      }
+    } catch(e) {
+      ledgerPaymentUpdate(callId, 'ring_refund', 'failed', null);
+      console.error('[refund-ring-fee] exception:', e.message);
+      return cb && cb({ success: false, reason: e.message });
+    }
+  });
+
   // ── CALL END (explicit hang-up) ────────────────────────────────────────────
 
   socket.on('call-end', async ({ callId }) => {
@@ -2777,12 +2892,13 @@ io.on('connection', (socket) => {
     if (!lobbyUsers[callee] && !federatedCallee) {
       if (ringFeePaid && ringFeePaid > 0 && callId) {
         // Callee went offline between rate check and ring — refund ring fee
+        const ringCurrency = activePayments[callId]?.currency || 'HBD';
         const refundMemo = `v4call:refund:${callId}:offline`;
-        ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending');
-        sendFromEscrow(caller, ringFeePaid, refundMemo, 'HBD', callId).then(r => {
+        ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+        sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(r => {
           const msg = r.success
-            ? `@${callee} is offline. Ring fee of ${ringFeePaid.toFixed(3)} HBD refunded.`
-            : `@${callee} is offline. Refund of ${ringFeePaid.toFixed(3)} HBD pending — contact support.`;
+            ? `@${callee} is offline. Ring fee of ${ringFeePaid.toFixed(3)} ${ringCurrency} refunded.`
+            : `@${callee} is offline. Refund of ${ringFeePaid.toFixed(3)} ${ringCurrency} pending — contact support.`;
           socket.emit('call-failed', { reason: msg, refunded: r.success });
           if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
         });
@@ -2827,8 +2943,11 @@ io.on('connection', (socket) => {
     ledgerCallCreate(effectiveCallId, caller, callee, callType || 'voice');
     ledgerCallUpdate(effectiveCallId, { status: 'ringing' });
     if (ringFeePaid > 0) {
+      // v0.16.9 — record currency from activePayments (set by verify-ring-payment)
+      // so the missed-call popup can show the actual currency, not always 'HBD'.
+      const ringCurrency = activePayments[effectiveCallId]?.currency || 'HBD';
       ledgerPayment(effectiveCallId, 'ring', caller, ESCROW_ACCOUNT, ringFeePaid,
-        `v4call:ring:${effectiveCallId}:${callee}`, 'verified');
+        `v4call:ring:${effectiveCallId}:${callee}`, 'verified', null, ringCurrency);
     }
 
     if (lobbyUsers[caller]) lobbyUsers[caller].inCall = roomName;
@@ -2871,6 +2990,12 @@ io.on('connection', (socket) => {
     const timer = setTimeout(() => {
       if (rooms[roomName] && rooms[roomName].members.length === 0) {
         const wasFederated = rooms[roomName].federated;
+        // v0.16.9 — persist missed status so the callee sees a refund popup later.
+        ledgerCallUpdate(effectiveCallId, {
+          status: 'missed',
+          end_reason: 'timeout',
+          ended_at: new Date().toISOString()
+        });
         delete rooms[roomName];
         if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
         if (lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
@@ -2968,6 +3093,15 @@ io.on('connection', (socket) => {
     const callee = [...room.allowlist].find(u => u !== caller);
     const federated = room.federated;
     if (room._callTimer) { clearTimeout(room._callTimer); delete room._callTimer; }
+    // v0.16.9 — persist cancelled status so the callee sees a refund popup
+    // later for the unspent ring fee.
+    if (room.callId) {
+      ledgerCallUpdate(room.callId, {
+        status: 'cancelled',
+        end_reason: 'cancelled_by_caller',
+        ended_at: new Date().toISOString()
+      });
+    }
     delete rooms[roomName];
     if (lobbyUsers[caller]) delete lobbyUsers[caller].inCall;
     if (callee && lobbyUsers[callee]) delete lobbyUsers[callee].inCall;
@@ -4297,6 +4431,16 @@ async function fedHandleMessage(ws, raw) {
         delete calleeUser.inCall;
         delete calleeUser.pendingFederatedCall;
       }
+      // v0.16.9 — persist cancelled status on our ledger so the callee sees
+      // a refund popup. The federation `payment-verified` handler already
+      // created the call row + ring payment row on this server.
+      if (msg.roomName) {
+        ledgerCallUpdate(msg.roomName, {
+          status: 'cancelled',
+          end_reason: 'cancelled_by_caller',
+          ended_at: new Date().toISOString()
+        });
+      }
       break;
     }
     case 'call-missed': {
@@ -4306,6 +4450,16 @@ async function fedHandleMessage(ws, raw) {
         io.to(calleeUser.socketId).emit('call-missed', { caller: msg.caller, roomName: msg.roomName });
         delete calleeUser.inCall;
         delete calleeUser.pendingFederatedCall;
+      }
+      // v0.16.9 — persist missed status on our ledger so the callee sees a
+      // refund popup. The federation `payment-verified` handler already
+      // created the call row + ring payment row on this server.
+      if (msg.roomName) {
+        ledgerCallUpdate(msg.roomName, {
+          status: 'missed',
+          end_reason: 'timeout',
+          ended_at: new Date().toISOString()
+        });
       }
       break;
     }
@@ -4394,16 +4548,20 @@ async function fedHandleMessage(ws, raw) {
             ? computedPlatformFee : msg.platformFee;
           if (msg.callType    !== undefined) p.callType    = msg.callType;
           ledgerCallCreate(callId, from, to, msg.callType || 'voice');
-          ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+          // v0.16.9 — pass currency so missed-call popup shows the actual token
+          ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
+          // Also mark this call as 'ringing' so the missed/cancelled status
+          // updates from federation `call-missed` / `call-cancelled` find a row.
+          ledgerCallUpdate(callId, { status: 'ringing' });
         } else if (paymentType === 'deposit') {
           p.depositPaid     = msg.depositAmount || amount;
           p.connectPaid     = msg.connectAmount || 0;
           p.creditRemaining = p.depositPaid;
-          ledgerPayment(callId, 'deposit', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+          ledgerPayment(callId, 'deposit', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
         } else if (paymentType === 'topup') {
           p.depositPaid     = (p.depositPaid     || 0) + amount;
           p.creditRemaining = (p.creditRemaining || 0) + amount;
-          ledgerPayment(callId, 'topup', from, ESCROW_ACCOUNT, amount, memo, 'verified');
+          ledgerPayment(callId, 'topup', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
           // Let the local callee's UI know the caller added more credit.
           const calleeSid = lobbyUsers[to]?.socketId;
           if (calleeSid) io.to(calleeSid).emit('credit-topup', {
