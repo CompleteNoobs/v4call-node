@@ -43,6 +43,16 @@ const SERVER_DOMAIN       = process.env.SERVER_DOMAIN       || 'v4call.com';
 const SERVER_HIVE_ACCOUNT = process.env.SERVER_HIVE_ACCOUNT || 'v4call';
 const ESCROW_ACCOUNT      = process.env.ESCROW_ACCOUNT      || 'v4call-escrow';
 const PLATFORM_FEE        = parseFloat(process.env.DEFAULT_PLATFORM_FEE || '10') / 100;
+
+// v0.16.8 — Universal precision floor for paid rates.
+// Rates below this are treated as free (picker filters them out, validator
+// ignores them, disbursement skips them). 0.001 matches HBD's 3-decimal
+// precision and the existing `.toFixed(3)` rounding throughout the disbursement
+// pipeline. For high-precision tokens (e.g. SWAP.BTC, 8 decimals) this means
+// the minimum settable rate is 0.001 of the token. To support sub-millicent
+// token rates (Path B in the v0.16.8 design), make this per-currency AND
+// replace `.toFixed(3)` in disbursement code with per-currency precision.
+const RATE_FLOOR = 0.001;
 const PORT                = parseInt(process.env.PORT        || '3000');
 const BIND_HOST           = process.env.BIND_HOST            || '127.0.0.1';
 
@@ -1107,7 +1117,12 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
         const tokSection = (calleeRates.tokens || []).find(t => t.symbol === bypassToken);
         if (tokSection) {
           console.log(`[rates] Applying ${bypassToken} token rates for bypassed @${caller}`);
-          return { currency: bypassToken, ...buildCallRateResult(tokSection, callType, escrow, platformFee) };
+          const result = { currency: bypassToken, ...buildCallRateResult(tokSection, callType, escrow, platformFee) };
+          if (isOptionBelowFloor(result)) {
+            console.log(`[rates] @${caller} ${bypassToken} rate below floor (${RATE_FLOOR}) — treating as free`);
+            return null;
+          }
+          return result;
         }
       }
     }
@@ -1124,7 +1139,12 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
     if (bal > 0) {
       console.log(`[rates] @${caller} qualifies for ${tok.symbol} token rates (bal: ${bal})`);
-      return { currency: tok.symbol, ...buildCallRateResult(tok, callType, escrow, platformFee) };
+      const result = { currency: tok.symbol, ...buildCallRateResult(tok, callType, escrow, platformFee) };
+      if (isOptionBelowFloor(result)) {
+        console.log(`[rates] @${caller} ${tok.symbol} rate below floor (${RATE_FLOOR}) — treating as free`);
+        return null;
+      }
+      return result;
     }
   }
 
@@ -1137,7 +1157,12 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     );
     if (win) {
       console.log(`[rates] @${caller} matched list "${list.name}"`);
-      return { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      if (isOptionBelowFloor(result)) {
+        console.log(`[rates] @${caller} HBD rate from list "${list.name}" below floor (${RATE_FLOOR}) — treating as free`);
+        return null;
+      }
+      return result;
     }
   }
 
@@ -1148,7 +1173,12 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
       w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
     );
     if (win) {
-      return { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      if (isOptionBelowFloor(result)) {
+        console.log(`[rates] @${caller} HBD rate from default list below floor (${RATE_FLOOR}) — treating as free`);
+        return null;
+      }
+      return result;
     }
   }
 
@@ -1158,6 +1188,20 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── isOptionBelowFloor ────────────────────────────────────────────────────────
+// True if the option has at least one nonzero rate field below RATE_FLOOR.
+// Such options can't be processed end-to-end (validator threshold + disbursement
+// rounding both kick in at 0.001), so they're filtered from the picker and
+// treated as free by the resolver.
+function isOptionBelowFloor(opt) {
+  if (!opt) return false;
+  if (opt.type === 'text') {
+    return opt.flat > 0 && opt.flat < RATE_FLOOR;
+  }
+  // voice or video
+  return [opt.ring, opt.connect, opt.rate].some(v => v > 0 && v < RATE_FLOOR);
+}
+
 // ── computePaymentOptions ─────────────────────────────────────────────────────
 // Returns ALL the payment options a caller qualifies for (one per accepted
 // currency: any token section where the caller has balance, plus an HBD option
@@ -1214,12 +1258,23 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   }
 
   const options = [];
+  let belowFloor = false;
+
+  // Helper: push if above floor, otherwise flag belowFloor and skip.
+  const pushOrFlag = (opt) => {
+    if (isOptionBelowFloor(opt)) {
+      belowFloor = true;
+      console.log(`[rates] Option for ${opt.currency} below floor (${RATE_FLOOR}) — filtered`);
+      return;
+    }
+    options.push(opt);
+  };
 
   // Token sections — one option per token the caller holds
   for (const tok of (rates.tokens || [])) {
     const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
     if (bal > 0) {
-      options.push({
+      pushOrFlag({
         currency: tok.symbol,
         balance:  bal,
         ...buildCallRateResult(tok, callType, escrow, platformFee)
@@ -1251,9 +1306,9 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
       }
     }
   }
-  if (hbdOption) options.push(hbdOption);
+  if (hbdOption) pushOrFlag(hbdOption);
 
-  return { options, blocked: false, feeRejected: false };
+  return { options, blocked: false, feeRejected: false, belowFloor };
 }
 
 
@@ -2485,10 +2540,10 @@ io.on('connection', (socket) => {
       return cb({ found: true, blocked: true, message: result.message });
     }
     if (result.options.length === 0) {
-      return cb({ found: true, free: true });
+      return cb({ found: true, free: true, belowFloor: result.belowFloor || false });
     }
     result.options[0]._recommended = true;
-    cb({ found: true, free: false, options: result.options, escrow: rates.escrow || ESCROW_ACCOUNT });
+    cb({ found: true, free: false, options: result.options, escrow: rates.escrow || ESCROW_ACCOUNT, belowFloor: result.belowFloor || false });
   });
 
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
