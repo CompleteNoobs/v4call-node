@@ -24,5 +24,9 @@ Thumbs.db
 .idea/
 *.swp
 
+# --------Nostr fed plans -------
+#NOSTR-DESIGN.md
+#v4call-nostr-gate/
+
 # that thing, server signing thingly 
 public/.well-known/v4call-server.json
