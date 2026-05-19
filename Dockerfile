@@ -11,13 +11,16 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 COPY server.js ./
+COPY nostr-fed.mjs ./
 COPY public/ ./public/
 
-# Create logs directory and give the node user ownership
-# This must happen before switching to USER node
-RUN mkdir -p /app/logs && chown -R node:node /app/logs
+# Create logs + nostr-key directories and give the node user ownership.
+# This must happen before switching to USER node. (The /app/nostr bind-mount
+# from the host may still be root-owned — see WalkThrough: if you see
+# "EACCES ... nostr-key.json", run `chown -R 1000:1000 ./data/nostr` on host.)
+RUN mkdir -p /app/logs /app/nostr && chown -R node:node /app/logs /app/nostr
 
-VOLUME ["/app/logs"]
+VOLUME ["/app/logs", "/app/nostr"]
 
 EXPOSE 3000
 
