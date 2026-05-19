@@ -12,6 +12,10 @@ services:
       BIND_HOST: "0.0.0.0"
     volumes:
       - ./data/logs:/app/logs
+      # Nostr federation identity key — own mount so it survives a
+      # `docker compose down && build --no-cache`. Do NOT delete ./data/nostr
+      # on the host or the server loses its Nostr identity (re-announce needed).
+      - ./data/nostr:/app/nostr
     networks:
       - internal
     healthcheck:

@@ -86,6 +86,20 @@ const FEDERATION_PEERS = (process.env.FEDERATION_PEERS || '')
 const FEDERATION_ENABLED = FEDERATION_PEERS.length > 0;
 const FEDERATION_VERSION = '0.4';
 
+// ── Nostr federation discovery (Phase B: publish own announce only) ─────────
+// FED_DISCOVERY_MODE controls how servers find each other:
+//   hive  = today's behaviour only (2h Hive scan), no Nostr
+//   nostr = Nostr relays only
+//   both  = Nostr (fast) + Hive scan (fallback)  ← default, belt-and-braces
+// This knob does NOT touch the WS federation transport (DMs/calls/payments
+// always ride that). It only affects discovery/presence. Phases C/D inherit it.
+const FED_DISCOVERY_MODE   = (process.env.FED_DISCOVERY_MODE || 'both').toLowerCase();
+const NOSTR_RELAYS         = (process.env.NOSTR_RELAYS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const NOSTR_REPUBLISH_HOURS = parseInt(process.env.NOSTR_REPUBLISH_HOURS || '6');
+const NOSTR_NSEC           = process.env.NOSTR_NSEC || '';   // one-time seed only
+const NOSTR_KEY_PATH       = process.env.NOSTR_KEY_PATH || '/app/nostr/nostr-key.json';
+
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
 console.log(`[config] Platform fee: ${PLATFORM_FEE * 100}%`);
@@ -4794,6 +4808,29 @@ if (FEDERATION_ENABLED) {
   setInterval(() => {
     scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
   }, 2 * 60 * 60 * 1000);
+}
+
+// ── Nostr federation (Phase B — publish own announce; non-blocking) ─────────
+// Loaded via dynamic import() because nostr-tools is ESM-only and server.js is
+// CommonJS. Fire-and-forget: any failure is logged inside and never throws,
+// so v4call runs normally regardless of Nostr state. Loaded in ALL modes
+// (even 'hive') so the identity key + npub are generated and printed for the
+// operator to pre-stage in their Hive announce; the module itself skips
+// publishing when mode is 'hive'.
+{
+  import('./nostr-fed.mjs').then(({ startNostrFed }) => {
+    startNostrFed({
+      domain:        SERVER_DOMAIN,
+      hiveAccount:   SERVER_HIVE_ACCOUNT,
+      verifyUrl:     `https://${SERVER_DOMAIN}/.well-known/v4call-server.json`,
+      protocol:      FEDERATION_VERSION,
+      mode:          FED_DISCOVERY_MODE,
+      relays:        NOSTR_RELAYS,
+      republishHours: NOSTR_REPUBLISH_HOURS,
+      nsecSeed:      NOSTR_NSEC,
+      keyPath:       NOSTR_KEY_PATH,
+    });
+  }).catch(e => console.error('[nostr] module load failed (v4call continues):', e.message));
 }
 
 

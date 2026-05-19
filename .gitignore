@@ -30,3 +30,6 @@ Thumbs.db
 
 # that thing, server signing thingly 
 public/.well-known/v4call-server.json
+
+# noob-docs
+noob-docs/
