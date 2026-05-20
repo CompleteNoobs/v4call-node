@@ -99,6 +99,14 @@ const NOSTR_RELAYS         = (process.env.NOSTR_RELAYS || '')
 const NOSTR_REPUBLISH_HOURS = parseInt(process.env.NOSTR_REPUBLISH_HOURS || '6');
 const NOSTR_NSEC           = process.env.NOSTR_NSEC || '';   // one-time seed only
 const NOSTR_KEY_PATH       = process.env.NOSTR_KEY_PATH || '/app/nostr/nostr-key.json';
+// When FED_DISCOVERY_MODE=nostr, should the 2h Hive scan still run as a
+// silent safety net? Default true. Set false ONLY for deliberate Nostr-only
+// testing — losing the Hive net means a total relay outage = no discovery.
+const NOSTR_HIVE_FALLBACK  = (process.env.NOSTR_HIVE_FALLBACK || 'true').toLowerCase() !== 'false';
+// Hive discovery scan runs UNLESS we're in pure-Nostr-no-fallback test mode.
+const HIVE_SCAN_ENABLED    = !(FED_DISCOVERY_MODE === 'nostr' && !NOSTR_HIVE_FALLBACK);
+// Nostr subscribe runs when discovery mode includes Nostr.
+const NOSTR_SUBSCRIBE_ENABLED = (FED_DISCOVERY_MODE === 'nostr' || FED_DISCOVERY_MODE === 'both');
 
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
@@ -4087,6 +4095,89 @@ async function scanV4CallDirectory() {
   console.log(`[discovery] Scan complete — ${parsedCount} v4call-server post(s), ${verifiedCount} verified`);
 }
 
+// ── Nostr-triggered discovery (Phase C) ─────────────────────────────────────
+// Called by nostr-fed.mjs when a v4call-server kind-30078 event arrives. We
+// trust NOTHING in the Nostr event payload — we extract only the domain and
+// run the existing verifyPeer() which is Hive-signature-anchored. The Nostr
+// event is effectively a "poke" that says "re-check this domain now" instead
+// of waiting up to 2h for the Hive scan. Worst case a forged event can do is
+// trigger a Hive verify we'd have done in the next scan anyway.
+//
+// Precedence: if a Hive-scan entry already exists for this domain (has
+// post_author), we KEEP it and only refresh last_seen — Hive-scan entries
+// are richer (carry post_*) and we don't want Nostr to clobber that.
+async function discoverPeerViaNostr({ domain, pubkey, eventId, content }) {
+  try {
+    if (!domain) return;
+    domain = String(domain).toLowerCase();
+    const existing = discoveredPeers[domain];
+    const now = new Date().toISOString();
+
+    // If a Hive-scan-sourced entry already exists, don't degrade it — just
+    // record that we saw it via Nostr too.
+    if (existing && existing.post_author) {
+      existing.last_seen   = now;
+      existing.nostr_seen  = true;
+      existing.nostr_pubkey = pubkey || existing.nostr_pubkey || null;
+      console.log(`[discovery] nostr poke for @${domain} — already known via Hive scan, last_seen refreshed`);
+      return;
+    }
+
+    // Verify the domain via the EXISTING Hive-anchored verifyPeer (no claimed
+    // account — let the signed file declare its own hive_account and we'll
+    // accept whatever the Hive signature validates).
+    const vr = await verifyPeer(domain);
+
+    // Build a `parsed` shape compatible with the admin-peers UI + approve path.
+    // Security-relevant fields come from the verified well-known (vr); the
+    // display-only fields can come from the Nostr event content (untrusted,
+    // labelled clearly in the source field).
+    const parsed = vr.verified ? {
+      domain:        vr.domain,
+      hive_account:  vr.hive_account,
+      escrow:        vr.escrow,
+      fee_account:   vr.fee_account,
+      federation_ws: vr.federation_ws,
+      verify_url:    `https://${domain}/.well-known/v4call-server.json`,
+      software:      (content && content.software) || 'unknown',
+      protocol:      (content && content.protocol) || 'unknown',
+      declared:      (content && content.announced_at) || null,
+    } : {
+      domain,
+      hive_account:  (content && content.hive_account) || null,
+      escrow:        null, fee_account: null, federation_ws: null,
+      verify_url:    `https://${domain}/.well-known/v4call-server.json`,
+      software:      (content && content.software) || 'unknown',
+      protocol:      (content && content.protocol) || 'unknown',
+      declared:      (content && content.announced_at) || null,
+    };
+
+    discoveredPeers[domain] = {
+      // Hive-post fields blank — this entry came from Nostr.
+      post_author:   '',
+      post_permlink: '',
+      post_created:  null,
+      // Phase C source-tracking fields (admin UI ignores unknown keys safely).
+      source:        'nostr',
+      nostr_pubkey:  pubkey || null,
+      nostr_event_id: eventId || null,
+      parsed,
+      verified:      !!vr.verified,
+      verify_reason: vr.verified ? null : (vr.reason || 'unknown'),
+      last_seen:     now
+    };
+
+    if (vr.verified) {
+      console.log(`[discovery] ✓ nostr-discovered + verified: @${domain} (signer @${vr.hive_account}) — visible in /admin-peers.html for approval`);
+    } else {
+      console.log(`[discovery] ✗ nostr-discovered but unverified: @${domain} — ${vr.reason}`);
+    }
+  } catch (e) {
+    // Discovery failures must never propagate. The Hive scan will retry.
+    console.error('[discovery] nostr discover error (non-fatal):', e.message);
+  }
+}
+
 function fedRegisterPeer(domain, name, ws, escrow) {
   const existing = federationPeers[domain];
   const isOutbound = ws._isOutbound === true;
@@ -4802,12 +4893,18 @@ if (FEDERATION_ENABLED) {
   console.log(`[federation] Approved peers: ${[...approvedPeers].join(', ') || '(none)'}`);
   for (const url of FEDERATION_PEERS) fedConnectPeer(url);
   // Kick off discovery shortly after startup (non-blocking), then every 2 hours.
-  setTimeout(() => {
-    scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
-  }, 5000);
-  setInterval(() => {
-    scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
-  }, 2 * 60 * 60 * 1000);
+  // Gated by HIVE_SCAN_ENABLED so FED_DISCOVERY_MODE=nostr + NOSTR_HIVE_FALLBACK=false
+  // can run pure-Nostr-no-fallback test mode.
+  if (HIVE_SCAN_ENABLED) {
+    setTimeout(() => {
+      scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
+    }, 5000);
+    setInterval(() => {
+      scanV4CallDirectory().catch(e => console.error('[discovery] scan error:', e.message));
+    }, 2 * 60 * 60 * 1000);
+  } else {
+    console.log('[discovery] Hive 2h scan DISABLED (FED_DISCOVERY_MODE=nostr, NOSTR_HIVE_FALLBACK=false) — Nostr is the only discovery channel');
+  }
 }
 
 // ── Nostr federation (Phase B — publish own announce; non-blocking) ─────────
@@ -4829,6 +4926,10 @@ if (FEDERATION_ENABLED) {
       republishHours: NOSTR_REPUBLISH_HOURS,
       nsecSeed:      NOSTR_NSEC,
       keyPath:       NOSTR_KEY_PATH,
+      // Phase C: subscribe + discovery
+      subscribeEnabled: NOSTR_SUBSCRIBE_ENABLED,
+      onDiscover:    discoverPeerViaNostr,        // module calls us; we own the trust check
+      ownDomain:     SERVER_DOMAIN,                // skip events from our own domain
     });
   }).catch(e => console.error('[nostr] module load failed (v4call continues):', e.message));
 }

@@ -135,6 +135,79 @@ async function publishOnce(pool, relays, ev) {
   });
 }
 
+// ── Phase C: long-lived subscription for other servers' announces ──────────
+// Filter: kind 30078 + #t=v4call-server. Newest-per-domain (`d` tag) wins
+// (kind 30078 is replaceable, so older events for the same `d` are stale).
+// We dedupe by event id (relays may deliver the same event N times) and
+// also by domain-with-newer-timestamp so an out-of-order arrival doesn't
+// downgrade a fresher view we already have.
+function startSubscribe(pool, cfg, ownPkHex) {
+  const relays = cfg.relays;
+  const seenEventIds  = new Set();
+  const newestByDomain = new Map();        // domain → created_at seconds
+  let resubCount = 0;
+
+  const filter = { kinds: [30078], '#t': ['v4call-server'] };
+
+  const onevent = (ev) => {
+    try {
+      if (seenEventIds.has(ev.id)) return;
+      seenEventIds.add(ev.id);
+
+      // Skip our own announce (we wrote it).
+      if (ev.pubkey === ownPkHex) return;
+
+      const dTag = ev.tags.find(t => t[0] === 'd');
+      const domain = dTag && dTag[1] ? String(dTag[1]).toLowerCase() : null;
+      if (!domain) return;
+
+      // Skip events claiming our own domain (we'd never need to discover us).
+      if (cfg.ownDomain && domain === String(cfg.ownDomain).toLowerCase()) return;
+
+      // Newer-wins per domain (kind 30078 is replaceable — but a relay can
+      // still hand us older copies).
+      const prevTs = newestByDomain.get(domain) || 0;
+      if (ev.created_at <= prevTs) return;
+      newestByDomain.set(domain, ev.created_at);
+
+      // Display-only content — must NEVER be trusted for security. The
+      // callback re-fetches /.well-known/v4call-server.json and uses the
+      // Hive-signed values for anything that matters.
+      let content = null;
+      try { content = JSON.parse(ev.content); } catch { /* best effort */ }
+
+      LOG(`◀ event from relay: domain=${domain} pubkey=${ev.pubkey.slice(0,12)}… ts=${ev.created_at} — handing to discovery`);
+      // Fire-and-forget; the callback handles its own errors.
+      Promise.resolve(cfg.onDiscover({
+        domain,
+        pubkey: ev.pubkey,
+        eventId: ev.id,
+        content,
+      })).catch(e => ERR(`onDiscover threw (non-fatal): ${e.message}`));
+    } catch (e) {
+      ERR(`subscribe onevent error (non-fatal): ${e.message}`);
+    }
+  };
+
+  const oneose = () => {
+    LOG(`subscribe: relay(s) sent stored backlog — now live`);
+  };
+
+  // SimplePool re-subscribes automatically when a relay reconnects, but a
+  // periodic re-open is cheap belt-and-braces against silent half-open
+  // sockets. Every ~30 min we tear down and re-open the subscription.
+  const openSub = () => {
+    resubCount++;
+    LOG(`subscribe: opening (#${resubCount}) on ${relays.length} relay(s), filter t=v4call-server kind=30078`);
+    return pool.subscribeMany(relays, filter, { onevent, oneose });
+  };
+  let sub = openSub();
+  setInterval(() => {
+    try { sub.close(); } catch { /* */ }
+    sub = openSub();
+  }, 30 * 60 * 1000).unref();
+}
+
 // ── Public entry point — called once from server.js at startup ─────────────
 export async function startNostrFed(cfg) {
   try {
@@ -176,6 +249,17 @@ export async function startNostrFed(cfg) {
     const everyMs = Math.max(1, cfg.republishHours) * 60 * 60 * 1000;
     setInterval(doPublish, everyMs).unref();         // repeat; don't hold the process open
     LOG(`will re-announce every ${cfg.republishHours}h (mode=${cfg.mode}, key source=${source})`);
+
+    // ── Phase C: subscribe for other servers' announces ─────────────────────
+    // We trust NOTHING in incoming events here — we extract only the domain
+    // (and a few display-only fields) and hand it to onDiscover(). The
+    // server.js callback runs the real Hive-anchored verifyPeer() before
+    // anything lands in discoveredPeers. nostr-fed.mjs stays a dumb transport.
+    if (cfg.subscribeEnabled && typeof cfg.onDiscover === 'function') {
+      startSubscribe(pool, cfg, pkHex);
+    } else if (cfg.subscribeEnabled) {
+      LOG(`subscribe requested but no onDiscover callback wired — skipping`);
+    }
   } catch (e) {
     // Absolute backstop: Nostr must NEVER take down v4call.
     ERR(`startup failed (v4call continues normally on Hive-only): ${e.message}`);
