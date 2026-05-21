@@ -3503,31 +3503,171 @@ io.on('connection', (socket) => {
         socket.emit('allowlist-error', { room, reason: `${handle.server} is on an older federation protocol — cross-server room invites need v0.4. Ask the operator to update.` });
         return;
       }
-      const canonical = `${handle.user}@${handle.server}`;
-      r.allowlist.add(canonical);
 
-      const inviteId = crypto.randomBytes(12).toString('hex');
-      pendingFederatedInvites[inviteId] = {
+      // v0.16.11 — federated invite-rate gate. Inviter-holds-funds model:
+      // payment goes to OUR escrow, we keep it until accept (disburse net to
+      // invitee cross-chain + fee to OUR operator) or decline/timeout (refund
+      // inviter from our escrow). Recipient server re-validates and re-verifies
+      // on-chain before delivering the popup (design rule #15).
+      const fedInviter = socket._username;
+      const fedInvitee = handle.user;
+      const canonical  = `${fedInvitee}@${handle.server}`;
+
+      // Re-invite of someone already on the allowlist is a no-op (no double-charge).
+      if (r.allowlist.has(canonical)) {
+        socket.emit('allowlist-info', { room, message: `@${fedInvitee}@${handle.server} is already invited.` });
+        return;
+      }
+
+      const fedInv = await getInviteOptions(fedInvitee, fedInviter);
+      if (fedInv.blocked) {
+        socket.emit('allowlist-error', { room, reason: fedInv.message || `@${fedInvitee} has blocked you.` });
+        return;
+      }
+      if (fedInv.feeRejected) {
+        socket.emit('allowlist-error', { room, reason: fedInv.message || `@${fedInvitee}'s platform fee is below this server's minimum.` });
+        return;
+      }
+
+      const isPaid = fedInv.options.length > 0;
+
+      // Paid invite — guard against escrow mismatch on the RECIPIENT side. The
+      // peer hello announced the peer's ESCROW account; if the invitee's rates
+      // post points elsewhere, the recipient server can't validate consistently
+      // and we'd be paying into our own escrow knowing the recipient's policy
+      // check will reject (and we'd refund). Fail loudly before Keychain pops.
+      if (isPaid) {
+        const peerEscrow = peer.escrow || null;
+        if (peerEscrow && fedInv.escrow !== peerEscrow) {
+          socket.emit('allowlist-error', { room, reason: `@${fedInvitee}'s rates post declares escrow @${fedInv.escrow}, but ${handle.server} controls @${peerEscrow}. They need to update their rates post (or switch home server) for paid invites to clear.` });
+          return;
+        }
+      }
+
+      if (!isPaid) {
+        // Free federated invite — original behaviour.
+        r.allowlist.add(canonical);
+        const inviteId = crypto.randomBytes(12).toString('hex');
+        pendingFederatedInvites[inviteId] = {
+          dir:           'outgoing',
+          room,
+          from_user:     fedInviter,
+          target_user:   fedInvitee,
+          target_server: handle.server,
+          created_at:    Date.now()
+        };
+        fedSend(peer.ws, {
+          type:          'room-invite',
+          invite_id:     inviteId,
+          from_user:     fedInviter,
+          to_user:       fedInvitee,
+          room_name:     room,
+          source_server: SERVER_DOMAIN,
+          payload:       {}
+        });
+        console.log(`[federation] → room-invite @${fedInviter} → @${fedInvitee}@${handle.server} #${room} (id ${inviteId})`);
+        socket.emit('allowlist-info', { room, message: `📨 Invite sent to @${fedInvitee}@${handle.server}.` });
+        emitRoomInfoToMembers(r, room);
+        broadcastRooms();
+        return;
+      }
+
+      // Paid federated invite — emit picker if no payment yet.
+      if (!payment || !payment.currency || !(payment.paid > 0) || !payment.memo || !payment.inviteId) {
+        const inviteId = crypto.randomBytes(12).toString('hex');
+        socket.emit('invite-payment-required', {
+          room,
+          invitee:  canonical, // show @user@server in modal so admin knows it's federated
+          inviteId,
+          escrow:   ESCROW_ACCOUNT, // OUR escrow — inviter-holds-funds model
+          options:  fedInv.options.map(o => ({
+            currency: o.currency,
+            flat:     o.flat,
+            balance:  o.balance ?? null,
+            listName: o.listName ?? null
+          })),
+          belowFloor: !!fedInv.belowFloor,
+          federated:  true,
+          peerServer: handle.server
+        });
+        return;
+      }
+
+      // Validate payment against picker offer.
+      const fedOpt = fedInv.options.find(o => o.currency === payment.currency);
+      if (!fedOpt) {
+        socket.emit('allowlist-error', { room, reason: `Currency ${payment.currency} is not an accepted invite rate for @${fedInvitee}.` });
+        return;
+      }
+      if (payment.paid + 1e-9 < fedOpt.flat) {
+        socket.emit('allowlist-error', { room, reason: `Underpaid: invite rate is ${fedOpt.flat} ${fedOpt.currency}, you sent ${payment.paid}.` });
+        return;
+      }
+      if (payment.memo !== `v4call:invite:${payment.inviteId}`) {
+        socket.emit('allowlist-error', { room, reason: 'Bad payment memo — must match the invite ID issued by the server.' });
+        return;
+      }
+      if (pendingPaidInvites[payment.inviteId] || pendingFederatedInvites[payment.inviteId]) {
+        socket.emit('allowlist-error', { room, reason: 'This invite has already been processed.' });
+        return;
+      }
+
+      // Verify on-chain — payment is to OUR escrow (inviter-holds-funds).
+      const fedCur = payment.currency;
+      const fedOk = (fedCur !== 'HBD' && fedCur !== 'HIVE')
+        ? await verifyHiveEnginePayment(fedInviter, ESCROW_ACCOUNT, payment.paid, fedCur, payment.memo)
+        : await verifyHivePayment(fedInviter, ESCROW_ACCOUNT, payment.paid, payment.memo);
+      if (!fedOk) {
+        socket.emit('allowlist-error', { room, reason: `Payment not found on blockchain. If ${fedCur} left your account, it can be recovered manually — note the memo: ${payment.memo}` });
+        return;
+      }
+
+      // Record both: paid-invite (for refund/disburse) and federated-invite
+      // (for peer-state tracking). Same id ties them together so the room-
+      // response handler can find the payment to settle.
+      pendingPaidInvites[payment.inviteId] = {
+        room,
+        inviter:    fedInviter,
+        invitee:    fedInvitee,             // bare username — Hive account is server-agnostic
+        invitee_server: handle.server,
+        currency:   fedCur,
+        paid:       payment.paid,
+        memo:       payment.memo,
+        status:     'pending',
+        created_at: Date.now(),
+        type:       'allowlist',
+        federated:  true
+      };
+      pendingFederatedInvites[payment.inviteId] = {
         dir:           'outgoing',
         room,
-        from_user:     socket._username,
-        target_user:   handle.user,
+        from_user:     fedInviter,
+        target_user:   fedInvitee,
         target_server: handle.server,
-        created_at:    Date.now()
+        created_at:    Date.now(),
+        paid_invite:   true
       };
+      ledgerPayment(payment.inviteId, 'invite', fedInviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', null, fedCur);
 
+      r.allowlist.add(canonical);
       fedSend(peer.ws, {
         type:          'room-invite',
-        invite_id:     inviteId,
-        from_user:     socket._username,
-        to_user:       handle.user,
+        invite_id:     payment.inviteId,
+        from_user:     fedInviter,
+        to_user:       fedInvitee,
         room_name:     room,
         source_server: SERVER_DOMAIN,
-        payload:       {} // v0.17 paid-invite hook — empty in v0.16
+        payload: {
+          payment: {
+            currency:      fedCur,
+            paid:          payment.paid,
+            memo:          payment.memo,
+            source_escrow: ESCROW_ACCOUNT // recipient verifies the on-chain payment was here
+          }
+        }
       });
-
-      console.log(`[federation] → room-invite @${socket._username} → @${handle.user}@${handle.server} #${room} (id ${inviteId})`);
-      socket.emit('allowlist-info', { room, message: `📨 Invite sent to @${handle.user}@${handle.server}.` });
+      console.log(`[paid-invite][fed] ${payment.inviteId} — @${fedInviter} paid ${payment.paid} ${fedCur} to invite @${fedInvitee}@${handle.server} → #${room}`);
+      socket.emit('allowlist-info', { room, message: `📨 Paid invite (${payment.paid.toFixed(3)} ${fedCur}) sent to @${fedInvitee}@${handle.server}.` });
       emitRoomInfoToMembers(r, room);
       broadcastRooms();
       return;
@@ -4972,10 +5112,80 @@ async function fedHandleMessage(ws, raw) {
       const lu = lobbyUsers[target];
       if (!lu) {
         // Target offline — auto-decline so the inviting admin gets feedback.
+        // Paid invite payment is auto-refunded by the source server when it
+        // receives this 'declined' (see room-response handler with reason='offline').
         fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'offline' });
         console.log(`[federation] ← room-invite for offline @${target} from @${from_user}@${ws._domain} — auto-declined`);
         return;
       }
+
+      // v0.16.11 — recipient-side paid-invite enforcement (design rule #15).
+      // If the source server attached a payment, re-validate the offer
+      // (rate match in OUR copy of target's rates) and re-verify the on-chain
+      // payment landed in the source server's claimed escrow. On any failure
+      // send back 'declined' with reason 'paid_rejected' so the source server
+      // refunds the inviter from its own escrow.
+      const payment = (payload && payload.payment) || null;
+      if (payment) {
+        const { currency, paid, memo, source_escrow } = payment;
+        if (!currency || !(paid > 0) || !memo || !source_escrow) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'malformed payment payload' });
+          console.log(`[federation] ← room-invite paid but malformed payment payload — rejected`);
+          return;
+        }
+        // Source escrow must match this peer's announced escrow (sanity check —
+        // we wouldn't accept a paid invite where the source server claims
+        // a different account holds the funds than the one in their signed
+        // v4call-server.json / hello envelope).
+        const peer = federationPeers[ws._domain];
+        const declaredEscrow = peer && peer.escrow;
+        if (declaredEscrow && source_escrow.toLowerCase() !== declaredEscrow.toLowerCase()) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: `source_escrow ${source_escrow} ≠ peer escrow ${declaredEscrow}` });
+          console.log(`[federation] ← room-invite paid but source_escrow ${source_escrow} doesn't match peer's announced @${declaredEscrow} — rejected`);
+          return;
+        }
+
+        // Re-validate rate: target's rates post must offer an invite option
+        // matching the currency the source claims to have charged, at or
+        // below the amount paid. Mirrors v0.16.6 paid-DM enforcement.
+        const tgtRates = await fetchRates(target);
+        const optRes   = await computePaymentOptions(tgtRates, from_user, 'invite', new Date());
+        if (optRes.blocked) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'blocked' });
+          console.log(`[federation] ← @${from_user} is blocked by @${target} — rejected`);
+          return;
+        }
+        if (optRes.feeRejected) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'fee_rejected' });
+          console.log(`[federation] ← @${target}'s platform fee below our minimum — rejected`);
+          return;
+        }
+        const matched = (optRes.options || []).find(o => o.currency === currency);
+        if (!matched) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: `currency ${currency} not accepted` });
+          console.log(`[federation] ← currency ${currency} not in @${target}'s invite options — rejected`);
+          return;
+        }
+        if (paid + 1e-9 < matched.flat) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: `underpaid: required ${matched.flat} ${currency}, paid ${paid}` });
+          console.log(`[federation] ← underpaid for @${target} — rejected`);
+          return;
+        }
+
+        // Re-verify the on-chain payment is from from_user to source_escrow
+        // for the claimed amount + currency + memo. This catches a malicious
+        // source server claiming a payment that didn't actually happen.
+        const ok = (currency !== 'HBD' && currency !== 'HIVE')
+          ? await verifyHiveEnginePayment(from_user, source_escrow, paid, currency, memo)
+          : await verifyHivePayment(from_user, source_escrow, paid, memo);
+        if (!ok) {
+          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'on-chain payment not found' });
+          console.log(`[federation] ← payment ${paid} ${currency} from @${from_user} → @${source_escrow} (memo ${memo}) not found on chain — rejected`);
+          return;
+        }
+        console.log(`[paid-invite][fed-recv] ✓ Validated paid invite ${invite_id} — @${from_user}@${ws._domain} paid ${paid} ${currency} to @${source_escrow} for @${target}`);
+      }
+
       pendingFederatedInvites[invite_id] = {
         dir:         'incoming',
         target_user: target,
@@ -4983,22 +5193,28 @@ async function fedHandleMessage(ws, raw) {
         from_server: ws._domain,
         room:        room_name,
         payload:     payload || {},
-        created_at:  Date.now()
+        created_at:  Date.now(),
+        paid_invite: !!payment
       };
+      // Deliver popup with paid badge if applicable so the invitee sees they're
+      // being paid (and that declining triggers a refund to the inviter).
       io.to(lu.socketId).emit('room-invite', {
-        roomName:    room_name,
-        from:        from_user,
-        invitees:    [from_user, target],
-        from_server: ws._domain,
-        invite_id
+        roomName:       room_name,
+        from:           from_user,
+        invitees:       [from_user, target],
+        from_server:    ws._domain,
+        invite_id,
+        paid_invite_id: payment ? invite_id : null,
+        paid_amount:    payment ? payment.paid : 0,
+        paid_currency:  payment ? payment.currency : null
       });
-      console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} #${room_name} (id ${invite_id})`);
+      console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} #${room_name} (id ${invite_id})${payment ? ` [paid ${payment.paid} ${payment.currency}]` : ''}`);
       break;
     }
 
     case 'room-response': {
       if (!ws._domain) return;
-      const { invite_id, response, reason } = msg;
+      const { invite_id, response, reason, detail } = msg;
       const entry = pendingFederatedInvites[invite_id];
       if (!entry || entry.dir !== 'outgoing') {
         console.warn(`[federation] ← room-response for unknown invite_id ${invite_id} from ${ws._domain}`);
@@ -5008,10 +5224,42 @@ async function fedHandleMessage(ws, raw) {
         console.warn(`[federation] ← room-response from ${ws._domain} but invite was for ${entry.target_server} — dropped`);
         return;
       }
+      const wasPaid = !!entry.paid_invite;
       delete pendingFederatedInvites[invite_id];
-      console.log(`[federation] ← room-response ${response} for #${entry.room} (@${entry.target_user}@${entry.target_server})${reason ? ' — ' + reason : ''}`);
+      console.log(`[federation] ← room-response ${response} for #${entry.room} (@${entry.target_user}@${entry.target_server})${reason ? ' — ' + reason : ''}${detail ? ' (' + detail + ')' : ''}`);
 
       const adminLu = lobbyUsers[entry.from_user];
+
+      // v0.16.11 — settle paid federated invite. On accept we disburse from
+      // our escrow (net to invitee via cross-chain transfer + fee to our
+      // operator). On decline (whether user-decline, offline auto-decline,
+      // or recipient-side paid_rejected) we refund the inviter.
+      if (wasPaid && pendingPaidInvites[invite_id]) {
+        if (response === 'accepted') {
+          disbursePaidInvite(invite_id);
+        } else {
+          // Roll back the canonical allowlist entry too — if recipient declined
+          // or rejected, the invitee shouldn't sit on the allowlist any more.
+          const r = rooms[entry.room];
+          if (r) {
+            const canonical = `${entry.target_user}@${entry.target_server}`;
+            r.allowlist.delete(canonical);
+            emitRoomInfoToMembers(r, entry.room);
+            broadcastRooms();
+          }
+          const refundReason = (reason === 'paid_rejected') ? 'rejected_by_peer'
+                             : (reason === 'offline')      ? 'offline'
+                             :                               'declined';
+          refundPaidInvite(invite_id, refundReason);
+          if (reason === 'paid_rejected' && adminLu) {
+            io.to(adminLu.socketId).emit('lobby-info', {
+              text: `⚠ ${entry.target_server} rejected your paid invite to @${entry.target_user}: ${detail || 'no detail'}. Refund in flight.`
+            });
+          }
+        }
+        break; // refund/disburse paths handle their own admin notifications
+      }
+
       if (response === 'accepted' && adminLu) {
         io.to(adminLu.socketId).emit('lobby-info', {
           text: `✓ @${entry.target_user}@${entry.target_server} accepted invite to #${entry.room}.`
@@ -5036,6 +5284,20 @@ setInterval(() => {
   for (const [id, entry] of Object.entries(pendingFederatedInvites)) {
     if (entry.created_at < cutoff) {
       console.log(`[federation] Pending invite ${id} (${entry.dir}) expired after ${Math.round((Date.now() - entry.created_at) / 60000)}m`);
+      // v0.16.11 — also trigger a paid-invite refund if this fed invite was
+      // paid. The 60s paid-invite sweep would catch it eventually, but doing
+      // it here keeps the two maps in lockstep and rolls back the allowlist
+      // entry that the source-side allowlist-add added at payment time.
+      if (entry.paid_invite && pendingPaidInvites[id] && pendingPaidInvites[id].status === 'pending') {
+        const r = rooms[entry.room];
+        if (r && entry.target_server) {
+          const canonical = `${entry.target_user}@${entry.target_server}`;
+          r.allowlist.delete(canonical);
+          emitRoomInfoToMembers(r, entry.room);
+          broadcastRooms();
+        }
+        refundPaidInvite(id, 'timed_out');
+      }
       delete pendingFederatedInvites[id];
     }
   }
@@ -5050,6 +5312,17 @@ setInterval(() => {
   for (const [id, entry] of Object.entries(pendingPaidInvites)) {
     if (entry.status === 'pending' && entry.created_at < cutoff) {
       console.log(`[paid-invite] ${id} timed out after ${Math.round((Date.now()-entry.created_at)/60000)}m — refunding @${entry.inviter}`);
+      // For federated entries, also roll back the canonical allowlist entry
+      // before refunding (mirrors the federated room-response decline path).
+      if (entry.federated && entry.invitee_server) {
+        const r = rooms[entry.room];
+        if (r) {
+          const canonical = `${entry.invitee}@${entry.invitee_server}`;
+          r.allowlist.delete(canonical);
+          emitRoomInfoToMembers(r, entry.room);
+          broadcastRooms();
+        }
+      }
       refundPaidInvite(id, 'timed_out');
     } else if (entry.status !== 'pending' && entry.created_at < (Date.now() - 30 * 60 * 1000)) {
       // Drop completed entries after 30m to keep the map tidy.
