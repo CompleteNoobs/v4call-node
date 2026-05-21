@@ -520,6 +520,18 @@ const federationPeers = {};
 const pendingFederatedInvites = {};
 const FED_INVITE_TTL_MS = 15 * 60 * 1000;
 
+// v0.16.10 — paid LOCAL room invites awaiting recipient accept/decline. When
+// an admin pays an invitee's room-invite fee, the funds sit in escrow under
+// this key; on decline / 15-min timeout / explicit cancel the inviter is
+// refunded the gross-paid amount. On accept, the recipient is paid net of
+// platform fee. Keyed by inviteId (random hex).
+//   { room, inviter, invitee, currency, paid, memo, msgId, status,
+//     created_at, type: 'create' | 'allowlist' }
+// status: 'pending' (sent, awaiting response) | 'accepted' | 'declined' |
+//         'timed_out' | 'cancelled'
+const pendingPaidInvites = {};
+const PAID_INVITE_TTL_MS = 15 * 60 * 1000;
+
 // ── Discovery state (populated by scanV4CallDirectory) ──────────────────────
 // domain → { post_author, post_permlink, post_created, parsed, verified,
 //            verify_reason, last_seen }
@@ -992,6 +1004,7 @@ function parseRates(body) {
 
 function parseRateBlock(body) {
   const r = {
+    invite:            0,
     text:              0,
     textSession:       0,
     voiceRing:         0, voiceConnect:    0, voiceRate:         0,
@@ -999,6 +1012,9 @@ function parseRateBlock(body) {
     videoRing:         0, videoConnect:    0, videoRate:         0,
     videoMinDepositMin: 10, videoMinDepositHbd: null
   };
+
+  const inviteM = body.match(/^INVITE:(.+)$/mi);
+  if (inviteM) r.invite = parseHbdOrFree(inviteM[1]);
 
   const textM = body.match(/^TEXT:(.+)$/mi);
   if (textM) r.text = parseHbdOrFree(textM[1]);
@@ -1099,6 +1115,16 @@ function buildCallRateResult(rateBlock, callType, escrow, platformFee) {
       type:        'text',
       flat:        rateBlock.text        || 0,
       textSession: rateBlock.textSession || 0,
+      escrow,
+      platformFee
+    };
+  }
+  if (callType === 'invite') {
+    // Room-invite rate — flat per-invite fee. Same shape as text so it threads
+    // through computePaymentOptions / isOptionBelowFloor unchanged.
+    return {
+      type:        'invite',
+      flat:        rateBlock.invite || 0,
       escrow,
       platformFee
     };
@@ -1257,7 +1283,7 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
 // treated as free by the resolver.
 function isOptionBelowFloor(opt) {
   if (!opt) return false;
-  if (opt.type === 'text') {
+  if (opt.type === 'text' || opt.type === 'invite') {
     return opt.flat > 0 && opt.flat < RATE_FLOOR;
   }
   // voice or video
@@ -1373,6 +1399,62 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   return { options, blocked: false, feeRejected: false, belowFloor };
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Paid-invite helpers (v0.16.10) ────────────────────────────────────────────
+// Mirrors the paid-DM pattern but on the 'invite' callType. Returns the picker
+// shape (an array of currency options the inviter qualifies for) or a reason
+// the invitee can't be invited at all (blocked / platform-fee rejected).
+// Free invite → options.length === 0 + no block/fee reject = "go ahead, free".
+// ─────────────────────────────────────────────────────────────────────────────
+async function getInviteOptions(inviteeUsername, inviterUsername) {
+  const rates = await fetchRates(inviteeUsername);
+  if (!rates) return { options: [], blocked: false, feeRejected: false, escrow: ESCROW_ACCOUNT };
+  const res = await computePaymentOptions(rates, inviterUsername, 'invite', new Date());
+  return { ...res, escrow: rates.escrow || ESCROW_ACCOUNT };
+}
+
+// Disburses an accepted paid invite: net to invitee, platform-fee to server.
+async function disbursePaidInvite(inviteId) {
+  const e = pendingPaidInvites[inviteId];
+  if (!e || e.status !== 'pending') return;
+  e.status = 'accepted';
+
+  const platformFee  = PLATFORM_FEE;
+  const platformCut  = parseFloat((e.paid * platformFee).toFixed(3));
+  const inviteeNet   = parseFloat((e.paid - platformCut).toFixed(3));
+
+  if (inviteeNet >= RATE_FLOOR) {
+    const payoutMemo = `v4call:invite-payout:${inviteId}`;
+    ledgerPayment(inviteId, 'invite_payout', ESCROW_ACCOUNT, e.invitee, inviteeNet, payoutMemo, 'pending', null, e.currency);
+    sendFromEscrow(e.invitee, inviteeNet, payoutMemo, e.currency, inviteId).then(r => {
+      if (r && r.success) {
+        ledgerPaymentUpdate(inviteId, 'invite_payout', 'sent', r.txId);
+        const lu = lobbyUsers[e.invitee];
+        if (lu) io.to(lu.socketId).emit('lobby-info', {
+          text: `💰 @${e.inviter} paid you ${inviteeNet.toFixed(3)} ${e.currency} for the invite to #${e.room}.`
+        });
+      } else {
+        console.error(`[paid-invite] Payout to @${e.invitee} failed: ${r && r.reason}`);
+        ledgerPaymentUpdate(inviteId, 'invite_payout', 'failed', null);
+      }
+    });
+  }
+
+  if (platformCut >= RATE_FLOOR) {
+    const feeMemo = `v4call:invite-fee:${inviteId}`;
+    ledgerPayment(inviteId, 'invite_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, e.currency);
+    sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, e.currency, inviteId).then(r => {
+      if (r && r.success) ledgerPaymentUpdate(inviteId, 'invite_fee', 'sent', r.txId);
+    });
+  }
+
+  const lu = lobbyUsers[e.inviter];
+  if (lu) io.to(lu.socketId).emit('lobby-info', {
+    text: `✓ @${e.invitee} accepted your invite to #${e.room}.`
+  });
+  console.log(`[paid-invite] ${inviteId} accepted — net ${inviteeNet} ${e.currency} → @${e.invitee}, fee ${platformCut} → @${SERVER_HIVE_ACCOUNT}`);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Payment tracking ──────────────────────────────────────────────────────────
@@ -3143,7 +3225,7 @@ io.on('connection', (socket) => {
 
   socket.on('room-check', (roomName, cb) => { cb({ available: !rooms[roomName] }); });
 
-  socket.on('room-create', ({ roomName, invitees = [], tokenGateSymbol = '', tokenGateAmount = 0, banlistVisibility = 'admin' }) => {
+  socket.on('room-create', async ({ roomName, invitees = [], tokenGateSymbol = '', tokenGateAmount = 0, banlistVisibility = 'admin' }) => {
     const creator = socket._username;
     if (!creator) return;
     if (rooms[roomName]) {
@@ -3186,7 +3268,28 @@ io.on('connection', (socket) => {
       // else: unresolvable, drop silently (matches existing behaviour for unknown locals).
     }
 
-    const allowlist = new Set([creator, ...resolved.map(r => r.canonical)]);
+    // v0.16.10 — gate LOCAL invitees on invite rate. Paid invitees are deferred:
+    // the room is created without them on the allowlist; the admin gets a notice
+    // listing who needs paying, and uses the allowlist panel (which has the
+    // payment flow) after entering the room. Free locals + federated invitees
+    // proceed as before. (Federated paid invites are a v0.16.11 follow-up.)
+    const deferred = []; // locals with a paid invite rate
+    const okLocals = []; // locals that can be invited free
+    for (const r of resolved) {
+      if (!r.local) continue;
+      const inv = await getInviteOptions(r.user, creator);
+      if (inv.blocked || inv.feeRejected) {
+        deferred.push({ user: r.user, reason: inv.message || 'cannot invite' });
+        continue;
+      }
+      if (inv.options.length === 0) okLocals.push(r);
+      else deferred.push({ user: r.user, reason: `paid invite (${inv.options.map(o => `${o.flat} ${o.currency}`).join(' or ')})` });
+    }
+    const fedResolved = resolved.filter(r => !r.local);
+    const finalLocalsCanonical = okLocals.map(r => r.canonical);
+    const fedCanonical         = fedResolved.map(r => r.canonical);
+
+    const allowlist = new Set([creator, ...finalLocalsCanonical, ...fedCanonical]);
     const sym = (tokenGateSymbol || '').trim().toUpperCase();
     const amt = parseFloat(tokenGateAmount) || 0;
     const tokenGate  = (sym && amt > 0) ? { symbol: sym, amount: amt } : null;
@@ -3203,13 +3306,17 @@ io.on('connection', (socket) => {
       createdAt:         new Date()
     };
 
-    const allInviteCanonical = [creator, ...resolved.map(r => r.canonical)];
-    for (const r of resolved) {
-      if (r.local) {
-        const lu = lobbyUsers[r.user];
-        if (lu) io.to(lu.socketId).emit('room-invite', { roomName, from: creator, invitees: allInviteCanonical });
-        continue;
-      }
+    // Surface deferred invitees back to the creator so they know what to do.
+    for (const d of deferred) {
+      socket.emit('lobby-info', { text: `ℹ @${d.user} requires ${d.reason} — invite them via #${roomName}'s allowlist panel after creating.` });
+    }
+
+    const allInviteCanonical = [creator, ...finalLocalsCanonical, ...fedCanonical];
+    for (const r of okLocals) {
+      const lu = lobbyUsers[r.user];
+      if (lu) io.to(lu.socketId).emit('room-invite', { roomName, from: creator, invitees: allInviteCanonical });
+    }
+    for (const r of fedResolved) {
       // Federated — fire room-invite over the federation socket. Same envelope
       // shape and pendingFederatedInvites bookkeeping as the allowlist-add path.
       const inviteId = crypto.randomBytes(12).toString('hex');
@@ -3235,8 +3342,8 @@ io.on('connection', (socket) => {
     }
 
     broadcastRooms();
-    socket.emit('room-created', { roomName, invitees: resolved.map(r => r.canonical) });
-    console.log(`@${creator} created #${roomName}${tokenGate ? ` [tokenGate: ${tokenGate.amount} ${tokenGate.symbol}]` : ''}${visibility === 'all' ? ' [banlist: public]' : ''}`);
+    socket.emit('room-created', { roomName, invitees: [...finalLocalsCanonical, ...fedCanonical] });
+    console.log(`@${creator} created #${roomName}${tokenGate ? ` [tokenGate: ${tokenGate.amount} ${tokenGate.symbol}]` : ''}${visibility === 'all' ? ' [banlist: public]' : ''}${deferred.length ? ` [deferred paid: ${deferred.map(d=>d.user).join(',')}]` : ''}`);
   });
 
   socket.on('request-join-token', ({ roomName }, cb) => {
@@ -3357,7 +3464,7 @@ io.on('connection', (socket) => {
 
   // ── ALLOWLIST MANAGEMENT ───────────────────────────────────────────────────
 
-  socket.on('allowlist-add', ({ room, username: targetUser }) => {
+  socket.on('allowlist-add', async ({ room, username: targetUser, payment }) => {
     const r = rooms[room];
     if (!r || r.creator !== socket._username) return;
 
@@ -3420,12 +3527,129 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // ── Local path (unchanged behaviour) ─────────────────────────────────────
-    r.allowlist.add(handle.user);
-    const lu = lobbyUsers[handle.user];
-    if (lu) io.to(lu.socketId).emit('room-invite', { roomName: room, from: socket._username, invitees: [...r.allowlist] });
+    // ── Local path ───────────────────────────────────────────────────────────
+    // v0.16.10 — invite-rate gate. If the invitee's rates post sets an invite
+    // fee, the inviter must pay it. Free invites work as before.
+    const inviter = socket._username;
+    const invitee = handle.user;
+
+    // Re-invite of someone already on the allowlist is a no-op (avoid charging
+    // twice for the same allowlist entry).
+    if (r.allowlist.has(invitee)) {
+      const lu = lobbyUsers[invitee];
+      if (lu) io.to(lu.socketId).emit('room-invite', { roomName: room, from: inviter, invitees: [...r.allowlist] });
+      emitRoomInfoToMembers(r, room);
+      broadcastRooms();
+      return;
+    }
+
+    const inv = await getInviteOptions(invitee, inviter);
+    if (inv.blocked) {
+      socket.emit('allowlist-error', { room, reason: inv.message || `@${invitee} has blocked you.` });
+      return;
+    }
+    if (inv.feeRejected) {
+      socket.emit('allowlist-error', { room, reason: inv.message || `@${invitee}'s platform fee is below this server's minimum.` });
+      return;
+    }
+
+    if (inv.options.length === 0) {
+      // Free invite (no invite rate set, or matches a free list/token).
+      r.allowlist.add(invitee);
+      const lu = lobbyUsers[invitee];
+      if (lu) io.to(lu.socketId).emit('room-invite', { roomName: room, from: inviter, invitees: [...r.allowlist] });
+      emitRoomInfoToMembers(r, room);
+      broadcastRooms();
+      return;
+    }
+
+    // Paid invite — guard against escrow mismatch. For a LOCAL invitee, their
+    // rates-post escrow must be the one this server controls; otherwise we
+    // could verify a payment to an escrow we can't disburse from (orphan funds).
+    if (inv.escrow !== ESCROW_ACCOUNT) {
+      socket.emit('allowlist-error', { room, reason: `@${invitee}'s rates post declares escrow @${inv.escrow}, but this server controls @${ESCROW_ACCOUNT}. Ask them to update their rates post (or switch home server) before charging invite fees.` });
+      return;
+    }
+
+    // Paid invite. If the client didn't include a payment, send the picker.
+    if (!payment || !payment.currency || !(payment.paid > 0) || !payment.memo || !payment.inviteId) {
+      const inviteId = crypto.randomBytes(12).toString('hex');
+      socket.emit('invite-payment-required', {
+        room,
+        invitee,
+        inviteId,
+        escrow: inv.escrow,
+        options: inv.options.map(o => ({
+          currency: o.currency,
+          flat:     o.flat,
+          balance:  o.balance ?? null,
+          listName: o.listName ?? null
+        })),
+        belowFloor: !!inv.belowFloor
+      });
+      return;
+    }
+
+    // Validate the payment matches one of the picker's offered options.
+    const opt = inv.options.find(o => o.currency === payment.currency);
+    if (!opt) {
+      socket.emit('allowlist-error', { room, reason: `Currency ${payment.currency} is not an accepted invite rate for @${invitee}.` });
+      return;
+    }
+    if (payment.paid + 1e-9 < opt.flat) {
+      socket.emit('allowlist-error', { room, reason: `Underpaid: invite rate is ${opt.flat} ${opt.currency}, you sent ${payment.paid}.` });
+      return;
+    }
+
+    // Memo must reference the inviteId the client got from invite-payment-required.
+    if (payment.memo !== `v4call:invite:${payment.inviteId}`) {
+      socket.emit('allowlist-error', { room, reason: 'Bad payment memo — must match the invite ID issued by the server.' });
+      return;
+    }
+
+    // Reject reuse of the same inviteId (one payment, one invite).
+    if (pendingPaidInvites[payment.inviteId]) {
+      socket.emit('allowlist-error', { room, reason: 'This invite has already been processed.' });
+      return;
+    }
+
+    // Verify on-chain. Funds went to OUR escrow (recipient is local on this server).
+    const cur = payment.currency;
+    const ok = (cur !== 'HBD' && cur !== 'HIVE')
+      ? await verifyHiveEnginePayment(inviter, ESCROW_ACCOUNT, payment.paid, cur, payment.memo)
+      : await verifyHivePayment(inviter, ESCROW_ACCOUNT, payment.paid, payment.memo);
+    if (!ok) {
+      socket.emit('allowlist-error', { room, reason: `Payment not found on blockchain. If ${cur} left your account, it can be recovered manually — note the memo: ${payment.memo}` });
+      return;
+    }
+
+    // Record + add to allowlist + emit invite (now carrying paidInviteId so the
+    // recipient's accept/decline can be tracked).
+    pendingPaidInvites[payment.inviteId] = {
+      room,
+      inviter,
+      invitee,
+      currency:   cur,
+      paid:       payment.paid,
+      memo:       payment.memo,
+      status:     'pending',
+      created_at: Date.now(),
+      type:       'allowlist'
+    };
+    ledgerPayment(payment.inviteId, 'invite', inviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', null, cur);
+
+    r.allowlist.add(invitee);
+    const lu = lobbyUsers[invitee];
+    if (lu) io.to(lu.socketId).emit('room-invite', {
+      roomName: room, from: inviter, invitees: [...r.allowlist],
+      paid_invite_id: payment.inviteId,
+      paid_amount:    payment.paid,
+      paid_currency:  cur
+    });
+    socket.emit('allowlist-info', { room, message: `📨 Paid invite (${payment.paid.toFixed(3)} ${cur}) sent to @${invitee}.` });
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
+    console.log(`[paid-invite] ${payment.inviteId} — @${inviter} paid ${payment.paid} ${cur} to invite @${invitee} → #${room}`);
   });
 
   // v0.16 / fed v0.4 — local user's accept/decline of a federated room invite.
@@ -3449,6 +3673,30 @@ io.on('connection', (socket) => {
     fedSend(peer.ws, { type: 'room-response', invite_id, response: finalResponse });
     delete pendingFederatedInvites[invite_id];
     console.log(`[federation] → room-response ${finalResponse} for invite_id ${invite_id} → ${entry.from_server}`);
+  });
+
+  // v0.16.10 — local paid-invite accept/decline. Only the actual invitee can
+  // resolve their own invite; on accept we disburse, on decline we refund.
+  // Same-server only — federated paid invites are a v0.16.11 follow-up.
+  socket.on('paid-invite-respond', ({ paid_invite_id, response }) => {
+    const e = pendingPaidInvites[paid_invite_id];
+    if (!e || e.status !== 'pending') return;
+    if (e.invitee !== socket._username) {
+      console.warn(`[paid-invite] @${socket._username} tried to respond to invite ${paid_invite_id} owned by @${e.invitee} — dropped`);
+      return;
+    }
+    if (response === 'accepted') {
+      disbursePaidInvite(paid_invite_id);
+    } else {
+      // Decline → refund the inviter the gross paid amount and remove the
+      // invitee from the room's allowlist (so they can't sneak in later off
+      // the same paid slot).
+      const r = rooms[e.room];
+      if (r) r.allowlist.delete(e.invitee);
+      refundPaidInvite(paid_invite_id, 'declined');
+      if (r) emitRoomInfoToMembers(r, e.room);
+      broadcastRooms();
+    }
   });
 
   socket.on('allowlist-remove', ({ room, username: targetUser }) => {
@@ -4786,6 +5034,48 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000).unref?.();
+
+// v0.16.10 — TTL sweep for paid LOCAL invites. Anything still in 'pending'
+// past PAID_INVITE_TTL_MS gets auto-refunded to the inviter and the entry
+// marked 'timed_out' (kept briefly so a late accept can detect "this was
+// already refunded").
+setInterval(() => {
+  const cutoff = Date.now() - PAID_INVITE_TTL_MS;
+  for (const [id, entry] of Object.entries(pendingPaidInvites)) {
+    if (entry.status === 'pending' && entry.created_at < cutoff) {
+      console.log(`[paid-invite] ${id} timed out after ${Math.round((Date.now()-entry.created_at)/60000)}m — refunding @${entry.inviter}`);
+      refundPaidInvite(id, 'timed_out');
+    } else if (entry.status !== 'pending' && entry.created_at < (Date.now() - 30 * 60 * 1000)) {
+      // Drop completed entries after 30m to keep the map tidy.
+      delete pendingPaidInvites[id];
+    }
+  }
+}, 60 * 1000).unref?.();
+
+// Refunds the inviter the gross amount they paid, marks the entry, and
+// notifies the inviter if they're online. Idempotent — re-entry is safe.
+async function refundPaidInvite(inviteId, newStatus) {
+  const e = pendingPaidInvites[inviteId];
+  if (!e || e.status !== 'pending') return;
+  e.status = newStatus; // mark first so concurrent accept/decline see it locked
+  const refundMemo = `v4call:invite-refund:${inviteId}`;
+  try {
+    const r = await sendFromEscrow(e.inviter, e.paid, refundMemo, e.currency, inviteId);
+    if (r && r.success) {
+      ledgerPayment(inviteId, 'invite_refund', ESCROW_ACCOUNT, e.inviter, e.paid, refundMemo, 'sent', r.txId || null, e.currency);
+      const lu = lobbyUsers[e.inviter];
+      if (lu) io.to(lu.socketId).emit('lobby-info', {
+        text: `↩️ Invite to @${e.invitee} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${e.paid.toFixed(3)} ${e.currency}.`
+      });
+      console.log(`[paid-invite] ↩ Refunded ${e.paid} ${e.currency} to @${e.inviter} for ${inviteId} (${newStatus})`);
+    } else {
+      console.error(`[paid-invite] ✗ Refund failed for ${inviteId}: ${r && r.reason}`);
+      ledgerPayment(inviteId, 'invite_refund', ESCROW_ACCOUNT, e.inviter, e.paid, refundMemo, 'failed', null, e.currency);
+    }
+  } catch (err) {
+    console.error(`[paid-invite] Refund error for ${inviteId}:`, err.message);
+  }
+}
 
 function fedAttachSocket(ws, label) {
   // fedHandleMessage is async (hello awaits verifyPeer). We chain handlers in
