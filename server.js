@@ -1411,7 +1411,13 @@ async function getInviteOptions(inviteeUsername, inviterUsername) {
   const rates = await fetchRates(inviteeUsername);
   if (!rates) return { options: [], blocked: false, feeRejected: false, escrow: ESCROW_ACCOUNT };
   const res = await computePaymentOptions(rates, inviterUsername, 'invite', new Date());
-  return { ...res, escrow: rates.escrow || ESCROW_ACCOUNT };
+  // computePaymentOptions returns ALL matching options (one per currency the
+  // inviter qualifies for) — including ones with flat=0. For voice/video the
+  // 0-rate option is meaningful (the picker still shows the currency); for
+  // invite it just means "free in this currency". Filter zero-rate options
+  // so options.length === 0 reliably means "free invite, no payment needed."
+  const paidOptions = (res.options || []).filter(o => o.flat >= RATE_FLOOR);
+  return { ...res, options: paidOptions, escrow: rates.escrow || ESCROW_ACCOUNT };
 }
 
 // Disburses an accepted paid invite: net to invitee, platform-fee to server.
