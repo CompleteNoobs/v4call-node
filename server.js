@@ -3312,10 +3312,10 @@ io.on('connection', (socket) => {
       createdAt:         new Date()
     };
 
-    // Surface deferred invitees back to the creator so they know what to do.
-    for (const d of deferred) {
-      socket.emit('lobby-info', { text: `ℹ @${d.user} requires ${d.reason} — invite them via #${roomName}'s allowlist panel after creating.` });
-    }
+    // Deferred paid invitees are surfaced via the room-created event below so
+    // the client can render a single prominent notice INSIDE the new room
+    // (lobby-info from before was too quiet — easy to miss when you've just
+    // entered the room). v0.16.12 — UX polish.
 
     const allInviteCanonical = [creator, ...finalLocalsCanonical, ...fedCanonical];
     for (const r of okLocals) {
@@ -3348,7 +3348,12 @@ io.on('connection', (socket) => {
     }
 
     broadcastRooms();
-    socket.emit('room-created', { roomName, invitees: [...finalLocalsCanonical, ...fedCanonical] });
+    socket.emit('room-created', {
+      roomName,
+      invitees: [...finalLocalsCanonical, ...fedCanonical],
+      deferred // v0.16.12 — each entry: { user, reason } so the client can
+               // render a clear "click to invite + pay" notice in the room.
+    });
     console.log(`@${creator} created #${roomName}${tokenGate ? ` [tokenGate: ${tokenGate.amount} ${tokenGate.symbol}]` : ''}${visibility === 'all' ? ' [banlist: public]' : ''}${deferred.length ? ` [deferred paid: ${deferred.map(d=>d.user).join(',')}]` : ''}`);
   });
 
