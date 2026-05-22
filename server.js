@@ -1456,8 +1456,9 @@ async function disbursePaidInvite(inviteId) {
   }
 
   const lu = lobbyUsers[e.inviter];
+  const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
   if (lu) io.to(lu.socketId).emit('lobby-info', {
-    text: `✓ @${e.invitee} accepted your invite to #${e.room}.`
+    text: `✓ ${inviteeLabel} accepted your invite to #${e.room}. Net ${inviteeNet.toFixed(3)} ${e.currency} sent.`
   });
   console.log(`[paid-invite] ${inviteId} accepted — net ${inviteeNet} ${e.currency} → @${e.invitee}, fee ${platformCut} → @${SERVER_HIVE_ACCOUNT}`);
 }
@@ -3277,23 +3278,45 @@ io.on('connection', (socket) => {
     // v0.16.10 — gate LOCAL invitees on invite rate. Paid invitees are deferred:
     // the room is created without them on the allowlist; the admin gets a notice
     // listing who needs paying, and uses the allowlist panel (which has the
-    // payment flow) after entering the room. Free locals + federated invitees
-    // proceed as before. (Federated paid invites are a v0.16.11 follow-up.)
-    const deferred = []; // locals with a paid invite rate
-    const okLocals = []; // locals that can be invited free
+    // payment flow) after entering the room.
+    // v0.16.13 — same gate now applies to FEDERATED invitees (closes the bypass
+    // where ticking @user@peer.com in the lobby user-picker and clicking Create
+    // Room would send a free room-invite to the peer regardless of the user's
+    // invite rate). Federated paid invitees are deferred the same way locals
+    // are; admin uses the allowlist panel afterwards which routes through the
+    // federated paid-invite flow (modal → Keychain → recipient validates).
+    const deferred  = []; // invitees with a paid invite rate (or blocked / fee-rejected)
+    const okLocals  = []; // locals that can be invited free
+    const okFededs  = []; // federated invitees that can be invited free
     for (const r of resolved) {
-      if (!r.local) continue;
       const inv = await getInviteOptions(r.user, creator);
+      // The deferral "user" label includes the server suffix for federated so
+      // the admin's in-room notice + allowlist pre-fill route through the
+      // canonical @user@server form.
+      const dispUser = r.local ? r.user : `${r.user}@${r.server}`;
       if (inv.blocked || inv.feeRejected) {
-        deferred.push({ user: r.user, reason: inv.message || 'cannot invite' });
+        deferred.push({ user: dispUser, reason: inv.message || 'cannot invite' });
         continue;
       }
-      if (inv.options.length === 0) okLocals.push(r);
-      else deferred.push({ user: r.user, reason: `paid invite (${inv.options.map(o => `${o.flat} ${o.currency}`).join(' or ')})` });
+      if (inv.options.length === 0) {
+        if (r.local) okLocals.push(r);
+        else         okFededs.push(r);
+        continue;
+      }
+      // Paid — escrow-mismatch sanity check for federated (same guard as
+      // allowlist-add fed path); if it fails the admin can't pay them via
+      // allowlist either, so it's a hard reject (not deferred).
+      if (!r.local) {
+        const peerEscrow = r.peer && r.peer.escrow;
+        if (peerEscrow && inv.escrow !== peerEscrow) {
+          deferred.push({ user: dispUser, reason: `escrow mismatch — rates declare @${inv.escrow}, peer controls @${peerEscrow}` });
+          continue;
+        }
+      }
+      deferred.push({ user: dispUser, reason: `paid invite (${inv.options.map(o => `${o.flat} ${o.currency}`).join(' or ')})` });
     }
-    const fedResolved = resolved.filter(r => !r.local);
     const finalLocalsCanonical = okLocals.map(r => r.canonical);
-    const fedCanonical         = fedResolved.map(r => r.canonical);
+    const fedCanonical         = okFededs.map(r => r.canonical);
 
     const allowlist = new Set([creator, ...finalLocalsCanonical, ...fedCanonical]);
     const sym = (tokenGateSymbol || '').trim().toUpperCase();
@@ -3322,9 +3345,11 @@ io.on('connection', (socket) => {
       const lu = lobbyUsers[r.user];
       if (lu) io.to(lu.socketId).emit('room-invite', { roomName, from: creator, invitees: allInviteCanonical });
     }
-    for (const r of fedResolved) {
+    for (const r of okFededs) {
       // Federated — fire room-invite over the federation socket. Same envelope
       // shape and pendingFederatedInvites bookkeeping as the allowlist-add path.
+      // v0.16.13 — only reached for FREE federated invitees; paid ones are in
+      // the `deferred` list and have to be invited via the allowlist panel.
       const inviteId = crypto.randomBytes(12).toString('hex');
       pendingFederatedInvites[inviteId] = {
         dir:           'outgoing',
@@ -5348,8 +5373,9 @@ async function refundPaidInvite(inviteId, newStatus) {
     if (r && r.success) {
       ledgerPayment(inviteId, 'invite_refund', ESCROW_ACCOUNT, e.inviter, e.paid, refundMemo, 'sent', r.txId || null, e.currency);
       const lu = lobbyUsers[e.inviter];
+      const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
       if (lu) io.to(lu.socketId).emit('lobby-info', {
-        text: `↩️ Invite to @${e.invitee} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${e.paid.toFixed(3)} ${e.currency}.`
+        text: `↩️ Invite to ${inviteeLabel} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${e.paid.toFixed(3)} ${e.currency}.`
       });
       console.log(`[paid-invite] ↩ Refunded ${e.paid} ${e.currency} to @${e.inviter} for ${inviteId} (${newStatus})`);
     } else {
