@@ -670,6 +670,15 @@ function recordNostrPresence({ domain, users, pubkey, eventId, ts }) {
 // For each domain we have Nostr presence for, return ONLY the users that the
 // WS federation hasn't already reported for that same domain. Result: if WS
 // is healthy, this is empty. If WS is lagging or down, Nostr fills the gap.
+//
+// v0.16.15 — visibility tracks approval. ONLY surface presence from domains
+// the operator has approved. A verified-but-unapproved peer can sit in
+// discoveredPeers (and on /admin-peers.html waiting for review) without
+// polluting the lobby. This closes the social-engineering / lobby-spam
+// surface a bad actor with a real Hive account could otherwise have used.
+// The recordNostrPresence write side STAYS unchanged so the moment you
+// approve a previously-rejected peer, their users appear on the next
+// broadcastLobby (no need to wait for a heartbeat).
 function nostrAdditivePresenceSnapshot() {
   if (!FED_PRESENCE_VIA_NOSTR) return [];
   // What WS-federation users do we already have, grouped by domain?
@@ -682,6 +691,8 @@ function nostrAdditivePresenceSnapshot() {
   }
   const out = [];
   for (const [domain, entry] of Object.entries(nostrCrossFedPresence)) {
+    // v0.16.15 — approval is the single switch for cross-server visibility.
+    if (!approvedPeers.has(domain)) continue;
     const wsSet = wsByDomain[domain] || new Set();
     for (const username of entry.users) {
       if (wsSet.has(username)) continue;        // WS already reports them
@@ -5785,9 +5796,17 @@ function fedConnectPeer(url) {
   open();
 }
 
+// v0.16.15 — persisted approvals always load, regardless of whether .env
+// has seed peers. Without this, commenting out FEDERATION_PEERS in .env
+// silently dropped every previously-approved peer from in-memory state on
+// next boot (the JSON file was untouched but never read). Now: disk wins,
+// matching the data/ bind-mount pattern everywhere else in the codebase.
+// The .env seeding inside loadApprovedPeers is a no-op when FEDERATION_PEERS
+// is empty, so this is safe to run unconditionally.
+loadApprovedPeers();
+console.log(`[federation] Approved peers: ${[...approvedPeers].join(', ') || '(none)'}`);
+
 if (FEDERATION_ENABLED) {
-  loadApprovedPeers();
-  console.log(`[federation] Approved peers: ${[...approvedPeers].join(', ') || '(none)'}`);
   for (const url of FEDERATION_PEERS) fedConnectPeer(url);
   // Kick off discovery shortly after startup (non-blocking), then every 2 hours.
   // Gated by HIVE_SCAN_ENABLED so FED_DISCOVERY_MODE=nostr + NOSTR_HIVE_FALLBACK=false
