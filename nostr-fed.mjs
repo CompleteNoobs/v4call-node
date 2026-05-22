@@ -208,6 +208,141 @@ function startSubscribe(pool, cfg, ownPkHex) {
   }, 30 * 60 * 1000).unref();
 }
 
+// ── Phase D: presence publish + subscribe ──────────────────────────────────
+// Returns { notePresenceChange } — call notePresenceChange whenever local
+// users join/leave; we'll publish a throttled snapshot. Heartbeat republishes
+// every cfg.presenceHeartbeatMs regardless, so a relay drop self-heals.
+//
+// Event shape (NIP-78 replaceable, d-tag = `<domain>:users` so it doesn't
+// collide with the discovery event's d=<domain>):
+//   { kind:30078, tags:[["d",`${domain}:users`],["t","v4call-presence"]],
+//     content: {"domain":"<domain>","users":[...], "updated_at":"..."} }
+//
+// Trust gate is NOT in this module — server.js's onPresence runs the
+// Hive-anchored binding check before anything lands in cross-fed state.
+function startPresence(pool, cfg, skBytes, ownPkHex) {
+  const throttleMs  = Math.max(1000, cfg.presenceThrottleMs);
+  const heartbeatMs = Math.max(throttleMs, cfg.presenceHeartbeatMs);
+
+  let lastPublishAt   = 0;
+  let pendingTimer    = null;
+  let lastSentJoined  = '';
+
+  const buildPresenceEvent = (users) => {
+    const unsigned = {
+      kind: 30078,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ['d', `${cfg.domain}:users`],
+        ['t', 'v4call-presence'],
+        ['protocol', cfg.protocol],
+      ],
+      content: JSON.stringify({
+        domain:     cfg.domain,
+        users,                                   // already sorted by server.js
+        updated_at: new Date().toISOString(),
+      }),
+    };
+    return finalizeEvent(unsigned, skBytes);
+  };
+
+  const doPublish = async (reason) => {
+    try {
+      const users = (cfg.getLocalUsers() || []).map(u => String(u).toLowerCase()).sort();
+      const joined = users.join(',');
+      // If nothing changed AND this isn't a heartbeat, skip. Heartbeat always
+      // publishes (covers relay drops + lets peers prove we're alive).
+      if (reason !== 'heartbeat' && joined === lastSentJoined) return;
+      lastSentJoined = joined;
+      lastPublishAt  = Date.now();
+      const ev = buildPresenceEvent(users);
+      LOG(`presence publish (${reason}): ${users.length} local user(s) for ${cfg.domain} — event ${ev.id.slice(0, 12)}…`);
+      await publishOnce(pool, cfg.relays, ev);
+    } catch (e) {
+      ERR(`presence publish failed (non-fatal): ${e.message}`);
+    }
+  };
+
+  // Initial publish so peers know we're alive (even if user list is empty).
+  doPublish('boot');
+
+  // Heartbeat — always republish at this cadence regardless of change.
+  setInterval(() => doPublish('heartbeat'), heartbeatMs).unref();
+
+  // Throttle: on a change, publish immediately if we're past the window,
+  // else schedule a single delayed publish at window-end. Coalesces bursts.
+  const notePresenceChange = () => {
+    const sinceLast = Date.now() - lastPublishAt;
+    if (sinceLast >= throttleMs) {
+      doPublish('change');
+    } else if (!pendingTimer) {
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        doPublish('change-delayed');
+      }, throttleMs - sinceLast);
+      pendingTimer.unref?.();
+    }
+    // If a timer is already pending, additional changes just ride along.
+  };
+
+  // Subscribe — listen for OTHER servers' presence snapshots.
+  // Filter intentionally narrow (only the presence tag) so server-discovery
+  // events from the same kind don't get processed twice.
+  const filter = { kinds: [30078], '#t': ['v4call-presence'] };
+  const seenIds = new Set();
+  let resubCount = 0;
+
+  const onevent = (ev) => {
+    try {
+      if (seenIds.has(ev.id)) return;
+      seenIds.add(ev.id);
+      if (ev.pubkey === ownPkHex) return;             // never our own
+      // Extract domain from `d` tag (`<domain>:users` → strip suffix).
+      const dTag = ev.tags.find(t => t[0] === 'd');
+      const dVal = dTag && dTag[1] ? String(dTag[1]).toLowerCase() : '';
+      const m    = /^(.+):users$/.exec(dVal);
+      if (!m) return;                                 // not a presence d-tag shape
+      const domainFromTag = m[1];
+      if (cfg.ownDomain && domainFromTag === String(cfg.ownDomain).toLowerCase()) return;
+
+      let content = null;
+      try { content = JSON.parse(ev.content); } catch { return; }
+      if (!content || typeof content !== 'object') return;
+      const domainInBody = String(content.domain || '').toLowerCase();
+      // Cross-check d-tag vs body — drop on mismatch (cheap forgery signal).
+      if (domainInBody !== domainFromTag) return;
+      const users = Array.isArray(content.users) ? content.users : [];
+
+      // Hand to server.js for the real Hive-anchored trust check.
+      Promise.resolve(cfg.onPresence({
+        domain:  domainFromTag,
+        users,
+        pubkey:  ev.pubkey,
+        eventId: ev.id,
+        ts:      ev.created_at,
+      })).catch(e => ERR(`onPresence threw (non-fatal): ${e.message}`));
+    } catch (e) {
+      ERR(`presence onevent error (non-fatal): ${e.message}`);
+    }
+  };
+
+  const openSub = () => {
+    resubCount++;
+    LOG(`presence subscribe: opening (#${resubCount}) on ${cfg.relays.length} relay(s)`);
+    return pool.subscribeMany(cfg.relays, filter, {
+      onevent,
+      oneose: () => LOG(`presence subscribe: relay(s) sent backlog — now live`),
+    });
+  };
+  let sub = openSub();
+  setInterval(() => {
+    try { sub.close(); } catch { /* */ }
+    sub = openSub();
+  }, 30 * 60 * 1000).unref();
+
+  return { notePresenceChange };
+}
+
 // ── Public entry point — called once from server.js at startup ─────────────
 export async function startNostrFed(cfg) {
   try {
@@ -260,6 +395,26 @@ export async function startNostrFed(cfg) {
     } else if (cfg.subscribeEnabled) {
       LOG(`subscribe requested but no onDiscover callback wired — skipping`);
     }
+
+    // ── Phase D: presence (publish + subscribe) ─────────────────────────────
+    // Publish: a throttled + heartbeat'd snapshot of our LOCAL online users.
+    // Subscribe: receive other servers' snapshots; hand to cfg.onPresence
+    // which is server.js's recordNostrPresence (the real trust gate). Same
+    // "dumb transport, server.js owns trust" rule as Phase C.
+    let notePresenceChange = () => {};
+    if (cfg.presenceEnabled && typeof cfg.getLocalUsers === 'function' &&
+        typeof cfg.onPresence === 'function') {
+      const ctl = startPresence(pool, cfg, skBytes, pkHex);
+      notePresenceChange = ctl.notePresenceChange;
+      LOG(`presence enabled — throttle ${cfg.presenceThrottleMs/1000}s, heartbeat ${cfg.presenceHeartbeatMs/1000}s`);
+    } else if (cfg.presenceEnabled) {
+      LOG(`presence requested but missing getLocalUsers/onPresence — skipping`);
+    }
+
+    // Return a controller so server.js can drive event-triggered publishes.
+    // notePresenceChange is a no-op when presence is off, so callers don't
+    // need to gate.
+    return { notePresenceChange };
   } catch (e) {
     // Absolute backstop: Nostr must NEVER take down v4call.
     ERR(`startup failed (v4call continues normally on Hive-only): ${e.message}`);

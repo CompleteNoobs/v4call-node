@@ -107,6 +107,15 @@ const NOSTR_HIVE_FALLBACK  = (process.env.NOSTR_HIVE_FALLBACK || 'true').toLower
 const HIVE_SCAN_ENABLED    = !(FED_DISCOVERY_MODE === 'nostr' && !NOSTR_HIVE_FALLBACK);
 // Nostr subscribe runs when discovery mode includes Nostr.
 const NOSTR_SUBSCRIBE_ENABLED = (FED_DISCOVERY_MODE === 'nostr' || FED_DISCOVERY_MODE === 'both');
+// ── Phase D — cross-server presence via Nostr (WS-wins-Nostr-additive) ─────
+// Master gate. Default off until proven; flip to true to opt in per server.
+const FED_PRESENCE_VIA_NOSTR        = (process.env.FED_PRESENCE_VIA_NOSTR || 'false').toLowerCase() === 'true';
+// At most one publish per N seconds (joins/leaves coalesce inside the window).
+const NOSTR_PRESENCE_THROTTLE_SECONDS  = parseInt(process.env.NOSTR_PRESENCE_THROTTLE_SECONDS  || '30');
+// Republish every N seconds even if nothing changed (covers relay drops).
+const NOSTR_PRESENCE_HEARTBEAT_SECONDS = parseInt(process.env.NOSTR_PRESENCE_HEARTBEAT_SECONDS || '60');
+// Drop a peer's Nostr presence if we haven't heard from it for N seconds.
+const NOSTR_PRESENCE_TTL_SECONDS       = parseInt(process.env.NOSTR_PRESENCE_TTL_SECONDS       || '300');
 
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
@@ -582,9 +591,146 @@ function lobbySnapshot() {
   const local = Object.entries(lobbyUsers)
     .filter(([, u]) => !u.invisible)
     .map(([username, u]) => ({ username, socketId: u.socketId, pubKey: u.pubKey, server: SERVER_DOMAIN }));
-  return [...local, ...federatedUserSnapshot()];
+  return [...local, ...federatedUserSnapshot(), ...nostrAdditivePresenceSnapshot()];
 }
-function broadcastLobby() { io.emit('lobby-users', lobbySnapshot()); }
+function broadcastLobby() {
+  io.emit('lobby-users', lobbySnapshot());
+  // Phase D: local presence may have changed → tell nostr-fed to publish
+  // (throttled + heartbeat-protected inside the module). No-op if Phase D
+  // is gated off or the module hasn't loaded yet.
+  try { nostrFedController?.notePresenceChange(); } catch { /* never crash on a Nostr hiccup */ }
+}
+
+// ── Phase D — cross-server presence via Nostr (WS-wins-Nostr-additive) ─────
+// Map of domain → { users:Set<string>, lastTs:number(unix s), lastEventId,
+// pubkey, updatedAt:ms }. Only domains we've Phase-C-discovered + verified
+// land here, and only events from the expected (Hive-anchored when possible)
+// pubkey are accepted. Stale entries time out via the TTL sweep.
+const nostrCrossFedPresence = {};
+let nostrFedController = null;  // populated after dynamic import; see startup block
+
+// Trust gate — what pubkey is THIS domain allowed to sign presence events with?
+// Prefer the Hive-signature-anchored binding from verifyPeer's Option B
+// canonical (`verified_nostr_hex`). Fall back to the Phase C "poke" binding
+// (`nostr_pubkey` recorded when a Nostr discovery event arrived). If neither
+// exists, we have no acceptable binding → reject.
+function expectedNostrHexForDomain(domain) {
+  const p = discoveredPeers[domain];
+  if (!p || !p.verified) return null;
+  return (p.verified_nostr_hex || p.nostr_pubkey || null);
+}
+
+// Called when a verified-shape v4call-presence event arrives. Trust gate is
+// already strict in the module (own-pubkey skip, content/d-tag domain match);
+// here we make the FINAL trust decision against the Hive-anchored binding.
+function recordNostrPresence({ domain, users, pubkey, eventId, ts }) {
+  try {
+    if (!FED_PRESENCE_VIA_NOSTR) return;        // master gate
+    if (!domain || !pubkey) return;
+    domain = String(domain).toLowerCase();
+    if (domain === SERVER_DOMAIN.toLowerCase()) return;   // can't be us
+
+    const expected = expectedNostrHexForDomain(domain);
+    if (!expected) {
+      // Peer not Phase-C-verified yet (or no Nostr binding for it). Drop.
+      // We do NOT silently buffer — they'll publish again at heartbeat.
+      return;
+    }
+    if (expected !== pubkey) {
+      console.warn(`[presence] ✗ pubkey mismatch from relay for @${domain}: expected ${expected.slice(0,12)}…, got ${pubkey.slice(0,12)}… — dropped`);
+      return;
+    }
+
+    // Newer-wins per domain (relays can echo older events).
+    const cur = nostrCrossFedPresence[domain];
+    if (cur && ts <= cur.lastTs) return;
+
+    const userSet = new Set(
+      (Array.isArray(users) ? users : [])
+        .map(u => String(u || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    nostrCrossFedPresence[domain] = {
+      users:     userSet,
+      lastTs:    ts,
+      lastEventId: eventId,
+      pubkey,
+      updatedAt: Date.now(),
+    };
+    // Tell every connected client right away — the user list now has more
+    // people in it. broadcastLobby will call back into nostr-fed to publish
+    // our local change too; that's fine and throttle-protected.
+    io.emit('lobby-users', lobbySnapshot());
+  } catch (e) {
+    console.error('[presence] recordNostrPresence error (non-fatal):', e.message);
+  }
+}
+
+// Reconciliation — WS wins, Nostr is purely additive (never marks offline).
+// For each domain we have Nostr presence for, return ONLY the users that the
+// WS federation hasn't already reported for that same domain. Result: if WS
+// is healthy, this is empty. If WS is lagging or down, Nostr fills the gap.
+function nostrAdditivePresenceSnapshot() {
+  if (!FED_PRESENCE_VIA_NOSTR) return [];
+  // What WS-federation users do we already have, grouped by domain?
+  const wsByDomain = {};
+  for (const u of federatedUserSnapshot()) {
+    const d = String(u.server || '').toLowerCase();
+    if (!d) continue;
+    if (!wsByDomain[d]) wsByDomain[d] = new Set();
+    wsByDomain[d].add(String(u.username || '').toLowerCase());
+  }
+  const out = [];
+  for (const [domain, entry] of Object.entries(nostrCrossFedPresence)) {
+    const wsSet = wsByDomain[domain] || new Set();
+    for (const username of entry.users) {
+      if (wsSet.has(username)) continue;        // WS already reports them
+      // Cached pubKey for DM encryption (may be present from a prior call/DM).
+      const cachedPub = pubKeyCache && pubKeyCache[username];
+      out.push({
+        username,
+        socketId: null,                          // no live socket here yet
+        pubKey:   cachedPub || null,
+        server:   domain,
+        source:   'nostr',                       // hint; client treats same as fed
+      });
+    }
+  }
+  return out;
+}
+
+// Periodic sweep — drop any domain whose Nostr presence is older than the TTL.
+// Runs even with Phase D off (cheap empty-map walk) so flipping the gate at
+// runtime via `.env` + restart is clean.
+function sweepStaleNostrPresence() {
+  if (!FED_PRESENCE_VIA_NOSTR) return;
+  const cutoff = Date.now() - NOSTR_PRESENCE_TTL_SECONDS * 1000;
+  let dropped = 0;
+  for (const [domain, entry] of Object.entries(nostrCrossFedPresence)) {
+    if (entry.updatedAt < cutoff) {
+      delete nostrCrossFedPresence[domain];
+      dropped++;
+      console.log(`[presence] ⌛ dropped stale Nostr presence for @${domain} (no update in ${NOSTR_PRESENCE_TTL_SECONDS}s)`);
+    }
+  }
+  if (dropped) io.emit('lobby-users', lobbySnapshot());
+}
+setInterval(sweepStaleNostrPresence, 60 * 1000).unref();
+
+// Helper for nostr-fed.mjs's presence publish: snapshot of our LOCAL online
+// usernames only (NOT federated — peers will report their own). Sorted so
+// re-publishes produce stable bytes when nothing changed.
+function getLocalOnlineUsernamesForPresence() {
+  return Object.entries(lobbyUsers)
+    .filter(([, u]) => !u.invisible)
+    .map(([username]) => username.toLowerCase())
+    .sort();
+}
+
+// Cached pubKeys so Nostr-only-additive users can still be DMed if we've
+// ever seen their pubKey before (e.g. a prior call/DM). Populated by the
+// existing user-event handlers below.
+const pubKeyCache = {};
 
 // Look up which federation peer hosts a given username. Returns the peer
 // record (with ws) or null if no federated peer has that user.
@@ -5559,7 +5705,7 @@ if (FEDERATION_ENABLED) {
 // publishing when mode is 'hive'.
 {
   import('./nostr-fed.mjs').then(({ startNostrFed }) => {
-    startNostrFed({
+    return startNostrFed({
       domain:        SERVER_DOMAIN,
       hiveAccount:   SERVER_HIVE_ACCOUNT,
       verifyUrl:     `https://${SERVER_DOMAIN}/.well-known/v4call-server.json`,
@@ -5569,11 +5715,24 @@ if (FEDERATION_ENABLED) {
       republishHours: NOSTR_REPUBLISH_HOURS,
       nsecSeed:      NOSTR_NSEC,
       keyPath:       NOSTR_KEY_PATH,
-      // Phase C: subscribe + discovery
+      // Phase C — subscribe + discovery
       subscribeEnabled: NOSTR_SUBSCRIBE_ENABLED,
       onDiscover:    discoverPeerViaNostr,        // module calls us; we own the trust check
       ownDomain:     SERVER_DOMAIN,                // skip events from our own domain
+      // Phase D — presence (WS-wins-Nostr-additive)
+      presenceEnabled:  FED_PRESENCE_VIA_NOSTR && NOSTR_SUBSCRIBE_ENABLED,
+      presenceThrottleMs:  NOSTR_PRESENCE_THROTTLE_SECONDS  * 1000,
+      presenceHeartbeatMs: NOSTR_PRESENCE_HEARTBEAT_SECONDS * 1000,
+      getLocalUsers:    getLocalOnlineUsernamesForPresence,
+      onPresence:       recordNostrPresence,
     });
+  }).then(controller => {
+    // Module returns a controller on success (presence publish trigger etc.).
+    // Stored globally so broadcastLobby can call notePresenceChange().
+    if (controller) {
+      nostrFedController = controller;
+      if (FED_PRESENCE_VIA_NOSTR) console.log('[presence] Phase D enabled — Nostr presence is additive to WS federation');
+    }
   }).catch(e => console.error('[nostr] module load failed (v4call continues):', e.message));
 }
 
