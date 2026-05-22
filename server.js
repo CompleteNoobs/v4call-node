@@ -3720,8 +3720,17 @@ io.on('connection', (socket) => {
         }
       }
 
-      if (!isPaid) {
-        // Free federated invite — original behaviour.
+      // v0.16.14 — payment-provided wins over isPaid. The previous flow's
+      // `if (!isPaid) free; return;` short-circuited the picker even when the
+      // inviter HAD paid (e.g. via the fee_required cycle from the recipient,
+      // where source-side rates are cached-stale or just plain disagree).
+      // Now: if payment is provided, route through the paid path regardless;
+      // the recipient does the authoritative rate validation.
+      const hasFedPayment = !!(payment && payment.currency && payment.paid > 0 && payment.memo && payment.inviteId);
+
+      if (!isPaid && !hasFedPayment) {
+        // Free federated invite — original behaviour. Recipient will re-check
+        // (v0.16.14) and bounce with fee_required if their rates disagree.
         r.allowlist.add(canonical);
         const inviteId = crypto.randomBytes(12).toString('hex');
         pendingFederatedInvites[inviteId] = {
@@ -3748,8 +3757,11 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Paid federated invite — emit picker if no payment yet.
-      if (!payment || !payment.currency || !(payment.paid > 0) || !payment.memo || !payment.inviteId) {
+      // Paid federated invite — emit picker if no payment yet (only when
+      // source's own rates say it's paid; the fee_required cycle is handled
+      // by the source-side room-response handler which emits the picker
+      // directly using the recipient-provided options).
+      if (isPaid && !hasFedPayment) {
         const inviteId = crypto.randomBytes(12).toString('hex');
         socket.emit('invite-payment-required', {
           room,
@@ -3769,15 +3781,21 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Validate payment against picker offer.
-      const fedOpt = fedInv.options.find(o => o.currency === payment.currency);
-      if (!fedOpt) {
-        socket.emit('allowlist-error', { room, reason: `Currency ${payment.currency} is not an accepted invite rate for @${fedInvitee}.` });
-        return;
-      }
-      if (payment.paid + 1e-9 < fedOpt.flat) {
-        socket.emit('allowlist-error', { room, reason: `Underpaid: invite rate is ${fedOpt.flat} ${fedOpt.currency}, you sent ${payment.paid}.` });
-        return;
+      // Payment was provided. Validate against source's options when source
+      // also thinks it's paid (UX guard — catches obvious mistakes). When
+      // source thinks free but payment was provided (post-fee_required
+      // cycle), skip source-side rate validation — recipient is the
+      // authoritative gate and the on-chain verify below catches the rest.
+      if (isPaid) {
+        const fedOpt = fedInv.options.find(o => o.currency === payment.currency);
+        if (!fedOpt) {
+          socket.emit('allowlist-error', { room, reason: `Currency ${payment.currency} is not an accepted invite rate for @${fedInvitee}.` });
+          return;
+        }
+        if (payment.paid + 1e-9 < fedOpt.flat) {
+          socket.emit('allowlist-error', { room, reason: `Underpaid: invite rate is ${fedOpt.flat} ${fedOpt.currency}, you sent ${payment.paid}.` });
+          return;
+        }
       }
       if (payment.memo !== `v4call:invite:${payment.inviteId}`) {
         socket.emit('allowlist-error', { room, reason: 'Bad payment memo — must match the invite ID issued by the server.' });
@@ -5338,6 +5356,25 @@ async function fedHandleMessage(ws, raw) {
         return;
       }
 
+      // v0.16.14 — recipient-side fee gate (closes the paid-invite bypass
+      // class). Per design rule #15 the recipient is the only fully trusted
+      // enforcer of its user's policy. ALWAYS re-fetch the target's invite
+      // options here regardless of what the source claims — never trust the
+      // source to have charged correctly. Mirrors the v0.16.6 paid-DM
+      // hardening: ALL paid flows must do recipient-side enforcement.
+      const recipInv = await getInviteOptions(target, from_user);
+      if (recipInv.blocked) {
+        fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'blocked' });
+        console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} — recipient blocks inviter — rejected`);
+        return;
+      }
+      if (recipInv.feeRejected) {
+        fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'fee_rejected' });
+        console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} — recipient platform fee mismatch — rejected`);
+        return;
+      }
+      const recipientRequiresPayment = (recipInv.options || []).length > 0;
+
       // v0.16.11 — recipient-side paid-invite enforcement (design rule #15).
       // If the source server attached a payment, re-validate the offer
       // (rate match in OUR copy of target's rates) and re-verify the on-chain
@@ -5345,6 +5382,31 @@ async function fedHandleMessage(ws, raw) {
       // send back 'declined' with reason 'paid_rejected' so the source server
       // refunds the inviter from its own escrow.
       const payment = (payload && payload.payment) || null;
+
+      // v0.16.14 — the actual bypass close: target has a paid rate but the
+      // source server didn't include payment. Refuse the invite and tell the
+      // source what we charge (with our escrow as the destination) so it can
+      // pop the picker for the inviter and re-invite with payment. THIS is
+      // the line of code that closes the bypass surfaced by Phase D making
+      // cross-server invites a daily workflow.
+      if (recipientRequiresPayment && !payment) {
+        const required = recipInv.options.map(o => ({
+          currency: o.currency,
+          flat:     o.flat
+        }));
+        fedSend(ws, {
+          type:        'room-response',
+          invite_id,
+          response:    'declined',
+          reason:      'paid_rejected',
+          detail:      'fee_required',
+          required,                              // [{currency, flat}, ...]
+          recipient_escrow: ESCROW_ACCOUNT,      // informational; inviter still pays into its OWN escrow (inviter-holds-funds model)
+        });
+        console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} — fee_required (options: ${required.map(o=>`${o.flat} ${o.currency}`).join(' or ')}) — rejected`);
+        return;
+      }
+
       if (payment) {
         const { currency, paid, memo, source_escrow } = payment;
         if (!currency || !(paid > 0) || !memo || !source_escrow) {
@@ -5367,19 +5429,9 @@ async function fedHandleMessage(ws, raw) {
         // Re-validate rate: target's rates post must offer an invite option
         // matching the currency the source claims to have charged, at or
         // below the amount paid. Mirrors v0.16.6 paid-DM enforcement.
-        const tgtRates = await fetchRates(target);
-        const optRes   = await computePaymentOptions(tgtRates, from_user, 'invite', new Date());
-        if (optRes.blocked) {
-          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'blocked' });
-          console.log(`[federation] ← @${from_user} is blocked by @${target} — rejected`);
-          return;
-        }
-        if (optRes.feeRejected) {
-          fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'fee_rejected' });
-          console.log(`[federation] ← @${target}'s platform fee below our minimum — rejected`);
-          return;
-        }
-        const matched = (optRes.options || []).find(o => o.currency === currency);
+        // v0.16.14 — reuse recipInv (already fetched + computed above; same
+        // 5-min cache, so this is just a property read).
+        const matched = (recipInv.options || []).find(o => o.currency === currency);
         if (!matched) {
           fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: `currency ${currency} not accepted` });
           console.log(`[federation] ← currency ${currency} not in @${target}'s invite options — rejected`);
@@ -5477,6 +5529,62 @@ async function fedHandleMessage(ws, raw) {
           }
         }
         break; // refund/disburse paths handle their own admin notifications
+      }
+
+      // v0.16.14 — recipient told us we owe a fee for this user. Pop the
+      // payment picker on the inviter's client so they can pay and re-invite.
+      // Also roll back the optimistic allowlist entry we added at free-send
+      // time. The picker will trigger a new allowlist-add with payment fields,
+      // which the source-side handler now routes through the paid path even
+      // when source-side rates think the invitee is free (cache stale, etc.).
+      if (response === 'declined' && reason === 'paid_rejected' && detail === 'fee_required') {
+        const r = rooms[entry.room];
+        if (r) {
+          const canonical = `${entry.target_user}@${entry.target_server}`;
+          r.allowlist.delete(canonical);
+          emitRoomInfoToMembers(r, entry.room);
+          broadcastRooms();
+        }
+        if (adminLu) {
+          const required = Array.isArray(msg.required) ? msg.required : [];
+          if (required.length > 0) {
+            const newInviteId = crypto.randomBytes(12).toString('hex');
+            io.to(adminLu.socketId).emit('invite-payment-required', {
+              room:       entry.room,
+              invitee:    `${entry.target_user}@${entry.target_server}`,
+              inviteId:   newInviteId,
+              escrow:     ESCROW_ACCOUNT,         // inviter-holds-funds — they pay into OUR escrow
+              options:    required.map(o => ({ currency: o.currency, flat: o.flat, balance: null })),
+              belowFloor: false,
+              federated:  true,
+              peerServer: entry.target_server,
+              fromFeeRequired: true,              // hint for client UX text
+            });
+          } else {
+            io.to(adminLu.socketId).emit('lobby-info', {
+              text: `⚠ @${entry.target_user}@${entry.target_server} requires payment but the recipient server didn't send the rate options. Try again shortly.`
+            });
+          }
+        }
+        break;
+      }
+
+      // v0.16.14 — recipient says the inviter is on the target's block list.
+      // Surface clearly and roll back the optimistic allowlist add.
+      if (response === 'declined' && reason === 'paid_rejected' && detail === 'blocked') {
+        const r = rooms[entry.room];
+        if (r) {
+          const canonical = `${entry.target_user}@${entry.target_server}`;
+          r.allowlist.delete(canonical);
+          emitRoomInfoToMembers(r, entry.room);
+          broadcastRooms();
+        }
+        if (adminLu) {
+          io.to(adminLu.socketId).emit('lobby-info', {
+            text: `⚠ @${entry.target_user}@${entry.target_server} has blocked you — invite refused.`
+          });
+        }
+        break;
       }
 
       if (response === 'accepted' && adminLu) {
