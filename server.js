@@ -4353,12 +4353,39 @@ async function _lookupPostingPubKey(account) {
   return data.result[0].posting?.key_auths?.[0]?.[0] || null;
 }
 
+// Canonical signed payload — MUST match public/server-sign.html `buildPayload`
+// byte-for-byte, because we recompute it here to verify the Hive signature.
+//
+// "Option B" (nGate STATUS.md, 2026-05-13):
+//   • 9-field shape  → when the well-known file has NO Nostr fields populated.
+//   • 12-field shape → when ANY of nostr_npub / nostr_hex / nostr_relays is set,
+//     a 3-field Nostr trailer is appended: nostr_npub | nostr_hex | relays_csv.
+//   • The nostr_attestation block is NEVER included in the Hive canonical
+//     (the attestation is self-verifying via its own NIP-01 id + schnorr sig).
+//
+// If you change the order/shape here, you MUST change the matching block in
+// server-sign.html, OR every v4call server stops verifying every other
+// v4call server's well-known. Cross-checked by comparing the joined string
+// for the same input — keep them byte-identical.
+//
+// Backward compat: a file with no Nostr fields produces the 9-field shape
+// exactly as before, so peers signed pre-Nostr keep verifying without re-sign.
 function _verifyPayloadString(obj) {
-  return [
+  const base = [
     obj.claim, obj.domain, obj.hive_account,
     obj.escrow, obj.fee_account, obj.federation_ws,
     obj.issued, obj.expires || '', obj.nonce
-  ].join('|');
+  ];
+  const relays   = Array.isArray(obj.nostr_relays) ? obj.nostr_relays.filter(Boolean) : [];
+  const hasNostr = !!(obj.nostr_npub || obj.nostr_hex || relays.length);
+  if (hasNostr) {
+    base.push(
+      obj.nostr_npub || '',
+      obj.nostr_hex  || '',
+      relays.join(',')
+    );
+  }
+  return base.join('|');
 }
 
 async function verifyPeer(domain, claimedAccount) {
@@ -4413,6 +4440,11 @@ async function verifyPeer(domain, claimedAccount) {
     return fail(`signature parse error: ${e.message}`);
   }
 
+  // Hive-anchored Nostr binding (only meaningful when the file used the
+  // 12-field canonical and the signature just verified). nostr_hex here is
+  // now covered by the Hive posting-key signature, so a future Phase D
+  // presence handler can trust `event.pubkey === peer.verified_nostr_hex`
+  // as a Hive-rooted check (no Phase C "poke" indirection needed).
   const ok = {
     verified:      true,
     domain:        obj.domain,
@@ -4421,7 +4453,9 @@ async function verifyPeer(domain, claimedAccount) {
     fee_account:   obj.fee_account,
     federation_ws: obj.federation_ws,
     issued:        obj.issued,
-    expires:       obj.expires || null
+    expires:       obj.expires || null,
+    verified_nostr_hex: obj.nostr_hex || null,
+    verified_nostr_npub: obj.nostr_npub || null,
   };
   peerVerifyCache[domain] = { result: ok, cachedAt: Date.now() };
   return ok;
@@ -4512,6 +4546,11 @@ async function scanV4CallDirectory() {
       parsed,
       verified:      !!vr.verified,
       verify_reason: vr.verified ? null : (vr.reason || 'unknown'),
+      // Hive-anchored Nostr identity (only set when the verify file carries
+      // the 12-field canonical with Nostr trailer). Phase D presence rides
+      // on this without needing the Phase C "poke" indirection.
+      verified_nostr_hex:  vr.verified ? (vr.verified_nostr_hex || null)  : null,
+      verified_nostr_npub: vr.verified ? (vr.verified_nostr_npub || null) : null,
       last_seen:     now
     };
     if (vr.verified) verifiedCount++;
@@ -4588,6 +4627,10 @@ async function discoverPeerViaNostr({ domain, pubkey, eventId, content }) {
       parsed,
       verified:      !!vr.verified,
       verify_reason: vr.verified ? null : (vr.reason || 'unknown'),
+      // Hive-anchored Nostr identity (only set when the verified file carries
+      // the 12-field canonical). Phase D rides on this directly.
+      verified_nostr_hex:  vr.verified ? (vr.verified_nostr_hex || null)  : null,
+      verified_nostr_npub: vr.verified ? (vr.verified_nostr_npub || null) : null,
       last_seen:     now
     };
 
