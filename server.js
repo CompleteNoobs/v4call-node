@@ -247,12 +247,38 @@ chatDb.exec(`
     last_seen   TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- ipfs-gate v0.1 attachment envelopes. One row per emit. File bytes live on
+  -- ipfs-gate (not here); we store only the envelope so room-history can replay
+  -- attachment bubbles on rejoin. per_recipient is a JSON map { username: encKey }.
+  -- Kept even past expires_at so users see "someone sent X (now gone)" with a
+  -- ⚠ 404 chip when the client tries to fetch the expired pin.
+  CREATE TABLE IF NOT EXISTS room_attachments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_name         TEXT    NOT NULL,
+    sender            TEXT    NOT NULL,
+    sender_pubkey     TEXT    NOT NULL,
+    cid               TEXT    NOT NULL,
+    size_bytes        INTEGER NOT NULL,
+    envelope_sig      TEXT    NOT NULL,
+    env_created_at    TEXT    NOT NULL,
+    expires_at        TEXT,
+    gateway_hint      TEXT,
+    kind_hint         TEXT,
+    per_recipient     TEXT    NOT NULL,
+    original_filename TEXT,
+    original_mime     TEXT,
+    original_size     INTEGER,
+    stored_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_dm_owner      ON dm_messages(owner);
   CREATE INDEX IF NOT EXISTS idx_dm_from       ON dm_messages(from_user);
   CREATE INDEX IF NOT EXISTS idx_dm_to         ON dm_messages(to_user);
   CREATE INDEX IF NOT EXISTS idx_dm_created     ON dm_messages(created_at);
   CREATE INDEX IF NOT EXISTS idx_room_name     ON room_messages(room_name);
   CREATE INDEX IF NOT EXISTS idx_room_created  ON room_messages(created_at);
+  CREATE INDEX IF NOT EXISTS idx_room_att_room    ON room_attachments(room_name);
+  CREATE INDEX IF NOT EXISTS idx_room_att_stored  ON room_attachments(stored_at);
 `);
 
 // Migration: paid-DM badge needs the actual currency. Older rows back-default
@@ -373,8 +399,65 @@ function chatDeleteRoom(roomName) {
   try {
     const info = chatDb.prepare(`DELETE FROM room_messages WHERE room_name = ?`).run(roomName);
     if (info.changes > 0) console.log(`[chat] Deleted ${info.changes} messages for room #${roomName}`);
+    const aInfo = chatDb.prepare(`DELETE FROM room_attachments WHERE room_name = ?`).run(roomName);
+    if (aInfo.changes > 0) console.log(`[chat] Deleted ${aInfo.changes} attachment envelopes for room #${roomName}`);
   } catch(e) {
     console.error('[chat] Room delete failed:', e.message);
+  }
+}
+
+function chatStoreRoomAttachment(env) {
+  try {
+    chatDb.prepare(`
+      INSERT INTO room_attachments (
+        room_name, sender, sender_pubkey, cid, size_bytes, envelope_sig,
+        env_created_at, expires_at, gateway_hint, kind_hint, per_recipient,
+        original_filename, original_mime, original_size
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      env.room, env.sender, env.sender_pubkey || '', env.cid,
+      env.size_bytes | 0, env.envelope_sig, env.created_at || new Date().toISOString(),
+      env.expires_at || null, env.gateway_hint || null, env.kind_hint || null,
+      JSON.stringify(env.per_recipient || {}),
+      env.original_filename || null, env.original_mime || null,
+      env.original_size != null ? (env.original_size | 0) : null
+    );
+  } catch (e) {
+    console.error('[chat] Room attachment store failed:', e.message);
+  }
+}
+
+// History query: returns full envelopes for the room where the requesting user
+// is either the sender OR present in per_recipient. Bystander-by-default for
+// late joiners (they don't see attachments addressed to others sent before they
+// joined — same privacy posture as chatGetRoomHistory for encrypted DMs).
+function chatGetRoomAttachments(roomName, username) {
+  try {
+    const rows = chatDb.prepare(`
+      SELECT * FROM room_attachments
+      WHERE room_name = ? ORDER BY stored_at ASC
+    `).all(roomName);
+    const out = [];
+    for (const r of rows) {
+      let per_recipient = {};
+      try { per_recipient = JSON.parse(r.per_recipient || '{}'); } catch (_) {}
+      if (r.sender !== username && !(username in per_recipient)) continue;
+      out.push({
+        v: 1, type: 'room-attachment',
+        room: r.room_name, sender: r.sender, sender_pubkey: r.sender_pubkey,
+        cid: r.cid, size_bytes: r.size_bytes, envelope_sig: r.envelope_sig,
+        created_at: r.env_created_at, expires_at: r.expires_at,
+        gateway_hint: r.gateway_hint, kind_hint: r.kind_hint,
+        per_recipient,
+        original_filename: r.original_filename,
+        original_mime: r.original_mime,
+        original_size: r.original_size
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error('[chat] Room attachment history failed:', e.message);
+    return [];
   }
 }
 
@@ -3646,6 +3729,12 @@ io.on('connection', (socket) => {
     if (history.length > 0) {
       socket.emit('room-history', history);
     }
+    // Send attachment envelope history (sender + per_recipient match only —
+    // late joiners don't see attachments addressed to others sent pre-join).
+    const attHistory = chatGetRoomAttachments(room, username);
+    if (attHistory.length > 0) {
+      socket.emit('room-attachments-history', attHistory);
+    }
 
     socket.to(room).emit('user-joined', {
       socketId: socket.id, username, pubKey, joinedVia,
@@ -4377,6 +4466,10 @@ io.on('connection', (socket) => {
       // decrypt per_recipient[myUsername] if present; bystanders see a locked
       // bubble.
       io.to(room).emit('room-attachment', env);
+      // Persist for room-history replay on rejoin. Envelope kept past
+      // expires_at — the recipient's client gracefully surfaces ⚠ 404 when
+      // the underlying pin is gone.
+      chatStoreRoomAttachment(env);
     } catch (e) {
       console.error('[room-attachment] handler error:', e.message);
     }
