@@ -4353,6 +4353,35 @@ io.on('connection', (socket) => {
     chatStoreRoomMsg(room, from, to, ciphertext, signature, timestamp, broadcast);
   });
 
+  // ── Room attachments (ipfs-gate v0.1) ──────────────────────────────────────
+  // Envelope shape: { v, type:'room-attachment', room, cid, size_bytes, sender,
+  //   sender_pubkey, envelope_sig, created_at, expires_at, gateway_hint,
+  //   kind_hint, per_recipient: { hive_account: encrypted_key_b64 } }
+  // Server is router-only: file bytes never touch v4call. Sender is validated
+  // as a current room member; recipients are looked up against the room's
+  // current membership. Recipient clients verify envelope_sig themselves.
+  socket.on('room-attachment', (env) => {
+    try {
+      if (!env || typeof env !== 'object') return;
+      const room = env.room;
+      const from = env.sender;
+      if (!room || !from || !rooms[room]) return;
+      if (socket._username !== from) return;                    // sender spoof guard
+      if (!rooms[room].members.some(m => m.socketId === socket.id)) return;
+      if (typeof env.cid !== 'string' || !env.cid.length) return;
+      if (typeof env.envelope_sig !== 'string' || !env.envelope_sig.length) return;
+      if (!env.per_recipient || typeof env.per_recipient !== 'object') return;
+
+      // Broadcast envelope to all current room members (including sender for
+      // their own bubble render). Recipients verify the sig client-side and
+      // decrypt per_recipient[myUsername] if present; bystanders see a locked
+      // bubble.
+      io.to(room).emit('room-attachment', env);
+    } catch (e) {
+      console.error('[room-attachment] handler error:', e.message);
+    }
+  });
+
   // ── DISCONNECT ─────────────────────────────────────────────────────────────
 
   socket.on('disconnect', () => {
