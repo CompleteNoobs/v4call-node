@@ -4470,6 +4470,25 @@ io.on('connection', (socket) => {
       // expires_at — the recipient's client gracefully surfaces ⚠ 404 when
       // the underlying pin is gone.
       chatStoreRoomAttachment(env);
+      // v0.16.14 — Notify addressed recipients who aren't currently in the
+      // room socket (e.g. in lobby or another room). They'll see a dot on
+      // the room card / tab in their UI. Federated recipients (hosted on a
+      // peer server) are skipped here — cross-server attachment notify is
+      // a v0.3+ federation extension.
+      try {
+        const liveMembers = new Set((rooms[room].members || []).map(m => m.username));
+        for (const recip of Object.keys(env.per_recipient || {})) {
+          if (recip === from) continue;          // sender doesn't notify themselves
+          if (liveMembers.has(recip)) continue;  // already got the live event
+          const lu = lobbyUsers[recip];
+          if (!lu || !lu.socketId) continue;     // offline → catches up on next rejoin via history
+          io.to(lu.socketId).emit('attachment-notification', {
+            room, sender: from, cid: env.cid
+          });
+        }
+      } catch (e) {
+        console.warn('[room-attachment] notify pass failed:', e.message);
+      }
     } catch (e) {
       console.error('[room-attachment] handler error:', e.message);
     }
