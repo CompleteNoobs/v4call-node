@@ -598,6 +598,10 @@ function ledgerPaymentUpdate(callId, type, status, txId = null) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const lobbyUsers = {}; // username → { socketId, pubKey, invisible, inCall? }
+// v0.16.17 — debounce offline broadcasts for ≤5s to soak transient socket
+// drops (laptop sleep wake, wifi blip). Keyed by username; cleared on
+// lobby-join. See the disconnect handler for the firing semantics.
+const pendingOfflineTimers = {};
 const rooms      = {}; // roomName → { creator, allowlist(Set), banlist(Set), tokenGate:{symbol,amount}|null, banlistVisibility:'admin'|'all', paidInvitees:Map, members[], createdAt, isCall?, callId?, ... }
 
 // Federation state — populated by federation message handlers (see below).
@@ -2648,6 +2652,14 @@ io.on('connection', (socket) => {
     const prev          = lobbyUsers[username];
     lobbyUsers[username] = { socketId: socket.id, pubKey, invisible: prev ? prev.invisible : false };
 
+    // v0.16.17 — if a pending offline broadcast is scheduled for this user,
+    // cancel it: they came back within the grace window, so other users
+    // should never see the flap.
+    if (pendingOfflineTimers[username]) {
+      clearTimeout(pendingOfflineTimers[username]);
+      delete pendingOfflineTimers[username];
+    }
+
     socket.emit('lobby-users', lobbySnapshot());
     socket.emit('lobby-rooms', roomsSnapshot());
     socket.emit('lobby-config', {
@@ -2674,6 +2686,44 @@ io.on('connection', (socket) => {
     const missedCalls = getRefundableMissedCalls(username);
     if (missedCalls.length > 0) {
       socket.emit('missed-calls-summary', { calls: missedCalls });
+    }
+
+    // ── v0.16.17 — Pending paid-invite re-delivery ─────────────────────────
+    // If someone paid to invite this user while they were offline, the original
+    // `room-invite` socket emit never reached them. Without re-delivery, the
+    // user only finds out via the inviter's 15-min timeout-refund notice.
+    // Scan both local + federated pending paid invites for entries addressed
+    // to this user; re-emit room-invite with the same shape used at the
+    // original send sites (lines 4083, 5612, etc.).
+    try {
+      for (const [id, e] of Object.entries(pendingPaidInvites)) {
+        if (e.invitee !== username || e.status !== 'pending') continue;
+        const r = rooms[e.room];
+        const invitees = r ? [...r.allowlist] : [e.invitee, e.inviter];
+        socket.emit('room-invite', {
+          roomName: e.room, from: e.inviter, invitees,
+          paid_invite_id: id, paid_amount: e.paid, paid_currency: e.currency
+        });
+      }
+      for (const [id, e] of Object.entries(pendingFederatedInvites)) {
+        if (e.dir !== 'incoming' || !e.paid_invite || e.target_user !== username) continue;
+        // Federated paid invites store the payment inside e.payload.payment
+        // (see incoming `room-invite` envelope handler around server.js:5701).
+        // Mirror the same socket emit shape used at original delivery.
+        const pay = e.payload && e.payload.payment ? e.payload.payment : {};
+        socket.emit('room-invite', {
+          roomName:       e.room,
+          from:           e.from_user,
+          from_server:    e.from_server,
+          invitees:       [e.from_user, e.target_user],
+          invite_id:      id,
+          paid_invite_id: id,
+          paid_amount:    pay.paid || 0,
+          paid_currency:  pay.currency || null
+        });
+      }
+    } catch (e) {
+      console.warn('[lobby-join] paid-invite re-delivery error:', e.message);
     }
 
     // ── DM previews (last N per conversation) ──────────────────────────────
@@ -3703,9 +3753,21 @@ io.on('connection', (socket) => {
     // displace a federated @user@peer.com.
     const memberKey = m => (m.homeServer ? `${m.username}@${m.homeServer}` : m.username);
     const staleBefore = r.members.length;
+    // v0.16.17 — collect stale socketIds before filtering so we can notify them
+    // they were displaced (popout into a new tab leaves the first tab's UI
+    // thinking it's still in the room — server has already dropped its
+    // membership). The `displaced` event lets that tab reset to lobby cleanly.
+    const staleMembers = r.members.filter(u => memberKey(u) === canonicalUser);
     r.members = r.members.filter(u => memberKey(u) !== canonicalUser);
     if (r.members.length !== staleBefore) {
       console.log(`[join] dropped ${staleBefore - r.members.length} stale member entry/entries for ${canonicalUser} in #${room}`);
+      for (const stale of staleMembers) {
+        if (stale.socketId === socket.id) continue;  // don't notify self (this socket is the new arrival)
+        io.to(stale.socketId).emit('displaced', {
+          room,
+          reason: 'You joined this room from another tab or device.'
+        });
+      }
     }
     r.members.push({ socketId: socket.id, username, pubKey, joinedVia, homeServer: isFed ? fedHome : null });
     if (!isFed && lobbyUsers[username]) lobbyUsers[username].inRoom = room;
@@ -4209,6 +4271,47 @@ io.on('connection', (socket) => {
     r.members = [];
     delete rooms[room];
     chatDeleteRoom(room);
+
+    // v0.16.17 — cancel any pending invites for this room. Without this, an
+    // invitee who hadn't responded yet could accept a stale invite afterwards
+    // (creating a fresh room as new admin), and paid invites would sit in
+    // escrow until the 15-min TTL sweep refunded them.
+    try {
+      // Local paid invites — immediate refund + invitee popup close.
+      for (const [id, e] of Object.entries(pendingPaidInvites)) {
+        if (e.room !== room || e.status !== 'pending') continue;
+        const inviteeSid = lobbyUsers[e.invitee]?.socketId;
+        if (inviteeSid) io.to(inviteeSid).emit('invite-cancelled', { room, reason: 'room_ended' });
+        if (typeof refundPaidInvite === 'function') {
+          refundPaidInvite(id, 'room_ended');
+        } else {
+          delete pendingPaidInvites[id];
+        }
+      }
+      // Federated invites (may or may not be paid). Tell invitee server to
+      // clean up + refund-if-paid; close invitee popup if they're local on us.
+      for (const [id, e] of Object.entries(pendingFederatedInvites)) {
+        if (e.room !== room) continue;
+        const inviteeSid = e.target_user ? lobbyUsers[e.target_user]?.socketId : null;
+        if (inviteeSid) io.to(inviteeSid).emit('invite-cancelled', { room, reason: 'room_ended' });
+        if (e.target_server) {
+          const peer = federationPeers[e.target_server];
+          if (peer?.connected) {
+            try {
+              fedSend(peer.ws, {
+                type: 'room-response',
+                invite_id: id, response: 'declined', reason: 'room_ended',
+                source_server: SERVER_DOMAIN
+              });
+            } catch (_) { /* peer drop → their own TTL sweep handles cleanup */ }
+          }
+        }
+        delete pendingFederatedInvites[id];
+      }
+    } catch (e) {
+      console.warn('[room-end-all] pending-invite cleanup error:', e.message);
+    }
+
     broadcastRooms();
     console.log(`Room #${room} ended-for-all by admin @${socket._username}`);
   });
@@ -4535,11 +4638,28 @@ io.on('connection', (socket) => {
       broadcastRooms();
     }
 
-    if (username && lobbyUsers[username]) {
-      delete lobbyUsers[username];
-      broadcastLobby();
-      broadcastRooms();
-      if (FEDERATION_ENABLED) fedAnnounceUserOffline(username);
+    // v0.16.17 — Reconnect grace: defer the user-offline broadcast by 5s in
+    // case this is a transient drop (laptop sleep, wifi blip, hot Socket.io
+    // reconnect). Without this, every drop generated a flap in the lobby user
+    // list + active-rooms count visible to everyone else. If the user
+    // reconnects within the window, lobby-join cancels the timer and nobody
+    // sees the flap. Past 5s, the original offline broadcast fires as usual.
+    // Only the most-recent socket for a username (the canonical lobby presence)
+    // triggers the timer — earlier-tab disconnects in a multi-tab session are
+    // ignored for offline-broadcast purposes, mirroring pre-v0.16.17 behavior.
+    if (username && lobbyUsers[username] && lobbyUsers[username].socketId === socket.id) {
+      if (pendingOfflineTimers[username]) clearTimeout(pendingOfflineTimers[username]);
+      pendingOfflineTimers[username] = setTimeout(() => {
+        delete pendingOfflineTimers[username];
+        // Re-check that no reconnect snuck in between scheduling + firing.
+        // If lobbyUsers[username] was replaced by a fresh tab, that tab's
+        // own lobby-join already handled the broadcast — skip.
+        if (lobbyUsers[username] && lobbyUsers[username].socketId !== socket.id) return;
+        delete lobbyUsers[username];
+        broadcastLobby();
+        broadcastRooms();
+        if (FEDERATION_ENABLED) fedAnnounceUserOffline(username);
+      }, 5000);
     }
 
     console.log(`Disconnected: @${username || '?'} (${socket.id})`);
