@@ -2923,9 +2923,17 @@ io.on('connection', (socket) => {
       // misleads users into thinking the recipient is unreachable.
       const nostrDomain = nostrSeenDomain(to);
       if (nostrDomain) {
-        console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation not connected — try again shortly`);
-        socket.emit('lobby-dm-error',
-          `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Try again in ~30s.`);
+        if (FEDERATION_ENABLED) {
+          console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation not connected — try again shortly`);
+          socket.emit('lobby-dm-error',
+            `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Try again in ~30s.`);
+        } else {
+          // WS federation is disabled in .env — Nostr presence shows the user
+          // but there's no transport to deliver. Tell the truth.
+          console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation is disabled on this server`);
+          socket.emit('lobby-dm-error',
+            `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS server-to-server federation disabled — cross-server DMs aren't routable. Ask the operator to enable FEDERATION_PEERS in .env.`);
+        }
         return;
       }
       const visiblePeers = Object.entries(federationPeers)
@@ -4779,10 +4787,10 @@ io.on('connection', (socket) => {
         // rather than thinking the payment was wasted.
         const nostrDomain = nostrSeenDomain(to);
         if (nostrDomain) {
-          socket.emit('dm-attachment-error', {
-            msgId: env.msgId || null,
-            error: `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Attachment is uploaded — try sending again in ~30s and your payment will route through.`
-          });
+          const errText = FEDERATION_ENABLED
+            ? `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Attachment is uploaded — try sending again in ~30s and your payment will route through.`
+            : `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS server-to-server federation disabled — cross-server attachments aren't routable. Ask the operator to enable FEDERATION_PEERS in .env.`;
+          socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: errText });
           return;
         }
         socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `@${to} is not online` });
@@ -4940,9 +4948,12 @@ io.on('connection', (socket) => {
     }
     const s = recipientStatus(String(to).toLowerCase());
     // Strip non-serializable internals before responding.
+    // federationEnabled tells the client whether WS server-to-server fed is
+    // even configured — when false and the recipient is nostr-only, there's
+    // literally no transport (don't tell the user to "wait for reconnect").
     if (s.status === 'local')     { if (cb) cb({ status: 'local' });                     return; }
     if (s.status === 'federated') { if (cb) cb({ status: 'federated', domain: s.peer.domain }); return; }
-    if (s.status === 'nostr-only'){ if (cb) cb({ status: 'nostr-only', domain: s.domain }); return; }
+    if (s.status === 'nostr-only'){ if (cb) cb({ status: 'nostr-only', domain: s.domain, federationEnabled: FEDERATION_ENABLED }); return; }
     if (cb) cb({ status: 'offline' });
   });
 
