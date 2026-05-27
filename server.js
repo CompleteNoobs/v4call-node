@@ -271,6 +271,32 @@ chatDb.exec(`
     stored_at         TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- DM attachments (v0.16.17). Same envelope shape as room_attachments but
+  -- the context is a 1:1 conversation (sender ↔ to_user) rather than a room.
+  -- per_recipient is always exactly { sender: encKey, to_user: encKey }.
+  -- text_paid + currency mirror dm_messages so the paid-DM trail is
+  -- auditable per-attachment. Local-server only in v0.1 (no federation).
+  CREATE TABLE IF NOT EXISTS dm_attachments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender            TEXT    NOT NULL,
+    to_user           TEXT    NOT NULL,
+    sender_pubkey     TEXT    NOT NULL,
+    cid               TEXT    NOT NULL,
+    size_bytes        INTEGER NOT NULL,
+    envelope_sig      TEXT    NOT NULL,
+    env_created_at    TEXT    NOT NULL,
+    expires_at        TEXT,
+    gateway_hint      TEXT,
+    kind_hint         TEXT,
+    per_recipient     TEXT    NOT NULL,
+    original_filename TEXT,
+    original_mime     TEXT,
+    original_size     INTEGER,
+    text_paid         REAL    NOT NULL DEFAULT 0,
+    currency          TEXT    NOT NULL DEFAULT 'HBD',
+    stored_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_dm_owner      ON dm_messages(owner);
   CREATE INDEX IF NOT EXISTS idx_dm_from       ON dm_messages(from_user);
   CREATE INDEX IF NOT EXISTS idx_dm_to         ON dm_messages(to_user);
@@ -279,6 +305,9 @@ chatDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_room_created  ON room_messages(created_at);
   CREATE INDEX IF NOT EXISTS idx_room_att_room    ON room_attachments(room_name);
   CREATE INDEX IF NOT EXISTS idx_room_att_stored  ON room_attachments(stored_at);
+  CREATE INDEX IF NOT EXISTS idx_dm_att_sender   ON dm_attachments(sender);
+  CREATE INDEX IF NOT EXISTS idx_dm_att_to       ON dm_attachments(to_user);
+  CREATE INDEX IF NOT EXISTS idx_dm_att_stored   ON dm_attachments(stored_at);
 `);
 
 // Migration: paid-DM badge needs the actual currency. Older rows back-default
@@ -461,6 +490,69 @@ function chatGetRoomAttachments(roomName, username) {
   }
 }
 
+// v0.16.17 — DM attachment persistence + history. Mirrors the room helpers
+// but keyed on the (sender, to_user) conversation pair. text_paid + currency
+// captured so the paid-DM trail per attachment is auditable.
+function chatStoreDmAttachment(env, textPaid, currency) {
+  try {
+    chatDb.prepare(`
+      INSERT INTO dm_attachments (
+        sender, to_user, sender_pubkey, cid, size_bytes, envelope_sig,
+        env_created_at, expires_at, gateway_hint, kind_hint, per_recipient,
+        original_filename, original_mime, original_size, text_paid, currency
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      env.sender, env.to_user, env.sender_pubkey || '', env.cid,
+      env.size_bytes | 0, env.envelope_sig, env.created_at || new Date().toISOString(),
+      env.expires_at || null, env.gateway_hint || null, env.kind_hint || null,
+      JSON.stringify(env.per_recipient || {}),
+      env.original_filename || null, env.original_mime || null,
+      env.original_size != null ? (env.original_size | 0) : null,
+      textPaid || 0, currency || 'HBD'
+    );
+  } catch (e) {
+    console.error('[chat] DM attachment store failed:', e.message);
+  }
+}
+
+// History query for the (username, withUser) conversation. Returns envelopes
+// for either direction (sender = username AND to_user = withUser, OR sender =
+// withUser AND to_user = username) where the requesting user is in
+// per_recipient. Envelopes kept past expires_at — client renders ⚠ 404.
+function chatGetDmAttachments(username, withUser) {
+  try {
+    const rows = chatDb.prepare(`
+      SELECT * FROM dm_attachments
+      WHERE (sender = ? AND to_user = ?) OR (sender = ? AND to_user = ?)
+      ORDER BY stored_at ASC
+    `).all(username, withUser, withUser, username);
+    const out = [];
+    for (const r of rows) {
+      let per_recipient = {};
+      try { per_recipient = JSON.parse(r.per_recipient || '{}'); } catch (_) {}
+      // Defensive — for DMs the audience is always {sender, to_user} so this
+      // should always pass; included for symmetry with the room query.
+      if (r.sender !== username && !(username in per_recipient)) continue;
+      out.push({
+        v: 1, type: 'dm-attachment',
+        to_user: r.to_user, sender: r.sender, sender_pubkey: r.sender_pubkey,
+        cid: r.cid, size_bytes: r.size_bytes, envelope_sig: r.envelope_sig,
+        created_at: r.env_created_at, expires_at: r.expires_at,
+        gateway_hint: r.gateway_hint, kind_hint: r.kind_hint,
+        per_recipient,
+        original_filename: r.original_filename,
+        original_mime: r.original_mime,
+        original_size: r.original_size,
+        text_paid: r.text_paid, currency: r.currency
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error('[chat] DM attachment history failed:', e.message);
+    return [];
+  }
+}
+
 // v0.14.5 — every row for a room, regardless of recipient. Used by the
 // .v4room export endpoint; per-recipient filtering happens client-side at
 // decryption time (since the ciphertext is what's stored).
@@ -491,10 +583,11 @@ function chatCleanup() {
   try {
     const dmCutoff   = chatDb.prepare(`SELECT datetime('now', ?) as cutoff`).get(`-${DM_RETENTION_DAYS} days`).cutoff;
     const roomCutoff = chatDb.prepare(`SELECT datetime('now', ?) as cutoff`).get(`-${ROOM_RETENTION_DAYS} days`).cutoff;
-    const dmDel   = chatDb.prepare(`DELETE FROM dm_messages WHERE created_at < ?`).run(dmCutoff);
-    const roomDel = chatDb.prepare(`DELETE FROM room_messages WHERE created_at < ?`).run(roomCutoff);
-    if (dmDel.changes || roomDel.changes) {
-      console.log(`[chat] Cleanup: removed ${dmDel.changes} DMs, ${roomDel.changes} room messages`);
+    const dmDel    = chatDb.prepare(`DELETE FROM dm_messages WHERE created_at < ?`).run(dmCutoff);
+    const roomDel  = chatDb.prepare(`DELETE FROM room_messages WHERE created_at < ?`).run(roomCutoff);
+    const dmAttDel = chatDb.prepare(`DELETE FROM dm_attachments WHERE stored_at < ?`).run(dmCutoff);
+    if (dmDel.changes || roomDel.changes || dmAttDel.changes) {
+      console.log(`[chat] Cleanup: removed ${dmDel.changes} DMs, ${roomDel.changes} room messages, ${dmAttDel.changes} DM attachments`);
     }
   } catch(e) {
     console.error('[chat] Cleanup failed:', e.message);
@@ -4595,6 +4688,133 @@ io.on('connection', (socket) => {
     } catch (e) {
       console.error('[room-attachment] handler error:', e.message);
     }
+  });
+
+  // ── DM attachments (ipfs-gate v0.1, local-server only) ─────────────────────
+  // Envelope shape: { v, type:'dm-attachment', to_user, cid, size_bytes,
+  //   sender, sender_pubkey, envelope_sig, created_at, expires_at,
+  //   gateway_hint, kind_hint, per_recipient: { sender: encKey, to_user: encKey },
+  //   original_filename, original_mime, original_size,
+  //   msgId?, textPaid?, textMemo?, textCurrency? }
+  // Mirrors the lobby-dm paid gate: if the recipient has a text rate set, the
+  // sender must include a verifiable on-chain payment before the envelope is
+  // accepted. Disbursement (net to recipient, fee to platform) mirrors lobby-dm
+  // exactly. No federation in v0.1 — recipient must be local.
+  socket.on('dm-attachment', async (env) => {
+    try {
+      if (!env || typeof env !== 'object') return;
+      const from = env.sender;
+      const to   = env.to_user;
+      if (!from || !to) return;
+      if (socket._username !== from) return;                       // sender spoof guard
+      if (typeof env.cid !== 'string' || !env.cid.length) return;
+      if (typeof env.envelope_sig !== 'string' || !env.envelope_sig.length) return;
+      if (!env.per_recipient || typeof env.per_recipient !== 'object') return;
+      if (!(from in env.per_recipient) || !(to in env.per_recipient)) {
+        socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: 'envelope must address both sender and recipient' });
+        return;
+      }
+
+      const recipient = lobbyUsers[to];
+      if (!recipient) {
+        socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `@${to} is not online` });
+        return;
+      }
+
+      // Resolve recipient's text rate against this sender (same path lobby-dm uses)
+      const calleeRates = await fetchRates(to);
+      const applicable  = calleeRates
+        ? await getRatesForCaller(calleeRates, from, 'text', new Date())
+        : null;
+
+      if (applicable?.blocked) {
+        socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `🚫 ${applicable.message || 'You have been blocked by this user.'}` });
+        return;
+      }
+      if (applicable?.feeRejected) {
+        socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `⚠ ${applicable.message}` });
+        return;
+      }
+
+      const textRate     = applicable?.flat || 0;
+      const cur          = env.textCurrency || applicable?.currency || 'HBD';
+      const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
+
+      if (textRate >= RATE_FLOOR) {
+        // Payment required
+        if (!env.textPaid || !env.textMemo || !env.msgId) {
+          socket.emit('dm-attachment-payment-required', {
+            msgId:   env.msgId || null,
+            to,
+            rate:    textRate,
+            currency: cur,
+            escrow:  calleeEscrow
+          });
+          return;
+        }
+
+        const ok = (cur !== 'HBD' && cur !== 'HIVE')
+          ? await verifyHiveEnginePayment(from, calleeEscrow, env.textPaid, cur, env.textMemo)
+          : await verifyHivePayment(from, calleeEscrow, env.textPaid, env.textMemo);
+        if (!ok) {
+          socket.emit('dm-attachment-error', { msgId: env.msgId, error: `Payment not found on blockchain — attachment not sent. Funds are safe if ${cur} left your account.` });
+          return;
+        }
+
+        ledgerPayment(env.msgId, 'text', from, calleeEscrow, env.textPaid, env.textMemo, 'verified', null, cur);
+
+        const platformFee  = applicable.platformFee || PLATFORM_FEE;
+        const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(3));
+        const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(3));
+
+        if (recipientNet >= 0.001) {
+          const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
+          ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
+          sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
+            if (r.success) {
+              ledgerPaymentUpdate(env.msgId, 'text_payout', 'sent', r.txId);
+              io.to(recipient.socketId).emit('text-payment-received', {
+                from, amount: recipientNet, currency: cur, msgId: env.msgId
+              });
+            } else {
+              console.error(`[dm-attachment] Payout failed to @${to}: ${r.reason}`);
+            }
+          });
+        }
+
+        if (platformCut >= 0.001) {
+          const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
+          ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
+          sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
+            if (r.success) ledgerPaymentUpdate(env.msgId, 'text_fee', 'sent', r.txId);
+          });
+        }
+
+        console.log(`[dm-attachment] @${from} → @${to}: paid ${env.textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
+      }
+
+      // Deliver to recipient and echo to sender so both see the bubble.
+      // Strip server-only fields (textMemo) before relaying — the recipient's
+      // client doesn't need them; the receipts ride on text-payment-received.
+      const wireEnv = { ...env };
+      delete wireEnv.textMemo;
+      io.to(recipient.socketId).emit('dm-attachment', wireEnv);
+      socket.emit('dm-attachment', wireEnv);
+
+      chatStoreDmAttachment(env, env.textPaid || 0, cur);
+      socket.emit('dm-attachment-sent', { msgId: env.msgId || null, to, textPaid: env.textPaid || 0, textCurrency: cur });
+    } catch (e) {
+      console.error('[dm-attachment] handler error:', e.message);
+      try { socket.emit('dm-attachment-error', { msgId: env?.msgId || null, error: e.message }); } catch (_) {}
+    }
+  });
+
+  socket.on('dm-attachments-history', ({ withUser }, cb) => {
+    const username = socket._username;
+    if (!username || !withUser) return cb ? cb([]) : null;
+    const history = chatGetDmAttachments(username, withUser);
+    if (cb) cb(history);
+    else socket.emit('dm-attachments-history', { withUser, envelopes: history });
   });
 
   // ── DISCONNECT ─────────────────────────────────────────────────────────────
