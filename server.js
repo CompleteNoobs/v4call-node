@@ -933,6 +933,44 @@ function peerForUser(username) {
   return null;
 }
 
+// v0.16.18 — Is this username visible via Nostr-additive presence (Phase D)
+// from a domain whose WS federation isn't currently connected? Used to give
+// a "WS reconnecting, try again" error instead of "not online" when the lobby
+// shows the user but routing isn't possible yet.
+// Returns the domain string or null.
+function nostrSeenDomain(username) {
+  if (!FED_PRESENCE_VIA_NOSTR) return null;
+  const u = String(username || '').toLowerCase();
+  if (!u) return null;
+  for (const [domain, entry] of Object.entries(nostrCrossFedPresence)) {
+    if (!approvedPeers.has(domain)) continue;
+    if (entry.users && entry.users.has(u)) return domain;
+  }
+  return null;
+}
+
+// Combined routing resolver — single source of truth that mirrors what the
+// lobby snapshot shows. Callers should use this instead of peerForUser when
+// they need to distinguish "user truly offline" from "user visible via Nostr
+// but WS federation isn't connected yet" (a transient state after restart).
+//
+// Return shapes:
+//   { status: 'local', recipient }                  — local socket, ready
+//   { status: 'federated', peer }                   — WS peer connected
+//   { status: 'nostr-only', domain }                — visible via Nostr, WS down
+//   { status: 'offline' }                           — not visible anywhere
+function recipientStatus(username) {
+  const recipient = lobbyUsers[username];
+  if (recipient) return { status: 'local', recipient };
+  if (FEDERATION_ENABLED) {
+    const peer = peerForUser(username);
+    if (peer) return { status: 'federated', peer };
+  }
+  const domain = nostrSeenDomain(username);
+  if (domain) return { status: 'nostr-only', domain };
+  return { status: 'offline' };
+}
+
 function roomsSnapshot() {
   return Object.entries(rooms).map(([name, r]) => ({
     name,
@@ -2879,6 +2917,17 @@ io.on('connection', (socket) => {
     const recipient    = lobbyUsers[to];
     const federatedTo  = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
     if (!recipient && !federatedTo) {
+      // v0.16.18 — Distinguish "truly offline" from "visible via Nostr but WS
+      // federation isn't connected yet". The latter is a transient state after
+      // a server restart while WS reconnects; surfacing it as "not online"
+      // misleads users into thinking the recipient is unreachable.
+      const nostrDomain = nostrSeenDomain(to);
+      if (nostrDomain) {
+        console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation not connected — try again shortly`);
+        socket.emit('lobby-dm-error',
+          `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Try again in ~30s.`);
+        return;
+      }
       const visiblePeers = Object.entries(federationPeers)
         .filter(([, p]) => p.connected)
         .map(([d, p]) => `${d}(${p.users.size})`).join(', ') || 'none';
@@ -4723,6 +4772,19 @@ io.on('connection', (socket) => {
       const recipient   = lobbyUsers[to];
       const federatedTo = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
       if (!recipient && !federatedTo) {
+        // Same Nostr-only distinction as lobby-dm. Critical for attachments
+        // because by the time the server sees the envelope, the sender has
+        // already paid BOTH the paid-DM rate AND the ipfs-gate CNOOBS/TEST
+        // fee. Surface the transient state clearly so the user knows to retry
+        // rather than thinking the payment was wasted.
+        const nostrDomain = nostrSeenDomain(to);
+        if (nostrDomain) {
+          socket.emit('dm-attachment-error', {
+            msgId: env.msgId || null,
+            error: `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Attachment is uploaded — try sending again in ~30s and your payment will route through.`
+          });
+          return;
+        }
         socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `@${to} is not online` });
         return;
       }
@@ -4863,6 +4925,25 @@ io.on('connection', (socket) => {
     const history = chatGetDmAttachments(username, withUser);
     if (cb) cb(history);
     else socket.emit('dm-attachments-history', { withUser, envelopes: history });
+  });
+
+  // v0.16.18 — Pre-flight routing check used by the client before any paid
+  // action (paid-DM Keychain prompt, ipfs-gate CNOOBS transfer). Returns the
+  // recipient's current routing status so the client can abort without
+  // charging when the user is visible via Nostr but WS federation isn't
+  // connected yet. Without this, a paid-DM or paid-attachment to a Nostr-only
+  // user would burn both fees with no delivery.
+  socket.on('dm-precheck', ({ to }, cb) => {
+    if (!socket._username || !to) {
+      if (cb) cb({ status: 'offline' });
+      return;
+    }
+    const s = recipientStatus(String(to).toLowerCase());
+    // Strip non-serializable internals before responding.
+    if (s.status === 'local')     { if (cb) cb({ status: 'local' });                     return; }
+    if (s.status === 'federated') { if (cb) cb({ status: 'federated', domain: s.peer.domain }); return; }
+    if (s.status === 'nostr-only'){ if (cb) cb({ status: 'nostr-only', domain: s.domain }); return; }
+    if (cb) cb({ status: 'offline' });
   });
 
   // ── DISCONNECT ─────────────────────────────────────────────────────────────
