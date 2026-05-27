@@ -3042,7 +3042,9 @@ io.on('connection', (socket) => {
     // ── Relay the message ─────────────────────────────────────────────────
     if (recipient) {
       io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0, textCurrency: cur });
+      console.log(`[text] @${from} → @${to}: delivered locally (sid ${recipient.socketId.slice(0,6)}…)`);
     } else if (federatedTo) {
+      const wsOk = federatedTo.ws && federatedTo.ws.readyState === 1;  // WebSocket.OPEN
       fedSend(federatedTo.ws, {
         type: 'dm',
         from, to, ciphertext, signature, timestamp,
@@ -3052,6 +3054,7 @@ io.on('connection', (socket) => {
         msgId:       msgId       || null,
         fromServer:  SERVER_DOMAIN
       });
+      console.log(`[text] @${from} → @${to}@${federatedTo.domain}: fedSend(type=dm) issued (ws.open=${wsOk}, paid=${textPaid || 0} ${cur})`);
     }
     socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0, textCurrency: cur });
 
@@ -5598,6 +5601,9 @@ async function fedHandleMessage(ws, raw) {
             textCurrency: cur,
             fromServer: fromServer || ws._domain
           });
+          console.log(`[fed-text] ← @${from}@${fromServer || ws._domain} → @${to}: delivered to local socket (sid ${recipient.socketId.slice(0,6)}…)`);
+        } else {
+          console.warn(`[fed-text] ← @${from}@${fromServer || ws._domain} → @${to}: recipient NOT in local lobbyUsers — message stored in chat DB only (will surface on next login via dm-history)`);
         }
         chatStoreDm(from, to, ciphertext, null, signature, timestamp, paid, cur);
         fedSend(ws, { type: 'dm-delivered', from, to, msgId: msgId || null });
