@@ -4690,7 +4690,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── DM attachments (ipfs-gate v0.1, local-server only) ─────────────────────
+  // ── DM attachments (ipfs-gate v0.1) ────────────────────────────────────────
   // Envelope shape: { v, type:'dm-attachment', to_user, cid, size_bytes,
   //   sender, sender_pubkey, envelope_sig, created_at, expires_at,
   //   gateway_hint, kind_hint, per_recipient: { sender: encKey, to_user: encKey },
@@ -4699,7 +4699,12 @@ io.on('connection', (socket) => {
   // Mirrors the lobby-dm paid gate: if the recipient has a text rate set, the
   // sender must include a verifiable on-chain payment before the envelope is
   // accepted. Disbursement (net to recipient, fee to platform) mirrors lobby-dm
-  // exactly. No federation in v0.1 — recipient must be local.
+  // exactly.
+  // v0.16.18 — federation support. Caller's server is verifier + router;
+  // recipient's server is treasurer. On a federated send the caller verifies
+  // the on-chain payment to the recipient's declared escrow (which lives on
+  // the peer's server), then forwards via federation `dm-attachment`. The
+  // recipient's server re-validates per design rule #15 and disburses.
   socket.on('dm-attachment', async (env) => {
     try {
       if (!env || typeof env !== 'object') return;
@@ -4715,8 +4720,9 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const recipient = lobbyUsers[to];
-      if (!recipient) {
+      const recipient   = lobbyUsers[to];
+      const federatedTo = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
+      if (!recipient && !federatedTo) {
         socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `@${to} is not online` });
         return;
       }
@@ -4740,6 +4746,17 @@ io.on('connection', (socket) => {
       const cur          = env.textCurrency || applicable?.currency || 'HBD';
       const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
 
+      // Escrow-mismatch guard for paid federated attachments — mirrors lobby-dm.
+      // If the recipient's rate-post escrow isn't controlled by the peer, the
+      // peer can't disburse and the caller's funds would orphan. Fail loudly.
+      if (federatedTo && textRate >= RATE_FLOOR && federatedTo.escrow && federatedTo.escrow !== calleeEscrow) {
+        socket.emit('dm-attachment-error', {
+          msgId: env.msgId || null,
+          error: `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ${federatedTo.domain} controls @${federatedTo.escrow}. They need to update their rates post for paid attachments to work across federation.`
+        });
+        return;
+      }
+
       if (textRate >= RATE_FLOOR) {
         // Payment required
         if (!env.textPaid || !env.textMemo || !env.msgId) {
@@ -4753,6 +4770,8 @@ io.on('connection', (socket) => {
           return;
         }
 
+        // Caller-side on-chain verification against the recipient's declared
+        // escrow (the peer's escrow for federated, or our own for local).
         const ok = (cur !== 'HBD' && cur !== 'HIVE')
           ? await verifyHiveEnginePayment(from, calleeEscrow, env.textPaid, cur, env.textMemo)
           : await verifyHivePayment(from, calleeEscrow, env.textPaid, env.textMemo);
@@ -4763,44 +4782,73 @@ io.on('connection', (socket) => {
 
         ledgerPayment(env.msgId, 'text', from, calleeEscrow, env.textPaid, env.textMemo, 'verified', null, cur);
 
-        const platformFee  = applicable.platformFee || PLATFORM_FEE;
-        const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(3));
-        const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(3));
+        // Disbursement ONLY runs on the local-recipient path. For federated
+        // recipients the peer's server owns the escrow and does the disburse
+        // after its own re-verification (per design rule #15).
+        if (recipient) {
+          const platformFee  = applicable.platformFee || PLATFORM_FEE;
+          const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(3));
+          const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(3));
 
-        if (recipientNet >= 0.001) {
-          const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
-          ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
-          sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
-            if (r.success) {
-              ledgerPaymentUpdate(env.msgId, 'text_payout', 'sent', r.txId);
-              io.to(recipient.socketId).emit('text-payment-received', {
-                from, amount: recipientNet, currency: cur, msgId: env.msgId
-              });
-            } else {
-              console.error(`[dm-attachment] Payout failed to @${to}: ${r.reason}`);
-            }
-          });
+          if (recipientNet >= 0.001) {
+            const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
+            ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
+            sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(env.msgId, 'text_payout', 'sent', r.txId);
+                io.to(recipient.socketId).emit('text-payment-received', {
+                  from, amount: recipientNet, currency: cur, msgId: env.msgId
+                });
+              } else {
+                console.error(`[dm-attachment] Payout failed to @${to}: ${r.reason}`);
+              }
+            });
+          }
+
+          if (platformCut >= 0.001) {
+            const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
+            ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
+            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
+              if (r.success) ledgerPaymentUpdate(env.msgId, 'text_fee', 'sent', r.txId);
+            });
+          }
+
+          console.log(`[dm-attachment] @${from} → @${to}: paid ${env.textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
+        } else {
+          console.log(`[dm-attachment] @${from} → @${to}@${federatedTo.domain}: paid ${env.textPaid} ${cur} (forwarding to peer for disburse)`);
         }
-
-        if (platformCut >= 0.001) {
-          const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
-          ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
-          sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
-            if (r.success) ledgerPaymentUpdate(env.msgId, 'text_fee', 'sent', r.txId);
-          });
-        }
-
-        console.log(`[dm-attachment] @${from} → @${to}: paid ${env.textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
       }
 
-      // Deliver to recipient and echo to sender so both see the bubble.
-      // Strip server-only fields (textMemo) before relaying — the recipient's
-      // client doesn't need them; the receipts ride on text-payment-received.
-      const wireEnv = { ...env };
-      delete wireEnv.textMemo;
-      io.to(recipient.socketId).emit('dm-attachment', wireEnv);
-      socket.emit('dm-attachment', wireEnv);
+      // Build the wire envelope (no payment fields — those are server-side
+      // routing data, not part of the attachment envelope itself).
+      const { msgId: _m, textPaid: _p, textMemo: _t, textCurrency: _c, ...wireEnv } = env;
 
+      if (recipient) {
+        // Local delivery — emit to recipient, echo to sender.
+        io.to(recipient.socketId).emit('dm-attachment', wireEnv);
+        socket.emit('dm-attachment', wireEnv);
+      } else {
+        // Federated delivery — forward via federation. Echo to sender locally
+        // so their bubble renders immediately; the peer will deliver to the
+        // recipient. On peer-side reject we get back `dm-attachment-failed`
+        // which surfaces as an error to the sender via the federation handler.
+        fedSend(federatedTo.ws, {
+          type: 'dm-attachment',
+          from, to,
+          envelope: wireEnv,
+          msgId:        env.msgId        || null,
+          textPaid:     env.textPaid     || 0,
+          textMemo:     env.textMemo     || null,
+          textCurrency: cur,
+          fromServer:   SERVER_DOMAIN
+        });
+        socket.emit('dm-attachment', wireEnv);
+      }
+
+      // Always persist sender's local copy so sender's history-replay on login
+      // includes it (their wrapped key is in per_recipient — they can decrypt
+      // their own copy). For federated, the peer separately persists the
+      // recipient's copy on its side.
       chatStoreDmAttachment(env, env.textPaid || 0, cur);
       socket.emit('dm-attachment-sent', { msgId: env.msgId || null, to, textPaid: env.textPaid || 0, textCurrency: cur });
     } catch (e) {
@@ -5573,6 +5621,123 @@ async function fedHandleMessage(ws, raw) {
       // Notify the original sender if still online.
       const sender = lobbyUsers[msg.from];
       if (sender) io.to(sender.socketId).emit('lobby-dm-error', `DM to @${msg.to} failed: ${msg.reason || 'unknown'}`);
+      break;
+    }
+    case 'dm-attachment': {
+      // v0.16.18 — Incoming ipfs-gate attachment DM for one of our local users.
+      // The envelope is ciphertext-key wrapped to {sender, to_user}; we never
+      // see plaintext. Paid path: re-verify on-chain to OUR escrow (we're the
+      // recipient's home server = treasurer), recipient-side rate enforcement
+      // per design rule #15, refund on reject.
+      const { from, to, envelope, msgId, textPaid, textMemo, textCurrency, fromServer } = msg;
+      if (!from || !to || !envelope || !envelope.cid || !envelope.envelope_sig) return;
+      if (!envelope.per_recipient || typeof envelope.per_recipient !== 'object') return;
+      if (!(from in envelope.per_recipient) || !(to in envelope.per_recipient)) return;
+
+      const recipient = lobbyUsers[to];
+      const cur       = textCurrency || 'HBD';
+      const paid      = textPaid || 0;
+
+      const deliver = () => {
+        // Persist on our side so recipient's dm-attachments-history replay
+        // returns it on next login. The envelope holds both wrapped keys, so
+        // either user can decrypt their own copy from the same row.
+        chatStoreDmAttachment(envelope, paid, cur);
+        if (recipient) io.to(recipient.socketId).emit('dm-attachment', envelope);
+      };
+
+      if (paid >= 0.001 && textMemo && msgId) {
+        // Re-verify on-chain to OUR escrow (we're the treasurer here).
+        const verifier = (cur !== 'HBD' && cur !== 'HIVE')
+          ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
+          : verifyHivePayment(from, ESCROW_ACCOUNT, paid, textMemo);
+        verifier.then(async ok => {
+          if (!ok) {
+            console.warn(`[fed-att] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo})`);
+            fedSend(ws, { type: 'dm-attachment-failed', from, to, msgId, reason: 'payment not on chain' });
+            return;
+          }
+
+          // Recipient-side rate enforcement (design rule #15).
+          const recipRates = await fetchRates(to);
+          const optResult  = await computePaymentOptions(recipRates, from, 'text', new Date());
+          let rejectReason = null;
+          if (optResult.blocked) {
+            rejectReason = optResult.message || 'sender is blocked by recipient';
+          } else if (optResult.feeRejected) {
+            rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.options.length > 0) {
+            const opt = optResult.options.find(o => o.currency === cur);
+            if (!opt) {
+              rejectReason = `recipient does not accept ${cur} for paid attachments`;
+            } else {
+              const requiredRate = opt.flat || 0;
+              if (requiredRate >= 0.001 && paid < requiredRate) {
+                rejectReason = `underpaid (required ${requiredRate} ${cur}, paid ${paid} ${cur})`;
+              }
+            }
+          }
+          if (rejectReason) {
+            console.warn(`[fed-att] ✗ Recipient-side check failed: @${from} → @${to}: ${rejectReason}`);
+            const refundMemo = `v4call:dm-att-refund:${msgId}`;
+            ledgerPayment(msgId, 'text_refund', ESCROW_ACCOUNT, from, paid, refundMemo, 'pending', null, cur);
+            sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
+                console.log(`[fed-att] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
+              } else {
+                ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
+                console.error(`[fed-att] Refund to @${from} failed: ${r.reason}`);
+              }
+            });
+            fedSend(ws, { type: 'dm-attachment-failed', from, to, msgId, reason: rejectReason });
+            return;
+          }
+
+          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified', null, cur);
+
+          // Disburse net to recipient, fee to platform.
+          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(3));
+          const recipientNet = parseFloat((paid - platformCut).toFixed(3));
+
+          if (recipientNet >= 0.001) {
+            const payoutMemo = `v4call:dm-att-payout:${msgId}`;
+            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
+            sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+                if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
+                  from, amount: recipientNet, currency: cur, msgId
+                });
+              } else {
+                console.error(`[fed-att] Payout to @${to} failed: ${r.reason}`);
+              }
+            });
+          }
+          if (platformCut >= 0.001) {
+            const feeMemo = `v4call:dm-att-fee:${msgId}`;
+            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
+            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+              if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+            });
+          }
+
+          console.log(`[fed-att] @${from}@${fromServer || ws._domain} → @${to}: paid ${paid} ${cur} | net ${recipientNet} | fee ${platformCut}`);
+          deliver();
+        });
+      } else {
+        deliver();
+        console.log(`[federation] DM attachment relayed: @${from}@${fromServer || ws._domain} → @${to} (cid ${envelope.cid.slice(0,12)}…)`);
+      }
+      break;
+    }
+    case 'dm-attachment-failed': {
+      // Peer rejected our forwarded attachment. Notify the original sender.
+      const sender = lobbyUsers[msg.from];
+      if (sender) io.to(sender.socketId).emit('dm-attachment-error', {
+        msgId: msg.msgId || null,
+        error: `Attachment to @${msg.to} failed: ${msg.reason || 'unknown'}`
+      });
       break;
     }
     case 'call-invite': {
