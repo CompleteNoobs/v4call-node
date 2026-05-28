@@ -14,6 +14,57 @@
 // In production via systemd, env vars are set directly in the service file.
 try { require('dotenv').config(); } catch(e) { /* dotenv is optional */ }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// .env duplicate-key safety net (v0.16.19+)
+//
+// dotenv is "last-wins": writing `FEDERATION_PEERS=A` on one line and
+// `FEDERATION_PEERS=B` on the next silently drops A — process.env.FEDERATION_PEERS
+// only sees B. Caught in production 2026-05-28 in a three-server mesh; one peer
+// of every pair was missing from the runtime config and nobody noticed because
+// Nostr presence kept federated users visible in the lobby anyway. See
+// FED-RECOVERY-NOTES.md Lesson 11.
+//
+// This scan re-reads the raw .env file at boot, looks for any key declared
+// more than once, and prints a loud warning per duplicate. Behavioural impact:
+// zero — dotenv has already loaded by this point. It just makes the silent
+// dedup loud so the next operator catches it in seconds rather than weeks.
+//
+// Skips silently if there's no .env file (production via systemd, the example
+// .env.example file in CI, etc.).
+//
+// path/fs are require()'d inline here because the main require block below
+// hasn't run yet — keeping the scan at the very top of boot means the warning
+// fires before any other [config] line, so an operator running
+// `docker compose logs app | head -20` sees it immediately.
+try {
+  const _fs   = require('fs');
+  const _path = require('path');
+  const envPath = _path.resolve(process.cwd(), '.env');
+  if (_fs.existsSync(envPath)) {
+    const raw = _fs.readFileSync(envPath, 'utf8');
+    const counts = Object.create(null);
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const m = trimmed.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+      if (!m) continue;
+      const key = m[1];
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    for (const [key, n] of Object.entries(counts)) {
+      if (n > 1) {
+        const hint = (key === 'FEDERATION_PEERS' || key === 'NOSTR_RELAYS')
+          ? ' Use comma-separated form: ' + key + '=value1,value2'
+          : ' dotenv keeps only the LAST occurrence.';
+        console.log('[config] ⚠ multiple ' + key + ' lines in .env (' + n + ').' + hint);
+      }
+    }
+  }
+} catch (e) {
+  // Don't crash the server over a diagnostic. Just log and move on.
+  console.log('[config] (env duplicate-key scan skipped: ' + e.message + ')');
+}
+
 const express    = require('express');
 const http       = require('http');
 const { Server } = require('socket.io');
@@ -3444,20 +3495,32 @@ io.on('connection', (socket) => {
 
     // Callee must be online (locally or on a federated peer)
     if (!lobbyUsers[callee] && !federatedCallee) {
+      // v0.16.19 — Server-side parity with the client call-precheck. The client
+      // already guards against this, but a stale browser or race could still get
+      // here. Distinguish "truly offline" from "visible via Nostr but no WS
+      // transport" so the caller gets an accurate reason. Funds are protected by
+      // the existing refund branch regardless.
+      const nostrDomain = nostrSeenDomain(String(callee).toLowerCase());
+      const offlineReason = nostrDomain
+        ? (FEDERATION_ENABLED
+            ? `@${callee} is shown online via Nostr presence on ${nostrDomain}, but WS federation to that server isn't connected right now — calls can't route. Try again in ~30s.`
+            : `@${callee} is on ${nostrDomain} (visible via Nostr presence), but this server has WS federation disabled — there's no transport to ring them. Operator needs to enable FEDERATION_PEERS in .env.`)
+        : `@${callee} is not online.`;
+
       if (ringFeePaid && ringFeePaid > 0 && callId) {
-        // Callee went offline between rate check and ring — refund ring fee
+        // Callee unreachable between rate check and ring — refund ring fee
         const ringCurrency = activePayments[callId]?.currency || 'HBD';
-        const refundMemo = `v4call:refund:${callId}:offline`;
+        const refundMemo = `v4call:refund:${callId}:unreachable`;
         ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
         sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(r => {
           const msg = r.success
-            ? `@${callee} is offline. Ring fee of ${ringFeePaid.toFixed(3)} ${ringCurrency} refunded.`
-            : `@${callee} is offline. Refund of ${ringFeePaid.toFixed(3)} ${ringCurrency} pending — contact support.`;
+            ? `${offlineReason} Ring fee of ${ringFeePaid.toFixed(3)} ${ringCurrency} refunded.`
+            : `${offlineReason} Refund of ${ringFeePaid.toFixed(3)} ${ringCurrency} pending — contact support.`;
           socket.emit('call-failed', { reason: msg, refunded: r.success });
           if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
         });
       } else {
-        socket.emit('call-failed', { reason: `@${callee} is not online.` });
+        socket.emit('call-failed', { reason: offlineReason });
       }
       return;
     }
