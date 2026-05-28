@@ -5195,14 +5195,30 @@ function fedShouldInitiate(peerDomain) {
 // belong to. This ties Hive identity to domain control: a squatter can spoof
 // hello but can't serve a matching file with a valid signature on a domain
 // they don't control. Results cache to avoid hammering peers on every connect.
-const PEER_VERIFY_TTL_OK   = 60 * 60 * 1000;   // 1h for positive results
-const PEER_VERIFY_TTL_FAIL = 5  * 60 * 1000;   // 5min for failures
-const peerVerifyCache = {};                    // domain → { result, cachedAt }
+const PEER_VERIFY_TTL_OK         = 60 * 60 * 1000;   // 1h for positive results
+const PEER_VERIFY_TTL_STRUCTURAL = 5  * 60 * 1000;   // 5min for permanent failures (bad sig, wrong claim, domain mismatch)
+const PEER_VERIFY_TTL_TRANSIENT  = 30 * 1000;        // 30s for transient failures (timeout, network error, HTTP 5xx)
+const peerVerifyCache = {};                          // domain → { result, cachedAt, transient? }
 
+// Bumped 8s → 15s in v0.16.19 after a production cascade on v4call.com:
+// out-of-band curl/wget against the same peers returned in ~70ms, but the
+// in-process Node fetch hit the 8s AbortSignal repeatedly. Working hypothesis
+// is event-loop pressure (heavy concurrent fed handshakes / Nostr publishes /
+// Hive scans block the loop long enough for the timeout to fire before the
+// fetch's I/O actually runs). 15s is a forgiving budget that still catches
+// genuine network failure quickly. The cache-TTL split below is the real fix —
+// this is the smaller half of the pair.
 async function _fetchPeerVerifyFile(domain) {
   const url = `https://${domain}/.well-known/v4call-server.json`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    // Tag the error so verifyPeer can classify the failure category. 5xx is
+    // transient (peer overloaded), 4xx is structural (peer mis-served the
+    // well-known on purpose or by config).
+    err._transient = res.status >= 500;
+    throw err;
+  }
   return await res.json();
 }
 
@@ -5251,55 +5267,73 @@ function _verifyPayloadString(obj) {
 }
 
 async function verifyPeer(domain, claimedAccount) {
+  // Cache lookup honours the failure category written at insert time. Positive
+  // results live 1h; structural failures (bad sig / wrong claim / etc.) live
+  // 5min because they can't change without operator action; transient failures
+  // (network timeout / 5xx / Hive node hiccup) live only 30s so a single bad
+  // fetch can't cascade into a 5-minute outage.
   const cached = peerVerifyCache[domain];
   if (cached) {
-    const ttl = cached.result.verified ? PEER_VERIFY_TTL_OK : PEER_VERIFY_TTL_FAIL;
+    let ttl;
+    if (cached.result.verified)  ttl = PEER_VERIFY_TTL_OK;
+    else if (cached.transient)   ttl = PEER_VERIFY_TTL_TRANSIENT;
+    else                         ttl = PEER_VERIFY_TTL_STRUCTURAL;
     if ((Date.now() - cached.cachedAt) < ttl) return cached.result;
   }
 
-  const fail = (reason) => {
+  // `transient = true` → cached for 30s (retry quickly on next handshake).
+  // `transient = false` → cached for 5min (won't change until operator fixes).
+  const fail = (reason, transient = false) => {
     const r = { verified: false, reason };
-    peerVerifyCache[domain] = { result: r, cachedAt: Date.now() };
+    peerVerifyCache[domain] = { result: r, cachedAt: Date.now(), transient };
     return r;
   };
 
   let obj;
   try { obj = await _fetchPeerVerifyFile(domain); }
-  catch(e) { return fail(`Cannot fetch v4call-server.json: ${e.message}`); }
-
-  // Shape + field-consistency checks
-  if (obj.claim !== 'v4call-server-ownership')                 return fail('wrong claim');
-  if (!obj.domain || !obj.hive_account || !obj.signature)      return fail('missing required fields');
-  if (obj.domain.toLowerCase() !== domain.toLowerCase())       return fail(`domain mismatch (file claims ${obj.domain})`);
-  if (claimedAccount && obj.hive_account.toLowerCase() !== claimedAccount.toLowerCase()) {
-    return fail(`account mismatch: hello says @${claimedAccount} but file signed by @${obj.hive_account}`);
+  catch(e) {
+    // AbortSignal timeouts, DNS errors, ECONNREFUSED, ECONNRESET, HTTP 5xx are
+    // all transient. HTTP 4xx (peer's nginx mis-served the file) is structural.
+    const isTransient = e._transient !== false; // _transient set in fetcher; default to true for network errors
+    return fail(`Cannot fetch v4call-server.json: ${e.message}`, isTransient);
   }
 
-  // Expiry — only enforce if operator set one
+  // Shape + field-consistency checks — all structural (won't change until peer
+  // operator regenerates the well-known file).
+  if (obj.claim !== 'v4call-server-ownership')                 return fail('wrong claim', false);
+  if (!obj.domain || !obj.hive_account || !obj.signature)      return fail('missing required fields', false);
+  if (obj.domain.toLowerCase() !== domain.toLowerCase())       return fail(`domain mismatch (file claims ${obj.domain})`, false);
+  if (claimedAccount && obj.hive_account.toLowerCase() !== claimedAccount.toLowerCase()) {
+    return fail(`account mismatch: hello says @${claimedAccount} but file signed by @${obj.hive_account}`, false);
+  }
+
+  // Expiry — only enforce if operator set one. Structural — peer needs to
+  // re-sign to fix.
   if (obj.expires) {
     const exp = Date.parse(obj.expires);
-    if (Number.isFinite(exp) && Date.now() > exp) return fail(`expired on ${obj.expires}`);
+    if (Number.isFinite(exp) && Date.now() > exp) return fail(`expired on ${obj.expires}`, false);
   }
-  // Reject far-future issued (tolerates 5min clock skew)
+  // Reject far-future issued (tolerates 5min clock skew). Structural.
   if (obj.issued) {
     const iss = Date.parse(obj.issued);
-    if (Number.isFinite(iss) && iss > Date.now() + 5 * 60 * 1000) return fail(`issued timestamp in future: ${obj.issued}`);
+    if (Number.isFinite(iss) && iss > Date.now() + 5 * 60 * 1000) return fail(`issued timestamp in future: ${obj.issued}`, false);
   }
 
-  // Signature verification
+  // Signature verification — Hive lookup is transient (RPC hiccup), but
+  // missing-pubkey or actual mismatch is structural.
   let pubKeyStr;
   try { pubKeyStr = await _lookupPostingPubKey(obj.hive_account); }
-  catch(e) { return fail(`Hive lookup error: ${e.message}`); }
-  if (!pubKeyStr) return fail(`no posting key found for @${obj.hive_account}`);
+  catch(e) { return fail(`Hive lookup error: ${e.message}`, true); }
+  if (!pubKeyStr) return fail(`no posting key found for @${obj.hive_account}`, false);
 
   try {
     const payload = _verifyPayloadString(obj);
     const hash    = dhive.cryptoUtils.sha256(payload);
     const pubKey  = dhive.PublicKey.fromString(pubKeyStr);
     const sig     = dhive.Signature.fromString(obj.signature);
-    if (!pubKey.verify(hash, sig)) return fail('signature does not match posting key');
+    if (!pubKey.verify(hash, sig)) return fail('signature does not match posting key', false);
   } catch(e) {
-    return fail(`signature parse error: ${e.message}`);
+    return fail(`signature parse error: ${e.message}`, false);
   }
 
   // Hive-anchored Nostr binding (only meaningful when the file used the
