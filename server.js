@@ -619,6 +619,48 @@ function chatGetRoomMessagesAll(roomName) {
   }
 }
 
+// v0.17 — uploads-management tab enrichment. The ipfs-gate is authoritative for
+// what's pinned, but it only ever saw ciphertext for encrypted uploads, so it
+// has no filename / kind / "which room or DM" context. That context lives here,
+// keyed by CID, in the rows WE stored when the user sent the attachment. Returns
+// a map cid -> { filename, mime, kind, context } for every attachment this user
+// sent (room + DM). The client merges it onto the gate's list by CID.
+function chatGetUploadContextForUser(username) {
+  const map = {};
+  try {
+    const roomRows = chatDb.prepare(`
+      SELECT cid, room_name, kind_hint, original_filename, original_mime
+      FROM room_attachments WHERE sender = ?
+    `).all(username);
+    for (const r of roomRows) {
+      map[r.cid] = {
+        filename: r.original_filename || null,
+        mime:     r.original_mime || null,
+        kind:     r.kind_hint || null,
+        context:  `in #${r.room_name}`
+      };
+    }
+    const dmRows = chatDb.prepare(`
+      SELECT cid, to_user, kind_hint, original_filename, original_mime
+      FROM dm_attachments WHERE sender = ?
+    `).all(username);
+    for (const r of dmRows) {
+      // Don't clobber a room row if the same CID somehow appears in both
+      // (shouldn't, since each encryption is a fresh key → unique CID).
+      if (map[r.cid]) continue;
+      map[r.cid] = {
+        filename: r.original_filename || null,
+        mime:     r.original_mime || null,
+        kind:     r.kind_hint || null,
+        context:  `→ @${r.to_user} (DM)`
+      };
+    }
+  } catch (e) {
+    console.error('[chat] upload-context query failed:', e.message);
+  }
+  return map;
+}
+
 function chatUpdateSeen(username) {
   try {
     chatDb.prepare(`
@@ -4768,6 +4810,17 @@ io.on('connection', (socket) => {
   // Server is router-only: file bytes never touch v4call. Sender is validated
   // as a current room member; recipients are looked up against the room's
   // current membership. Recipient clients verify envelope_sig themselves.
+  // v0.17 — uploads-management tab enrichment. Returns this user's locally
+  // stored attachment context (filename + kind + which room/DM), keyed by CID,
+  // so the client can decorate the gate's authoritative upload list. Read-only,
+  // scoped to the authenticated socket's own username — never another user's.
+  socket.on('my-uploads-context', (cb) => {
+    if (typeof cb !== 'function') return;
+    const user = socket._username;
+    if (!user) { cb({ context: {} }); return; }
+    cb({ context: chatGetUploadContextForUser(user) });
+  });
+
   socket.on('room-attachment', (env) => {
     try {
       if (!env || typeof env !== 'object') return;
