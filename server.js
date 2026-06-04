@@ -348,7 +348,7 @@ chatDb.exec(`
     stored_at         TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- Durable per-sender upload metadata index (v0.17 — uploads-management tab).
+  -- Durable per-sender upload metadata index (v0.16.25 — uploads-management tab).
   -- room_attachments is cascade-deleted when an ephemeral room is torn down, so
   -- it can't supply filename/room context for the Uploads tab after you leave a
   -- room. This table is written at send time and NEVER cascade-deleted, so the
@@ -637,7 +637,7 @@ function chatGetRoomMessagesAll(roomName) {
   }
 }
 
-// v0.17 — durable record of an upload's metadata for the sender, keyed by CID.
+// v0.16.25 — durable record of an upload's metadata for the sender, keyed by CID.
 // Written at send time from both the room + DM attachment handlers. Survives
 // ephemeral-room teardown (unlike room_attachments). INSERT OR REPLACE: CIDs are
 // content-unique, and a re-send just refreshes the same metadata.
@@ -653,7 +653,7 @@ function chatRecordUploadIndex({ cid, uploader, filename, mime, kind, context })
   }
 }
 
-// v0.17 — uploads-management tab enrichment. The ipfs-gate is authoritative for
+// v0.16.25 — uploads-management tab enrichment. The ipfs-gate is authoritative for
 // what's pinned, but it only ever saw ciphertext for encrypted uploads, so it
 // has no filename / kind / "which room or DM" context. That context lives here,
 // keyed by CID. Returns a map cid -> { filename, mime, kind, context } for every
@@ -4845,7 +4845,7 @@ io.on('connection', (socket) => {
   // Server is router-only: file bytes never touch v4call. Sender is validated
   // as a current room member; recipients are looked up against the room's
   // current membership. Recipient clients verify envelope_sig themselves.
-  // v0.17 — uploads-management tab enrichment. Returns this user's locally
+  // v0.16.25 — uploads-management tab enrichment. Returns this user's locally
   // stored attachment context (filename + kind + which room/DM), keyed by CID,
   // so the client can decorate the gate's authoritative upload list. Read-only,
   // scoped to the authenticated socket's own username — never another user's.
@@ -4856,7 +4856,7 @@ io.on('connection', (socket) => {
     cb({ context: chatGetUploadContextForUser(user) });
   });
 
-  // v0.17 — record metadata for an upload that didn't go through a room/DM
+  // v0.16.25 — record metadata for an upload that didn't go through a room/DM
   // handler (i.e. a public/plaintext upload started from the Uploads tab), so
   // the tab can label it with its filename. Scoped to the authenticated user;
   // home-server-local by construction (public uploads aren't tied to a room).
