@@ -348,6 +348,23 @@ chatDb.exec(`
     stored_at         TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Durable per-sender upload metadata index (v0.17 — uploads-management tab).
+  -- room_attachments is cascade-deleted when an ephemeral room is torn down, so
+  -- it can't supply filename/room context for the Uploads tab after you leave a
+  -- room. This table is written at send time and NEVER cascade-deleted, so the
+  -- gate's long-lived pin can still be shown with its real name + where it was
+  -- sent. Pure metadata (no ciphertext, no keys); pruned by retention cleanup.
+  -- The gate stays authoritative for what's actually pinned + quota.
+  CREATE TABLE IF NOT EXISTS upload_index (
+    cid       TEXT PRIMARY KEY,
+    uploader  TEXT NOT NULL,
+    filename  TEXT,
+    mime      TEXT,
+    kind      TEXT,
+    context   TEXT,
+    sent_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_dm_owner      ON dm_messages(owner);
   CREATE INDEX IF NOT EXISTS idx_dm_from       ON dm_messages(from_user);
   CREATE INDEX IF NOT EXISTS idx_dm_to         ON dm_messages(to_user);
@@ -359,6 +376,7 @@ chatDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_dm_att_sender   ON dm_attachments(sender);
   CREATE INDEX IF NOT EXISTS idx_dm_att_to       ON dm_attachments(to_user);
   CREATE INDEX IF NOT EXISTS idx_dm_att_stored   ON dm_attachments(stored_at);
+  CREATE INDEX IF NOT EXISTS idx_upload_index_up  ON upload_index(uploader);
 `);
 
 // Migration: paid-DM badge needs the actual currency. Older rows back-default
@@ -619,41 +637,54 @@ function chatGetRoomMessagesAll(roomName) {
   }
 }
 
+// v0.17 — durable record of an upload's metadata for the sender, keyed by CID.
+// Written at send time from both the room + DM attachment handlers. Survives
+// ephemeral-room teardown (unlike room_attachments). INSERT OR REPLACE: CIDs are
+// content-unique, and a re-send just refreshes the same metadata.
+function chatRecordUploadIndex({ cid, uploader, filename, mime, kind, context }) {
+  if (!cid || !uploader) return;
+  try {
+    chatDb.prepare(`
+      INSERT OR REPLACE INTO upload_index (cid, uploader, filename, mime, kind, context, sent_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(cid, uploader, filename || null, mime || null, kind || null, context || null);
+  } catch (e) {
+    console.error('[chat] upload-index write failed:', e.message);
+  }
+}
+
 // v0.17 — uploads-management tab enrichment. The ipfs-gate is authoritative for
 // what's pinned, but it only ever saw ciphertext for encrypted uploads, so it
 // has no filename / kind / "which room or DM" context. That context lives here,
-// keyed by CID, in the rows WE stored when the user sent the attachment. Returns
-// a map cid -> { filename, mime, kind, context } for every attachment this user
-// sent (room + DM). The client merges it onto the gate's list by CID.
+// keyed by CID. Returns a map cid -> { filename, mime, kind, context } for every
+// attachment this user sent. The durable `upload_index` is primary; we also
+// merge any still-present room_attachments / dm_attachments rows (covers live
+// rooms + pre-index legacy sends) WITHOUT clobbering the index. The client
+// merges the result onto the gate's authoritative list by CID.
 function chatGetUploadContextForUser(username) {
   const map = {};
   try {
+    const idxRows = chatDb.prepare(`
+      SELECT cid, filename, mime, kind, context FROM upload_index WHERE uploader = ?
+    `).all(username);
+    for (const r of idxRows) {
+      map[r.cid] = { filename: r.filename || null, mime: r.mime || null, kind: r.kind || null, context: r.context || null };
+    }
     const roomRows = chatDb.prepare(`
       SELECT cid, room_name, kind_hint, original_filename, original_mime
       FROM room_attachments WHERE sender = ?
     `).all(username);
     for (const r of roomRows) {
-      map[r.cid] = {
-        filename: r.original_filename || null,
-        mime:     r.original_mime || null,
-        kind:     r.kind_hint || null,
-        context:  `in #${r.room_name}`
-      };
+      if (map[r.cid]) continue;
+      map[r.cid] = { filename: r.original_filename || null, mime: r.original_mime || null, kind: r.kind_hint || null, context: `in #${r.room_name}` };
     }
     const dmRows = chatDb.prepare(`
       SELECT cid, to_user, kind_hint, original_filename, original_mime
       FROM dm_attachments WHERE sender = ?
     `).all(username);
     for (const r of dmRows) {
-      // Don't clobber a room row if the same CID somehow appears in both
-      // (shouldn't, since each encryption is a fresh key → unique CID).
       if (map[r.cid]) continue;
-      map[r.cid] = {
-        filename: r.original_filename || null,
-        mime:     r.original_mime || null,
-        kind:     r.kind_hint || null,
-        context:  `→ @${r.to_user} (DM)`
-      };
+      map[r.cid] = { filename: r.original_filename || null, mime: r.original_mime || null, kind: r.kind_hint || null, context: `→ @${r.to_user} (DM)` };
     }
   } catch (e) {
     console.error('[chat] upload-context query failed:', e.message);
@@ -679,8 +710,12 @@ function chatCleanup() {
     const dmDel    = chatDb.prepare(`DELETE FROM dm_messages WHERE created_at < ?`).run(dmCutoff);
     const roomDel  = chatDb.prepare(`DELETE FROM room_messages WHERE created_at < ?`).run(roomCutoff);
     const dmAttDel = chatDb.prepare(`DELETE FROM dm_attachments WHERE stored_at < ?`).run(dmCutoff);
-    if (dmDel.changes || roomDel.changes || dmAttDel.changes) {
-      console.log(`[chat] Cleanup: removed ${dmDel.changes} DMs, ${roomDel.changes} room messages, ${dmAttDel.changes} DM attachments`);
+    // Prune the durable upload index on the longer of the two retentions so a
+    // row outlives the underlying gate pin but can't accumulate forever.
+    const idxCutoff = DM_RETENTION_DAYS >= ROOM_RETENTION_DAYS ? dmCutoff : roomCutoff;
+    const idxDel   = chatDb.prepare(`DELETE FROM upload_index WHERE sent_at < ?`).run(idxCutoff);
+    if (dmDel.changes || roomDel.changes || dmAttDel.changes || idxDel.changes) {
+      console.log(`[chat] Cleanup: removed ${dmDel.changes} DMs, ${roomDel.changes} room messages, ${dmAttDel.changes} DM attachments, ${idxDel.changes} upload-index rows`);
     }
   } catch(e) {
     console.error('[chat] Cleanup failed:', e.message);
@@ -4842,6 +4877,14 @@ io.on('connection', (socket) => {
       // expires_at — the recipient's client gracefully surfaces ⚠ 404 when
       // the underlying pin is gone.
       chatStoreRoomAttachment(env);
+      // Durable sender-side record so the Uploads tab can still show this file's
+      // name + room after the ephemeral room is torn down (room_attachments is
+      // cascade-deleted on teardown; upload_index is not).
+      chatRecordUploadIndex({
+        cid: env.cid, uploader: env.sender,
+        filename: env.original_filename, mime: env.original_mime,
+        kind: env.kind_hint, context: `in #${env.room}`
+      });
       // v0.16.14 — Notify addressed recipients who aren't currently in the
       // room socket (e.g. in lobby or another room). They'll see a dot on
       // the room card / tab in their UI. Federated recipients (hosted on a
@@ -5039,6 +5082,12 @@ io.on('connection', (socket) => {
       // their own copy). For federated, the peer separately persists the
       // recipient's copy on its side.
       chatStoreDmAttachment(env, env.textPaid || 0, cur);
+      // Durable sender-side record for the Uploads tab (mirrors the room path).
+      chatRecordUploadIndex({
+        cid: env.cid, uploader: env.sender,
+        filename: env.original_filename, mime: env.original_mime,
+        kind: env.kind_hint, context: `→ @${env.to_user || to} (DM)`
+      });
       socket.emit('dm-attachment-sent', { msgId: env.msgId || null, to, textPaid: env.textPaid || 0, textCurrency: cur });
     } catch (e) {
       console.error('[dm-attachment] handler error:', e.message);
