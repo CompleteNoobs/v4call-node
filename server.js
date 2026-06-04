@@ -4856,6 +4856,23 @@ io.on('connection', (socket) => {
     cb({ context: chatGetUploadContextForUser(user) });
   });
 
+  // v0.17 — record metadata for an upload that didn't go through a room/DM
+  // handler (i.e. a public/plaintext upload started from the Uploads tab), so
+  // the tab can label it with its filename. Scoped to the authenticated user;
+  // home-server-local by construction (public uploads aren't tied to a room).
+  socket.on('record-upload-meta', (m) => {
+    try {
+      const user = socket._username;
+      if (!user || !m || typeof m !== 'object' || typeof m.cid !== 'string' || !m.cid) return;
+      const clip = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
+      chatRecordUploadIndex({
+        cid: m.cid, uploader: user,
+        filename: clip(m.filename, 256), mime: clip(m.mime, 128),
+        kind: clip(m.kind, 32), context: clip(m.context, 128) || 'public link'
+      });
+    } catch (e) { console.error('[record-upload-meta] failed:', e.message); }
+  });
+
   socket.on('room-attachment', (env) => {
     try {
       if (!env || typeof env !== 'object') return;
