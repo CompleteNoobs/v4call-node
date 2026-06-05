@@ -1327,11 +1327,10 @@ async function fetchRates(username) {
     return cached.rates;
   }
   try {
-    // ── Step 1: Blog search first ────────────────────────────────────────────
-    // The V2 rate editor posts with a timestamped permlink (v4call-rates-TIMESTAMP)
-    // rather than the fixed permlink 'v4call-rates' used by V1.
-    // Blog search sorted by date DESC ensures we always get the MOST RECENT
-    // rates post, regardless of which permlink was used.
+    // ── Blog search for the user-announce post ───────────────────────────────
+    // The user-announce.html generator posts with a timestamped permlink
+    // (user-announce-TIMESTAMP). Blog search sorted by date DESC ensures we
+    // always get the MOST RECENT user-announce post.
     const blogRes  = await fetch(HIVE_API, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1342,10 +1341,12 @@ async function fetchRates(username) {
     });
     const blogData = await blogRes.json();
     if (blogData.result) {
-      // find() on a date-DESC list returns the most recent matching post first
+      // find() on a date-DESC list returns the most recent matching post first.
+      // Rates are read ONLY from the unified `user-announce` post now — the old
+      // `v4call-rates` posts (rate-editor.html) are no longer consulted. The
+      // [V4CALL-RATES-V2] block inside the user-announce body is what parseRates reads.
       const post = blogData.result.find(p =>
-        (p.title.toLowerCase() === 'v4call-rates' ||
-         p.title.toLowerCase() === 'user-announce') && p.author === username
+        p.title.toLowerCase() === 'user-announce' && p.author === username
       );
       if (post) {
         const rates = parseRates(post.body);
@@ -1357,28 +1358,7 @@ async function fetchRates(username) {
       }
     }
 
-    // ── Step 2: Fallback — try the fixed permlink 'v4call-rates' ─────────────
-    // This catches V1 users who posted before the rate editor added timestamps,
-    // and any edge case where the blog search missed the post.
-    const directRes  = await fetch(HIVE_API, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        jsonrpc: '2.0', method: 'condenser_api.get_content',
-        params:  [username, 'v4call-rates'], id: 1
-      })
-    });
-    const directData = await directRes.json();
-    if (directData.result && directData.result.author === username && directData.result.body) {
-      const rates = parseRates(directData.result.body);
-      if (rates) {
-        rateCache[username] = { rates, fetchedAt: Date.now() };
-        console.log(`[rates] Loaded V${rates.version} for @${username} (fallback direct permlink)`);
-        return rates;
-      }
-    }
-
-    console.log(`[rates] No v4call-rates post found for @${username}`);
+    console.log(`[rates] No user-announce post found for @${username}`);
     return null;
   } catch(e) {
     console.error(`[rates] Failed to fetch rates for @${username}:`, e.message);
@@ -2853,8 +2833,8 @@ app.get('/debug-rates/:username', async (req, res) => {
   if (!rates) {
     return res.json({
       found:   false,
-      message: `No v4call-rates post found for @${req.params.username}. ` +
-               `Make sure the post exists with title "v4call-rates" and contains a [V4CALL-RATES-V1] or [V4CALL-RATES-V2] block.`
+      message: `No user-announce post found for @${req.params.username}. ` +
+               `Make sure the post exists with title "user-announce" and contains a [V4CALL-RATES-V2] block.`
     });
   }
   const caller    = req.query.caller || 'unknown';
