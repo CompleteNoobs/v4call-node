@@ -1344,7 +1344,8 @@ async function fetchRates(username) {
     if (blogData.result) {
       // find() on a date-DESC list returns the most recent matching post first
       const post = blogData.result.find(p =>
-        p.title.toLowerCase() === 'v4call-rates' && p.author === username
+        (p.title.toLowerCase() === 'v4call-rates' ||
+         p.title.toLowerCase() === 'user-announce') && p.author === username
       );
       if (post) {
         const rates = parseRates(post.body);
