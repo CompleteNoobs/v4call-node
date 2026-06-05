@@ -1509,6 +1509,7 @@ function parseRates(body) {
 function parseRateBlock(body) {
   const r = {
     invite:            0,
+    offer:             0,
     text:              0,
     textSession:       0,
     voiceRing:         0, voiceConnect:    0, voiceRate:         0,
@@ -1520,7 +1521,16 @@ function parseRateBlock(body) {
   const inviteM = body.match(/^INVITE:(.+)$/mi);
   if (inviteM) r.invite = parseHbdOrFree(inviteM[1]);
 
-  const textM = body.match(/^TEXT:(.+)$/mi);
+  // OFFER: per-offer anti-spam fee for v0.17 paid-expert invites.
+  // Captured here so user-announce posts round-trip; the paid-expert
+  // invite flow that consumes it is deferred (not wired yet).
+  const offerM = body.match(/^OFFER:(.+)$/mi);
+  if (offerM) r.offer = parseHbdOrFree(offerM[1]);
+
+  // Message rate. The user-announce post format uses DM:; the older
+  // v4call-rates (rate-editor.html) format uses TEXT:. Accept either so
+  // both archived and new posts parse. DM: wins if both are present.
+  const textM = body.match(/^DM:(.+)$/mi) || body.match(/^TEXT:(.+)$/mi);
   if (textM) r.text = parseHbdOrFree(textM[1]);
 
   const tsM = body.match(/^TEXT-SESSION:(.+)$/mi);
