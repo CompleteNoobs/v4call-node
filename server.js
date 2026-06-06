@@ -3528,6 +3528,10 @@ io.on('connection', (socket) => {
 
     const getSocketId = (username) => lobbyUsers[username]?.socketId;
 
+    // Ring-fee currency (set by verify-ring-payment) so the callee's
+    // "Caller paid X … ring fee" line shows the real token, not always HBD.
+    const ringCurrency = activePayments[callId]?.currency || 'HBD';
+
     // Free-ring cooldown (paid rings bypass this — ring fee is the skin in the game)
     if (!ringFeePaid || ringFeePaid === 0) {
       const cool = checkCallCooldown(caller, callee);
@@ -3651,14 +3655,16 @@ io.on('connection', (socket) => {
         roomName,
         callerPubKey: socket._pubKey,
         callerServer: SERVER_DOMAIN,
-        ringFeePaid:  ringFeePaid || 0
+        ringFeePaid:  ringFeePaid || 0,
+        ringCurrency
       });
     } else {
       const calleeSid = getSocketId(callee);
       if (calleeSid) {
         io.to(calleeSid).emit('incoming-call', {
           caller, callerPubKey: socket._pubKey,
-          roomName, callType: callType || 'voice', ringFeePaid: ringFeePaid || 0
+          roomName, callType: callType || 'voice', ringFeePaid: ringFeePaid || 0,
+          ringCurrency
         });
       } else {
         socket.emit('call-failed', { reason: `@${callee} is online but unreachable. Ask them to refresh.` });
@@ -6047,7 +6053,7 @@ async function fedHandleMessage(ws, raw) {
     }
     case 'call-invite': {
       // A peer server is asking us to ring one of our local users.
-      const { caller, callee, callType, roomName, callerPubKey, callerServer, ringFeePaid } = msg;
+      const { caller, callee, callType, roomName, callerPubKey, callerServer, ringFeePaid, ringCurrency } = msg;
       if (!caller || !callee || !roomName) return;
       const calleeUser = lobbyUsers[callee];
       if (!calleeUser) {
@@ -6068,6 +6074,7 @@ async function fedHandleMessage(ws, raw) {
         roomName,
         callType: callType || 'voice',
         ringFeePaid: ringFeePaid || 0,
+        ringCurrency: ringCurrency || 'HBD',
         callerServer: callerServer || ws._domain
       });
       console.log(`[federation] Incoming call: @${caller}@${callerServer || ws._domain} → @${callee} (${callType})`);
