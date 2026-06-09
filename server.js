@@ -2598,6 +2598,12 @@ app.get('/join-token', (req, res) => {
   res.json({ username: t.username, pubKey: t.pubKey, roomName: t.roomName });
 });
 
+// TODO(landing-page): add a public GET /api/info that returns
+//   { server, escrow, platformFee, version, federation }
+// so index.html (landing page) can display this server's escrow fee
+// without an operator having to edit CONFIG.SERVER_FEE_PERCENT by hand.
+// Permissive CORS. No auth. See TODO.md for the proposed shape.
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Admin & Debug Endpoints ───────────────────────────────────────────────────
