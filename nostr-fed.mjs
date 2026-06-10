@@ -7,11 +7,13 @@
 //   • Re-publish every NOSTR_REPUBLISH_HOURS (relays drop events; repeat).
 //   • Respect FED_DISCOVERY_MODE: only publishes when mode is nostr|both.
 //
-// WHAT THIS DOES *NOT* DO (later phases)
-//   • Does NOT subscribe / listen for other servers   → Phase C
-//   • Does NOT feed the peer-approval list             → Phase C
-//   • Does NOT do presence ("user X online")           → Phase D
-//   • Does NOT touch the existing WS federation, money, DMs, calls — ever.
+// NOTE: header below describes the original Phase-B scope. Phases C (subscribe +
+// discovery), D (presence), and the optional payload transport (dm + dm-attachment
+// over Nostr, NIP-44-encrypted) have since shipped — see startSubscribe /
+// startPresence / startFedTransport. The module is still a DUMB TRANSPORT:
+// server.js owns every trust decision (Hive-anchored pubkey↔domain binding,
+// approved-peer gate). It decrypts (only it holds the key) but never decides who
+// to trust, and a Nostr problem must NEVER crash v4call.
 //
 // WHY ESM (.mjs): nostr-tools v2 is ESM-only. server.js is CommonJS and loads
 // this via dynamic import(). The boundary is deliberately tiny.
@@ -23,6 +25,7 @@
 import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure';
 import { npubEncode, decode as nip19decode } from 'nostr-tools/nip19';
 import { SimplePool, useWebSocketImplementation } from 'nostr-tools/pool';
+import * as nip44 from 'nostr-tools/nip44';
 import WebSocket from 'ws';
 import { webcrypto } from 'node:crypto';
 import fs from 'node:fs';
@@ -35,6 +38,21 @@ useWebSocketImplementation(WebSocket);
 
 const LOG = (...a) => console.log('[nostr]', ...a);
 const ERR = (...a) => console.error('[nostr]', ...a);
+
+// ── Payload transport (optional layer on top of discovery/presence) ─────────
+// Carries the existing WS-federation envelopes (dm + dm-attachment) over Nostr
+// relays when the WS /federation transport is down/disabled. NIP-44-encrypted
+// server→peer so a public relay only sees an opaque blob; server.js owns the
+// approved-peer trust gate (we stay a dumb transport here).
+const FEDMSG_KIND = 1314;              // regular/stored kind → relays keep it for
+                                       // store-and-forward backlog (NOT replaceable
+                                       // 30078, NOT ephemeral 2xxxx).
+const FEDMSG_TAG  = 'v4call-fedmsg';   // discriminator so this never collides with
+                                       // the v4call-server / v4call-presence subs.
+const FEDMSG_MAX_PLAINTEXT = 49152;    // ~48KB safety margin under NIP-44's 65535
+                                       // cap. The attachment "wrapper" is small
+                                       // metadata (CID + wrapped keys) — file bytes
+                                       // live on IPFS — so this is generous headroom.
 
 // ── Key bootstrap ──────────────────────────────────────────────────────────
 // Priority: existing key file  →  one-time NOSTR_NSEC seed  →  auto-generate.
@@ -343,6 +361,95 @@ function startPresence(pool, cfg, skBytes, ownPkHex) {
   return { notePresenceChange };
 }
 
+// ── Payload transport: publish one encrypted fedmsg to a peer ──────────────
+// NIP-44-encrypt the inner federation envelope to the peer's pubkey, wrap in a
+// regular (stored) kind-1314 event tagged for them, NIP-40 expiration so relays
+// GC delivered messages. Returns { ok, eventId } | { ok:false, reason }.
+async function nostrFedSendImpl(pool, relays, skBytes, ownPkHex, peerHex, msgObj, ttlSeconds) {
+  try {
+    if (!peerHex || typeof peerHex !== 'string') return { ok: false, reason: 'no peer pubkey' };
+    if (!msgObj || typeof msgObj !== 'object')    return { ok: false, reason: 'no message' };
+    const plaintext = JSON.stringify(msgObj);
+    if (plaintext.length > FEDMSG_MAX_PLAINTEXT) {
+      ERR(`fedmsg too large (${plaintext.length}B > ${FEDMSG_MAX_PLAINTEXT}) — refusing Nostr route (use WS)`);
+      return { ok: false, reason: 'too large for nostr transport' };
+    }
+    const convKey = nip44.getConversationKey(skBytes, peerHex);
+    const ct      = nip44.encrypt(plaintext, convKey);
+    const now     = Math.floor(Date.now() / 1000);
+    const ttl     = Math.max(60, ttlSeconds || 86400);
+    const ev = finalizeEvent({
+      kind: FEDMSG_KIND,
+      created_at: now,
+      tags: [
+        ['p', peerHex],
+        ['t', FEDMSG_TAG],
+        ['expiration', String(now + ttl)],
+      ],
+      content: ct,
+    }, skBytes);
+    LOG(`fedmsg → ${peerHex.slice(0, 12)}… type=${msgObj.type} (event ${ev.id.slice(0, 12)}…)`);
+    await publishOnce(pool, relays, ev);
+    return { ok: true, eventId: ev.id };
+  } catch (e) {
+    ERR(`fedmsg publish failed (non-fatal): ${e.message}`);
+    return { ok: false, reason: e.message };
+  }
+}
+
+// ── Payload transport: subscribe for fedmsgs addressed to us ────────────────
+// Decrypt (only we hold the key), parse, hand the inner envelope up to
+// cfg.onFedMessage. server.js resolves pubkey→approved-domain, builds a
+// pseudo-socket, and runs the SAME fedHandleMessage dispatcher the WS path
+// uses — so dm / dm-attachment handlers (incl. recipient-side rate enforcement
+// + refunds) run unchanged. We make NO trust decision here.
+function startFedTransport(pool, cfg, skBytes, ownPkHex) {
+  const relays  = cfg.relays;
+  const seenIds = new Set();
+  let resubCount = 0;
+  const filter = { kinds: [FEDMSG_KIND], '#p': [ownPkHex], '#t': [FEDMSG_TAG] };
+
+  const onevent = (ev) => {
+    try {
+      if (seenIds.has(ev.id)) return;
+      seenIds.add(ev.id);
+      // Cheap unbounded-growth guard; server.js holds the authoritative
+      // time-windowed dedup, so a hard reset here is harmless belt-and-braces.
+      if (seenIds.size > 5000) seenIds.clear();
+      if (ev.pubkey === ownPkHex) return;            // never our own
+
+      let inner = null;
+      try {
+        const convKey = nip44.getConversationKey(skBytes, ev.pubkey);
+        inner = JSON.parse(nip44.decrypt(ev.content, convKey));
+      } catch {
+        return;                                       // wrong key / not for us / malformed → drop quietly
+      }
+      if (!inner || typeof inner !== 'object' || !inner.type) return;
+
+      LOG(`fedmsg ◀ from ${ev.pubkey.slice(0, 12)}… type=${inner.type} (event ${ev.id.slice(0, 12)}…)`);
+      Promise.resolve(cfg.onFedMessage({ fromPubkey: ev.pubkey, eventId: ev.id, innerMsg: inner }))
+        .catch(e => ERR(`onFedMessage threw (non-fatal): ${e.message}`));
+    } catch (e) {
+      ERR(`fedmsg onevent error (non-fatal): ${e.message}`);
+    }
+  };
+
+  const openSub = () => {
+    resubCount++;
+    LOG(`fedmsg subscribe: opening (#${resubCount}) on ${relays.length} relay(s), filter kind=${FEDMSG_KIND} #p=self`);
+    return pool.subscribeMany(relays, filter, {
+      onevent,
+      oneose: () => LOG(`fedmsg subscribe: relay backlog received — now live (store-and-forward replay done)`),
+    });
+  };
+  let sub = openSub();
+  setInterval(() => {
+    try { sub.close(); } catch { /* */ }
+    sub = openSub();
+  }, 30 * 60 * 1000).unref();
+}
+
 // ── Public entry point — called once from server.js at startup ─────────────
 export async function startNostrFed(cfg) {
   try {
@@ -411,10 +518,26 @@ export async function startNostrFed(cfg) {
       LOG(`presence requested but missing getLocalUsers/onPresence — skipping`);
     }
 
+    // ── Payload transport (optional) — carry dm/dm-attachment over Nostr ────
+    // Same "dumb transport, server.js owns trust" split as Phase C/D: we
+    // subscribe + decrypt; server.js's onFedMessage does the approved-peer gate
+    // and dispatches into the existing fedHandleMessage.
+    if (cfg.fedTransportEnabled && typeof cfg.onFedMessage === 'function') {
+      startFedTransport(pool, cfg, skBytes, pkHex);
+      LOG(`fedmsg transport ENABLED — dm + dm-attachment payloads can route over Nostr (kind ${FEDMSG_KIND}, ttl ${cfg.fedmsgTtlSeconds || 86400}s)`);
+    } else if (cfg.fedTransportEnabled) {
+      LOG(`fedmsg transport requested but no onFedMessage callback wired — skipping`);
+    }
+
+    // Bound send helper for server.js (publishes one encrypted fedmsg to a peer
+    // pubkey). Available only once the pool exists; server.js guards on it.
+    const nostrFedSend = (peerHex, msgObj) =>
+      nostrFedSendImpl(pool, cfg.relays, skBytes, pkHex, peerHex, msgObj, cfg.fedmsgTtlSeconds);
+
     // Return a controller so server.js can drive event-triggered publishes.
     // notePresenceChange is a no-op when presence is off, so callers don't
-    // need to gate.
-    return { notePresenceChange };
+    // need to gate. nostrFedSend routes a payload envelope over Nostr.
+    return { notePresenceChange, nostrFedSend };
   } catch (e) {
     // Absolute backstop: Nostr must NEVER take down v4call.
     ERR(`startup failed (v4call continues normally on Hive-only): ${e.message}`);

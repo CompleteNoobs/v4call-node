@@ -167,6 +167,17 @@ const NOSTR_PRESENCE_THROTTLE_SECONDS  = parseInt(process.env.NOSTR_PRESENCE_THR
 const NOSTR_PRESENCE_HEARTBEAT_SECONDS = parseInt(process.env.NOSTR_PRESENCE_HEARTBEAT_SECONDS || '60');
 // Drop a peer's Nostr presence if we haven't heard from it for N seconds.
 const NOSTR_PRESENCE_TTL_SECONDS       = parseInt(process.env.NOSTR_PRESENCE_TTL_SECONDS       || '300');
+// ── Nostr payload transport — carry dm + dm-attachment over Nostr relays ────
+// Lets cross-server DMs + media attachments deliver when the WS /federation
+// transport is down/disabled. Default OFF until proven; enable on ALL peers
+// together (a peer without it just won't subscribe = graceful degradation).
+// Requires FED_DISCOVERY_MODE=nostr|both (to subscribe) AND FED_PRESENCE_VIA_NOSTR
+// (to know which peer hosts a username) AND the peer's NOSTR_PUBKEY in their
+// signed v4call-server.json (Hive-anchored binding). WS stays the PREFERRED
+// route — Nostr is best-effort store-and-forward (see fedRouteSend: WS-first).
+const NOSTR_FED_TRANSPORT      = (process.env.NOSTR_FED_TRANSPORT || 'false').toLowerCase() === 'true';
+// NIP-40 expiration on fedmsg events so relays GC delivered messages.
+const NOSTR_FEDMSG_TTL_SECONDS = parseInt(process.env.NOSTR_FEDMSG_TTL_SECONDS || '86400');
 
 console.log(`[config] Server:       ${SERVER_NAME} (${SERVER_DOMAIN})`);
 console.log(`[config] Escrow:       @${ESCROW_ACCOUNT}`);
@@ -177,6 +188,13 @@ if (FEDERATION_ENABLED) {
   console.log(`[config] Federation: ENABLED — peers: ${FEDERATION_PEERS.join(', ')}`);
 } else {
   console.log(`[config] Federation: disabled (no FEDERATION_PEERS set)`);
+}
+if (NOSTR_FED_TRANSPORT) {
+  if (NOSTR_SUBSCRIBE_ENABLED && FED_PRESENCE_VIA_NOSTR) {
+    console.log(`[config] Nostr payload transport: ENABLED (dm + dm-attachment over relays, ttl ${NOSTR_FEDMSG_TTL_SECONDS}s)`);
+  } else {
+    console.warn(`[config] ⚠ NOSTR_FED_TRANSPORT=true but needs FED_DISCOVERY_MODE=nostr|both (subscribe=${NOSTR_SUBSCRIBE_ENABLED}) AND FED_PRESENCE_VIA_NOSTR=true (presence=${FED_PRESENCE_VIA_NOSTR}) — transport will NOT route until both are on.`);
+  }
 }
 
 // ── v0.13 Lobby Notice + Anti-Spam Gate (env only; no federation bump) ──────
@@ -1095,8 +1113,162 @@ function recipientStatus(username) {
     if (peer) return { status: 'federated', peer };
   }
   const domain = nostrSeenDomain(username);
-  if (domain) return { status: 'nostr-only', domain };
+  if (domain) {
+    // With the Nostr payload transport on, a Nostr-visible+approved recipient is
+    // genuinely ROUTABLE (dm + dm-attachment ride relays). Without it, Nostr is
+    // visibility-only → 'nostr-only' keeps the existing "WS disabled" UX.
+    if (NOSTR_FED_TRANSPORT) return { status: 'nostr', domain };
+    return { status: 'nostr-only', domain };
+  }
   return { status: 'offline' };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Nostr payload transport (dm + dm-attachment over relays) ─────────────────
+// Mirrors the WS /federation transport: a per-peer "pseudo-socket" lets the SAME
+// fedHandleMessage dispatcher run over Nostr unchanged. server.js owns every
+// trust decision (Hive-anchored pubkey↔domain binding + approval); nostr-fed.mjs
+// stays a dumb transport. WS is PREFERRED — Nostr is the fallback (fedRouteSend).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Inverse of expectedNostrHexForDomain: which approved+verified domain owns this
+// Nostr pubkey? Authenticates an incoming fedmsg. Returns domain | null.
+function domainForNostrPubkey(hex) {
+  if (!hex) return null;
+  for (const [domain, p] of Object.entries(discoveredPeers)) {
+    if (!p || !p.verified) continue;
+    if (p.verified_nostr_hex === hex || p.nostr_pubkey === hex) return domain;
+  }
+  return null;
+}
+
+// Peer escrow for the federated-paid-DM escrow-mismatch guard. WS peer record
+// first (authoritative when connected), else the verified discovered-peer file —
+// so the guard works on a Nostr-only route (no WS peer record exists).
+function peerEscrowForDomain(domain) {
+  const wsPeer = federationPeers[domain];
+  if (wsPeer && wsPeer.escrow) return wsPeer.escrow;
+  const dp = discoveredPeers[domain];
+  return (dp && dp.parsed && dp.parsed.escrow) || null;
+}
+
+// One pseudo-socket per peer domain. Quacks like the WS `ws` the dispatcher
+// expects: `_domain` (logging/fromServer), readyState OPEN, and a send() that
+// re-publishes the reply over Nostr. So fedSend(pseudoWs, reply) inside the
+// dm/dm-attachment handlers (dm-delivered / *-failed / refund-notify) routes back
+// to the sender server automatically. Kept OUT of federationPeers so peerForUser
+// never returns a non-WS peer.
+const nostrPseudoSockets = {};   // domain → pseudo-ws
+function nostrPseudoWsForDomain(domain, peerHex) {
+  const existing = nostrPseudoSockets[domain];
+  if (existing) { existing._peerHex = peerHex; return existing; }
+  const pseudo = {
+    _domain:  domain,
+    _isNostr: true,
+    _peerHex: peerHex,
+    readyState: 1,                 // WebSocket.OPEN — satisfies fedSend's gate
+    send(str) {
+      try {
+        const obj = JSON.parse(str);
+        if (nostrFedController && nostrFedController.nostrFedSend) {
+          nostrFedController.nostrFedSend(this._peerHex, obj);
+        }
+      } catch (e) { console.error('[nostr] pseudo-ws send failed:', e.message); }
+    },
+  };
+  nostrPseudoSockets[domain] = pseudo;
+  return pseudo;
+}
+
+// Send a federation envelope to an approved peer over Nostr. Returns bool.
+function nostrFedSendToDomain(domain, msg) {
+  if (!NOSTR_FED_TRANSPORT) return false;
+  if (!domain || !approvedPeers.has(domain)) return false;
+  const hex = expectedNostrHexForDomain(domain);   // Hive-anchored, verified
+  if (!hex) return false;
+  if (!nostrFedController || !nostrFedController.nostrFedSend) return false;
+  nostrFedController.nostrFedSend(hex, msg);
+  return true;
+}
+
+// Transport-agnostic router for a federation envelope addressed to `username`.
+// WS first (lowest latency, guaranteed once connected); Nostr fallback (WS down/
+// disabled but peer Nostr-visible + approved + transport on). Returns
+// { via:'ws'|'nostr', domain } or null when not routable.
+function fedRouteSend(username, msg) {
+  if (FEDERATION_ENABLED) {
+    const peer = peerForUser(username);
+    if (peer && peer.ws) { fedSend(peer.ws, msg); return { via: 'ws', domain: peer.domain }; }
+  }
+  if (NOSTR_FED_TRANSPORT) {
+    const domain = nostrSeenDomain(username);   // already gated on approval + Phase D
+    if (domain && nostrFedSendToDomain(domain, msg)) return { via: 'nostr', domain };
+  }
+  return null;
+}
+
+// Event-id dedup, time-windowed so it can't grow unbounded. LOAD-BEARING FOR
+// MONEY: ledgerPayment/sendFromEscrow are NOT idempotent, so a relay-redelivered
+// fedmsg that re-ran a paid path would DOUBLE-DISBURSE. Drop dup ids BEFORE
+// dispatch. nostr-fed.mjs has its own per-sub Set; this is the authoritative
+// cross-resub guard. Sized to the fedmsg TTL.
+const seenFedEventIds = new Map();   // eventId → expiryMs
+function fedEventSeen(eventId) {
+  if (!eventId) return false;
+  if (seenFedEventIds.has(eventId)) return true;
+  seenFedEventIds.set(eventId, Date.now() + NOSTR_FEDMSG_TTL_SECONDS * 1000);
+  return false;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, exp] of seenFedEventIds) if (exp < now) seenFedEventIds.delete(id);
+}, 5 * 60 * 1000).unref();
+
+// Per-domain ordering queue mirroring the WS per-socket Promise chain (strict
+// in-order per peer; a slow peer can't head-of-line-block others).
+const nostrFedQueues = {};   // domain → Promise chain
+function enqueueNostrFed(domain, fn) {
+  const prev = nostrFedQueues[domain] || Promise.resolve();
+  const next = prev.then(fn).catch(e => console.error('[nostr] fedmsg handler error:', e.message));
+  nostrFedQueues[domain] = next;
+  return next;
+}
+
+// Payload-only whitelist — guarantees hello / call / room / presence NEVER route
+// over Nostr even if a buggy/hostile peer tries.
+const NOSTR_FEDMSG_ALLOWED = new Set([
+  'dm', 'dm-attachment', 'dm-delivered', 'dm-failed', 'dm-attachment-failed',
+]);
+
+// Inbound fedmsg from nostr-fed.mjs (already decrypted). Authenticate sender
+// pubkey → approved domain, dedup, then dispatch through the SAME fedHandleMessage
+// the WS path uses, via a pseudo-socket. Never throws.
+function onNostrFedMessage({ fromPubkey, eventId, innerMsg }) {
+  try {
+    if (!NOSTR_FED_TRANSPORT) return;
+    const domain = domainForNostrPubkey(fromPubkey);
+    if (!domain || !approvedPeers.has(domain)) {
+      console.warn(`[nostr] fedmsg dropped — pubkey ${String(fromPubkey).slice(0,12)}… not bound to an approved peer`);
+      return;
+    }
+    // Defence-in-depth: binding must match the Hive-anchored expected hex.
+    if (expectedNostrHexForDomain(domain) !== fromPubkey) {
+      console.warn(`[nostr] fedmsg dropped — pubkey/domain binding mismatch for @${domain}`);
+      return;
+    }
+    if (!innerMsg || !NOSTR_FEDMSG_ALLOWED.has(innerMsg.type)) {
+      console.warn(`[nostr] fedmsg dropped — type '${innerMsg && innerMsg.type}' not allowed over Nostr (from @${domain})`);
+      return;
+    }
+    if (fedEventSeen(eventId)) {
+      console.log(`[nostr] fedmsg dropped — duplicate event ${String(eventId).slice(0,12)}… (from @${domain})`);
+      return;
+    }
+    const pseudo = nostrPseudoWsForDomain(domain, fromPubkey);
+    enqueueNostrFed(domain, () => fedHandleMessage(pseudo, JSON.stringify(innerMsg)));
+  } catch (e) {
+    console.error('[nostr] onNostrFedMessage error (non-fatal):', e.message);
+  }
 }
 
 function roomsSnapshot() {
@@ -3041,11 +3213,12 @@ io.on('connection', (socket) => {
 
     const recipient    = lobbyUsers[to];
     const federatedTo  = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
-    if (!recipient && !federatedTo) {
+    // Nostr payload-transport fallback: WS has no route but the recipient is
+    // visible+approved via Nostr presence and the transport is on → route over Nostr.
+    const nostrRoute   = (!recipient && !federatedTo && NOSTR_FED_TRANSPORT) ? nostrSeenDomain(to) : null;
+    if (!recipient && !federatedTo && !nostrRoute) {
       // v0.16.18 — Distinguish "truly offline" from "visible via Nostr but WS
-      // federation isn't connected yet". The latter is a transient state after
-      // a server restart while WS reconnects; surfacing it as "not online"
-      // misleads users into thinking the recipient is unreachable.
+      // federation isn't connected yet" (transient after restart) / disabled.
       const nostrDomain = nostrSeenDomain(to);
       if (nostrDomain) {
         if (FEDERATION_ENABLED) {
@@ -3053,11 +3226,10 @@ io.on('connection', (socket) => {
           socket.emit('lobby-dm-error',
             `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Try again in ~30s.`);
         } else {
-          // WS federation is disabled in .env — Nostr presence shows the user
-          // but there's no transport to deliver. Tell the truth.
-          console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation is disabled on this server`);
+          // WS disabled AND Nostr payload transport off — no transport to deliver.
+          console.warn(`[text] @${from} → @${to}: visible via Nostr on ${nostrDomain} but WS federation disabled + Nostr payload transport off`);
           socket.emit('lobby-dm-error',
-            `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS server-to-server federation disabled — cross-server DMs aren't routable. Ask the operator to enable FEDERATION_PEERS in .env.`);
+            `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS federation disabled and the Nostr payload transport off — cross-server DMs aren't routable. Ask the operator to enable FEDERATION_PEERS or NOSTR_FED_TRANSPORT in .env.`);
         }
         return;
       }
@@ -3068,7 +3240,11 @@ io.on('connection', (socket) => {
       socket.emit('lobby-dm-error', `@${to} is not online`);
       return;
     }
-    console.log(`[text] @${from} → @${to}: routing ${recipient ? 'local' : `federated via ${federatedTo.domain}`}`);
+    // Routing context that works for both WS and Nostr federated routes.
+    const routeDomain = recipient ? null : (federatedTo ? federatedTo.domain : nostrRoute);
+    const routeEscrow = recipient ? null : (federatedTo ? federatedTo.escrow : peerEscrowForDomain(nostrRoute));
+    const isFederated = !!(federatedTo || nostrRoute);
+    console.log(`[text] @${from} → @${to}: routing ${recipient ? 'local' : `federated via ${routeDomain}${nostrRoute ? ' (nostr)' : ''}`}`);
 
     // Fetch recipient's rates and resolve applicable text rate for this sender
     const calleeRates = await fetchRates(to);
@@ -3095,11 +3271,11 @@ io.on('connection', (socket) => {
     // For paid federated DMs, the callee's rates-post escrow MUST match the
     // peer server's own ESCROW_ACCOUNT — otherwise the peer holds no key to
     // disburse from it. Fail loudly instead of silently dropping the message.
-    if (federatedTo && textRate >= 0.001 && federatedTo.escrow && federatedTo.escrow !== calleeEscrow) {
+    if (isFederated && textRate >= 0.001 && routeEscrow && routeEscrow !== calleeEscrow) {
       socket.emit('lobby-dm-error',
         `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ` +
-        `${federatedTo.domain} controls @${federatedTo.escrow}. They need to ` +
-        `update their rates post to point at @${federatedTo.escrow} (or switch servers) ` +
+        `${routeDomain} controls @${routeEscrow}. They need to ` +
+        `update their rates post to point at @${routeEscrow} (or switch servers) ` +
         `for paid DMs to work across federation.`);
       return;
     }
@@ -3168,9 +3344,9 @@ io.on('connection', (socket) => {
     if (recipient) {
       io.to(recipient.socketId).emit('lobby-dm', { from, ciphertext, signature, timestamp, textPaid: textPaid || 0, textCurrency: cur });
       console.log(`[text] @${from} → @${to}: delivered locally (sid ${recipient.socketId.slice(0,6)}…)`);
-    } else if (federatedTo) {
-      const wsOk = federatedTo.ws && federatedTo.ws.readyState === 1;  // WebSocket.OPEN
-      fedSend(federatedTo.ws, {
+    } else {
+      // Federated — WS first, Nostr fallback (fedRouteSend picks the transport).
+      const routed = fedRouteSend(to, {
         type: 'dm',
         from, to, ciphertext, signature, timestamp,
         textPaid:    textPaid    || 0,
@@ -3179,7 +3355,7 @@ io.on('connection', (socket) => {
         msgId:       msgId       || null,
         fromServer:  SERVER_DOMAIN
       });
-      console.log(`[text] @${from} → @${to}@${federatedTo.domain}: fedSend(type=dm) issued (ws.open=${wsOk}, paid=${textPaid || 0} ${cur})`);
+      console.log(`[text] @${from} → @${to}@${routeDomain}: dm via ${routed ? routed.via : 'NONE (no route)'} (paid=${textPaid || 0} ${cur})`);
     }
     socket.emit('lobby-dm-sent', { to, textPaid: textPaid || 0, textCurrency: cur });
 
@@ -4961,23 +5137,26 @@ io.on('connection', (socket) => {
 
       const recipient   = lobbyUsers[to];
       const federatedTo = recipient ? null : (FEDERATION_ENABLED ? peerForUser(to) : null);
-      if (!recipient && !federatedTo) {
-        // Same Nostr-only distinction as lobby-dm. Critical for attachments
-        // because by the time the server sees the envelope, the sender has
-        // already paid BOTH the paid-DM rate AND the ipfs-gate CNOOBS/TEST
-        // fee. Surface the transient state clearly so the user knows to retry
-        // rather than thinking the payment was wasted.
+      // Nostr payload-transport fallback (same as lobby-dm).
+      const nostrRoute  = (!recipient && !federatedTo && NOSTR_FED_TRANSPORT) ? nostrSeenDomain(to) : null;
+      if (!recipient && !federatedTo && !nostrRoute) {
+        // Same Nostr distinction as lobby-dm. Critical for attachments because by
+        // the time the server sees the envelope, the sender has already paid BOTH
+        // the paid-DM rate AND the ipfs-gate/Pinata fee. Surface the state clearly.
         const nostrDomain = nostrSeenDomain(to);
         if (nostrDomain) {
           const errText = FEDERATION_ENABLED
             ? `⏳ @${to} is shown online via Nostr presence (${nostrDomain}), but federation is still reconnecting. Attachment is uploaded — try sending again in ~30s and your payment will route through.`
-            : `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS server-to-server federation disabled — cross-server attachments aren't routable. Ask the operator to enable FEDERATION_PEERS in .env.`;
+            : `@${to} is on ${nostrDomain} (visible via Nostr presence), but this server has WS federation disabled and the Nostr payload transport off — cross-server attachments aren't routable. Ask the operator to enable FEDERATION_PEERS or NOSTR_FED_TRANSPORT in .env.`;
           socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: errText });
           return;
         }
         socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `@${to} is not online` });
         return;
       }
+      const routeDomain = recipient ? null : (federatedTo ? federatedTo.domain : nostrRoute);
+      const routeEscrow = recipient ? null : (federatedTo ? federatedTo.escrow : peerEscrowForDomain(nostrRoute));
+      const isFederated = !!(federatedTo || nostrRoute);
 
       // Resolve recipient's text rate against this sender (same path lobby-dm uses)
       const calleeRates = await fetchRates(to);
@@ -5001,10 +5180,10 @@ io.on('connection', (socket) => {
       // Escrow-mismatch guard for paid federated attachments — mirrors lobby-dm.
       // If the recipient's rate-post escrow isn't controlled by the peer, the
       // peer can't disburse and the caller's funds would orphan. Fail loudly.
-      if (federatedTo && textRate >= RATE_FLOOR && federatedTo.escrow && federatedTo.escrow !== calleeEscrow) {
+      if (isFederated && textRate >= RATE_FLOOR && routeEscrow && routeEscrow !== calleeEscrow) {
         socket.emit('dm-attachment-error', {
           msgId: env.msgId || null,
-          error: `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ${federatedTo.domain} controls @${federatedTo.escrow}. They need to update their rates post for paid attachments to work across federation.`
+          error: `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ${routeDomain} controls @${routeEscrow}. They need to update their rates post for paid attachments to work across federation.`
         });
         return;
       }
@@ -5067,7 +5246,7 @@ io.on('connection', (socket) => {
 
           console.log(`[dm-attachment] @${from} → @${to}: paid ${env.textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
         } else {
-          console.log(`[dm-attachment] @${from} → @${to}@${federatedTo.domain}: paid ${env.textPaid} ${cur} (forwarding to peer for disburse)`);
+          console.log(`[dm-attachment] @${from} → @${to}@${routeDomain}: paid ${env.textPaid} ${cur} (forwarding to peer for disburse)`);
         }
       }
 
@@ -5080,11 +5259,11 @@ io.on('connection', (socket) => {
         io.to(recipient.socketId).emit('dm-attachment', wireEnv);
         socket.emit('dm-attachment', wireEnv);
       } else {
-        // Federated delivery — forward via federation. Echo to sender locally
-        // so their bubble renders immediately; the peer will deliver to the
-        // recipient. On peer-side reject we get back `dm-attachment-failed`
+        // Federated delivery — WS first, Nostr fallback (fedRouteSend). Echo to
+        // sender locally so their bubble renders immediately; the peer delivers
+        // to the recipient. On peer-side reject we get back `dm-attachment-failed`
         // which surfaces as an error to the sender via the federation handler.
-        fedSend(federatedTo.ws, {
+        const routed = fedRouteSend(to, {
           type: 'dm-attachment',
           from, to,
           envelope: wireEnv,
@@ -5094,6 +5273,7 @@ io.on('connection', (socket) => {
           textCurrency: cur,
           fromServer:   SERVER_DOMAIN
         });
+        console.log(`[dm-attachment] @${from} → @${to}@${routeDomain}: attachment via ${routed ? routed.via : 'NONE (no route)'} (cid ${env.cid.slice(0,12)}…)`);
         socket.emit('dm-attachment', wireEnv);
       }
 
@@ -5129,7 +5309,7 @@ io.on('connection', (socket) => {
   // charging when the user is visible via Nostr but WS federation isn't
   // connected yet. Without this, a paid-DM or paid-attachment to a Nostr-only
   // user would burn both fees with no delivery.
-  socket.on('dm-precheck', ({ to }, cb) => {
+  socket.on('dm-precheck', ({ to, purpose }, cb) => {
     if (!socket._username || !to) {
       if (cb) cb({ status: 'offline' });
       return;
@@ -5139,8 +5319,19 @@ io.on('connection', (socket) => {
     // federationEnabled tells the client whether WS server-to-server fed is
     // even configured — when false and the recipient is nostr-only, there's
     // literally no transport (don't tell the user to "wait for reconnect").
-    if (s.status === 'local')     { if (cb) cb({ status: 'local' });                     return; }
-    if (s.status === 'federated') { if (cb) cb({ status: 'federated', domain: s.peer.domain }); return; }
+    // purpose: 'dm' (default) can ride WS OR the Nostr payload transport;
+    // 'call' is WS-ONLY (calls aren't carried over Nostr — deferred scope), so
+    // a Nostr-routable recipient must report 'nostr-only' to the call path.
+    if (s.status === 'local')     { if (cb) cb({ status: 'local' });                              return; }
+    if (s.status === 'federated') { if (cb) cb({ status: 'federated', domain: s.peer.domain });   return; }
+    if (s.status === 'nostr') {
+      // Routable via the Nostr payload transport. DM/attachment → report
+      // 'federated' (client treats as sendable, no client change). Call →
+      // 'nostr-only' (existing graceful "calls can't route" UX).
+      if (purpose === 'call') { if (cb) cb({ status: 'nostr-only', domain: s.domain, federationEnabled: FEDERATION_ENABLED }); return; }
+      if (cb) cb({ status: 'federated', domain: s.domain, via: 'nostr' });
+      return;
+    }
     if (s.status === 'nostr-only'){ if (cb) cb({ status: 'nostr-only', domain: s.domain, federationEnabled: FEDERATION_ENABLED }); return; }
     if (cb) cb({ status: 'offline' });
   });
@@ -6816,6 +7007,12 @@ if (FEDERATION_ENABLED) {
       presenceHeartbeatMs: NOSTR_PRESENCE_HEARTBEAT_SECONDS * 1000,
       getLocalUsers:    getLocalOnlineUsernamesForPresence,
       onPresence:       recordNostrPresence,
+      // Payload transport — carry dm + dm-attachment over Nostr (default off).
+      // Needs subscribe (to receive) + presence (so the send-side router knows
+      // which peer hosts a username). onNostrFedMessage owns the trust gate.
+      fedTransportEnabled: NOSTR_FED_TRANSPORT && NOSTR_SUBSCRIBE_ENABLED,
+      fedmsgTtlSeconds:    NOSTR_FEDMSG_TTL_SECONDS,
+      onFedMessage:        onNostrFedMessage,
     });
   }).then(controller => {
     // Module returns a controller on success (presence publish trigger etc.).
