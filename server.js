@@ -2770,11 +2770,32 @@ app.get('/join-token', (req, res) => {
   res.json({ username: t.username, pubKey: t.pubKey, roomName: t.roomName });
 });
 
-// TODO(landing-page): add a public GET /api/info that returns
-//   { server, escrow, platformFee, version, federation }
-// so index.html (landing page) can display this server's escrow fee
-// without an operator having to edit CONFIG.SERVER_FEE_PERCENT by hand.
-// Permissive CORS. No auth. See TODO.md for the proposed shape.
+// Public server-info endpoint — no auth, CORS-open so the landing page (and
+// other apps / a cross-server directory scanner) can read this server's live
+// config. The platform fee is the operator's MINIMUM (a floor — the actual cut
+// also depends on each user's rate post; see Key Design Decision #2). Reads
+// straight from env, so it's always current: change DEFAULT_PLATFORM_FEE and
+// restart and index.html reflects it on next load with no manual edit.
+app.get('/api/info', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');      // public read-only; safe to share
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    name:                    SERVER_NAME,
+    domain:                  SERVER_DOMAIN,
+    hive_account:            SERVER_HIVE_ACCOUNT,
+    escrow:                  ESCROW_ACCOUNT,
+    platform_fee:            PLATFORM_FEE,                                  // fraction, e.g. 0.10
+    platform_fee_percent:    parseFloat((PLATFORM_FEE * 100).toFixed(2)),  // e.g. 10
+    platform_fee_is_minimum: true,                                         // it's a floor, not a fixed rate
+    protocol_version:        FEDERATION_VERSION,
+    software:                process.env.SOFTWARE_VERSION || null,         // optional, operator-set
+    federation: {
+      wss_enabled:     FEDERATION_ENABLED,
+      nostr_presence:  FED_PRESENCE_VIA_NOSTR,
+      nostr_transport: NOSTR_FED_TRANSPORT
+    }
+  });
+});
 
 
 // ─────────────────────────────────────────────────────────────────────────────
