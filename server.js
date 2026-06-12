@@ -1271,19 +1271,35 @@ function onNostrFedMessage({ fromPubkey, eventId, innerMsg }) {
   }
 }
 
-function roomsSnapshot() {
+// Whether `viewerUser` is on room r's allowlist, checking bare + canonical
+// (federated-home and this-server canonical) forms.
+function viewerIsAllowlisted(r, viewerUser, viewerHome) {
+  if (!viewerUser) return false;
+  if (r.allowlist.has(viewerUser)) return true;
+  if (viewerHome && r.allowlist.has(`${viewerUser}@${viewerHome}`)) return true;
+  if (r.allowlist.has(`${viewerUser}@${SERVER_DOMAIN.toLowerCase()}`)) return true;
+  return false;
+}
+
+// Per-viewer rooms snapshot. The full allowlist is NEVER broadcast globally —
+// it exposed every room's invitee list to all connected users (privacy leak).
+// Each viewer learns only whether THEY are allowlisted + the invitee count;
+// current room members still get the full allowlist via the per-member
+// room-info emit (emitRoomInfoToMembers).
+function roomsSnapshotFor(viewerUser, viewerHome) {
   return Object.entries(rooms).map(([name, r]) => ({
     name,
-    creator:     r.creator,
-    memberCount: r.members.length,
-    isCall:      r.isCall || false,
-    tokenGate:   r.tokenGate || null,
-    allowlist:   [...r.allowlist].map(username => ({
-      username,
-      online: !!lobbyUsers[username] || r.members.some(m => m.username === username)
-    }))
+    creator:        r.creator,
+    memberCount:    r.members.length,
+    isCall:         r.isCall || false,
+    tokenGate:      r.tokenGate || null,
+    allowlistCount: r.allowlist.size,
+    iAmAllowlisted: viewerIsAllowlisted(r, viewerUser, viewerHome)
   }));
 }
+
+// Anonymous snapshot (no viewer) — used for sockets that haven't authenticated.
+function roomsSnapshot() { return roomsSnapshotFor(null, null); }
 
 // Per-member room-info emit so banlist visibility can differ per recipient
 // (creator always sees full banlist; other members see it only when
@@ -1306,13 +1322,24 @@ function emitRoomInfoToMembers(r, roomName) {
 // v0.15 — clear the room's broadcast spotlight if `username` is the current
 // target. Called whenever a member leaves (leave-room / disconnect / ban).
 function clearSpotlightIfMember(r, room, username) {
-  if (r.spotlight && r.spotlight === username) {
+  if (!r.spotlight || !username) return;
+  const norm = String(username).trim().toLowerCase().replace(/^@/, '');
+  const bare = norm.includes('@') ? norm.split('@')[0] : norm;
+  const spot = String(r.spotlight).trim().toLowerCase();
+  if (spot === norm || spot === bare) {
     r.spotlight = null;
     io.to(room).emit('room-spotlight-changed', { target: null, targetSocketId: null });
   }
 }
 
-function broadcastRooms() { io.emit('lobby-rooms', roomsSnapshot()); }
+// Emit a per-recipient rooms snapshot so each user only sees their own
+// allowlist membership + an invitee count, never every room's full invitee
+// list (privacy — see roomsSnapshotFor).
+function broadcastRooms() {
+  for (const [, s] of io.sockets.sockets) {
+    s.emit('lobby-rooms', roomsSnapshotFor(s._username, s._homeServer));
+  }
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2146,6 +2173,12 @@ const activePayments = {};
 
 const creditTimers = {}; // callId → intervalId
 
+function clearCreditBurn(callId) {
+  if (!creditTimers[callId]) return;
+  clearInterval(creditTimers[callId]);
+  delete creditTimers[callId];
+}
+
 function startCreditBurn(callId, roomName) {
   const payment = activePayments[callId];
   if (!payment || !payment.ratePerHour) return; // free call — nothing to burn
@@ -2156,7 +2189,7 @@ function startCreditBurn(callId, roomName) {
 
   creditTimers[callId] = setInterval(async () => {
     const p = activePayments[callId];
-    if (!p) { clearInterval(creditTimers[callId]); return; }
+    if (!p) { clearCreditBurn(callId); return; }
 
     const elapsed         = Date.now() - (p.startTime || Date.now());
     const burned          = elapsed * ratePerMs;
@@ -2182,8 +2215,7 @@ function startCreditBurn(callId, roomName) {
     }
 
     if (p.creditRemaining <= 0) {
-      clearInterval(creditTimers[callId]);
-      delete creditTimers[callId];
+      clearCreditBurn(callId);
       console.log(`[credit] Call ${callId} ran out of credit — disconnecting`);
       io.to(roomName).emit('credit-exhausted', { callId });
       await processCallEnd(callId, roomName, io, lobbyUsers, 'credit_exhausted');
@@ -2192,10 +2224,7 @@ function startCreditBurn(callId, roomName) {
 }
 
 function stopCreditBurn(callId) {
-  if (creditTimers[callId]) {
-    clearInterval(creditTimers[callId]);
-    delete creditTimers[callId];
-  }
+  clearCreditBurn(callId);
 }
 
 
@@ -2207,16 +2236,22 @@ function stopCreditBurn(callId) {
 
 const callCooldowns = {}; // "caller->callee" → timestamp of last attempt
 
-function checkCallCooldown(caller, callee) {
+function peekCallCooldown(caller, callee) {
   const key  = `${caller}->${callee}`;
   const last = callCooldowns[key] || 0;
   const age  = Date.now() - last;
   if (age < CALL_COOLDOWN_MS) {
     return { allowed: false, waitMs: CALL_COOLDOWN_MS - age };
   }
-  callCooldowns[key] = Date.now();
   return { allowed: true };
 }
+
+function recordCallCooldown(caller, callee) {
+  callCooldowns[`${caller}->${callee}`] = Date.now();
+}
+
+// Back-compat alias if anything else referenced the old name
+const checkCallCooldown = peekCallCooldown;
 
 // Clean up entries older than 5 minutes
 setInterval(() => {
@@ -2261,6 +2296,38 @@ async function hivePost(body, nodes = HIVE_API_NODES) {
   }
   console.warn(`[hive] All nodes exhausted for ${method} (tried ${nodes.length})`);
   return null;
+}
+
+// ── Identity verification cache + helper (anti-spoofing for lobby-join) ───────
+// Maps a verified Hive account → the posting pubkey we last confirmed on-chain.
+const verifiedPostingKeys = {}; // username(lowercase) → { pubKey, ts }
+const IDENTITY_VERIFY_TTL_MS = 60 * 60 * 1000; // re-verify at most hourly per (user,key)
+
+// Returns true if `pubKey` matches ANY of the account's on-chain posting
+// key_auths (not just the first — multi-key accounts are legitimate); false if
+// the account exists but the key isn't authorized, or the account doesn't
+// exist. THROWS if no Hive node could give a definitive answer, so the caller
+// can fail open (a node outage must never lock users out).
+async function verifyAccountPostingKey(username, pubKey) {
+  const uname = String(username || '').toLowerCase();
+  if (!uname || !pubKey) return false;
+  const cached = verifiedPostingKeys[uname];
+  if (cached && cached.pubKey === pubKey && (Date.now() - cached.ts) < IDENTITY_VERIFY_TTL_MS) {
+    return true;
+  }
+  const data = await hivePost({
+    jsonrpc: '2.0', method: 'condenser_api.get_accounts',
+    params: [[uname]], id: 1
+  });
+  if (!data || !Array.isArray(data.result)) {
+    const e = new Error('no definitive get_accounts response'); e._failOpen = true; throw e;
+  }
+  const acct = data.result[0];
+  if (!acct) return false; // definitively no such Hive account
+  const keyAuths = acct.posting?.key_auths || [];
+  const match = keyAuths.some(ka => Array.isArray(ka) && ka[0] === pubKey);
+  if (match) { verifiedPostingKeys[uname] = { pubKey, ts: Date.now() }; return true; }
+  return false; // account exists but this key isn't a posting authority
 }
 
 
@@ -3009,8 +3076,9 @@ app.get('/admin/discovery-test', async (req, res) => {
   });
 });
 
-// GET /debug-state — shows current lobby and room state (no auth, safe info only)
+// GET /debug-state — shows current lobby and room state (admin key required)
 app.get('/debug-state', (req, res) => {
+  if (!_requireAdmin(req, res)) return;
   res.json({
     lobbyUsers: Object.entries(lobbyUsers).map(([username, u]) => ({
       username, socketId: u.socketId, invisible: u.invisible, inCall: u.inCall || null
@@ -3027,6 +3095,7 @@ app.get('/debug-state', (req, res) => {
 // Useful for testing rate posts without making actual calls.
 // Clears cache so you always get a fresh fetch.
 app.get('/debug-rates/:username', async (req, res) => {
+  if (!_requireAdmin(req, res)) return;
   delete rateCache[req.params.username];
   const rates = await fetchRates(req.params.username);
   if (!rates) {
@@ -3091,7 +3160,8 @@ io.on('connection', (socket) => {
 
   // ── LOBBY ──────────────────────────────────────────────────────────────────
 
-  socket.on('lobby-join', ({ username, pubKey }) => {
+  socket.on('lobby-join', async ({ username, pubKey }) => {
+    if (!username || !pubKey) return;
     socket._username    = username;
     socket._pubKey      = pubKey;
     socket._invisible   = false;
@@ -3110,7 +3180,7 @@ io.on('connection', (socket) => {
     }
 
     socket.emit('lobby-users', lobbySnapshot());
-    socket.emit('lobby-rooms', roomsSnapshot());
+    socket.emit('lobby-rooms', roomsSnapshotFor(username, socket._homeServer));
     socket.emit('lobby-config', {
       serverName: SERVER_NAME,
       serverDomain: SERVER_DOMAIN,
@@ -3187,6 +3257,32 @@ io.on('connection', (socket) => {
     chatUpdateSeen(username);
 
     console.log(`@${username} entered lobby`);
+
+    // ── Identity verification (anti-spoofing) ──────────────────────────────
+    // The browser checks the posting key client-side at login, but the server
+    // must not trust a self-reported identity. Verify the claimed posting
+    // pubkey against the account's on-chain posting authorities AFTER the
+    // synchronous setup above — so a concurrent join/chat on this socket still
+    // sees the identity, and a Hive-node outage can never block logins.
+    //   confirmed mismatch / no such account → boot the socket
+    //   node error / could-not-verify        → fail OPEN (log + keep)
+    // Checks ALL key_auths, so multi-posting-key accounts aren't falsely rejected.
+    try {
+      const ok = await verifyAccountPostingKey(username, pubKey);
+      if (ok === false) {
+        console.warn(`[lobby-join] Rejected @${username} — posting key not authorized on chain`);
+        socket.emit('lobby-join-rejected', {
+          reason: 'Identity verification failed — your posting public key does not match this Hive account. Refresh and log in again.'
+        });
+        if (lobbyUsers[username] && lobbyUsers[username].socketId === socket.id) delete lobbyUsers[username];
+        socket._username = null; socket._pubKey = null; socket._room = null;
+        if (FEDERATION_ENABLED) fedAnnounceUserOffline(username);
+        broadcastLobby();
+        socket.disconnect(true);
+      }
+    } catch (e) {
+      console.warn(`[lobby-join] identity check could not complete for @${username} — proceeding (fail-open):`, e.message);
+    }
   });
 
   socket.on('lobby-invisible', (invisible) => {
@@ -3722,7 +3818,7 @@ io.on('connection', (socket) => {
 
   // ── DIRECT CALL — initiate ─────────────────────────────────────────────────
 
-  socket.on('call-user', ({ callee, callType, ringFeePaid, callId }) => {
+  socket.on('call-user', async ({ callee, callType, ringFeePaid, callId }) => {
     const caller = socket._username;
     if (!caller) {
       socket.emit('call-failed', { reason: 'Session not found — please refresh.' });
@@ -3737,7 +3833,7 @@ io.on('connection', (socket) => {
 
     // Free-ring cooldown (paid rings bypass this — ring fee is the skin in the game)
     if (!ringFeePaid || ringFeePaid === 0) {
-      const cool = checkCallCooldown(caller, callee);
+      const cool = peekCallCooldown(caller, callee);
       if (!cool.allowed) {
         const waitSec = Math.ceil(cool.waitMs / 1000);
         socket.emit('call-failed', { reason: `Please wait ${waitSec}s before calling @${callee} again.` });
@@ -3752,20 +3848,37 @@ io.on('connection', (socket) => {
     // (see comment in lobby-dm handler). We only bother checking when a ring
     // fee was paid; free calls don't care about disbursement.
     if (federatedCallee && ringFeePaid > 0) {
-      // Use an async lookup inline — we already fetched rates client-side for
-      // the payment flow, but double-check here before routing the invite.
-      fetchRates(callee).then(r => {
+      // Verify the escrow match BEFORE routing the invite (was fire-and-forget,
+      // so the invite could go out before this resolved). On a real mismatch we
+      // refund the ring fee and stop — the call never reaches the callee.
+      try {
+        const r = await fetchRates(callee);
         const declaredEscrow = r?.escrow || null;
         if (declaredEscrow && federatedCallee.escrow && declaredEscrow !== federatedCallee.escrow) {
-          socket.emit('call-failed', {
-            reason: `⚠ @${callee}'s rates post declares escrow @${declaredEscrow}, ` +
-              `but ${federatedCallee.domain} controls @${federatedCallee.escrow}. ` +
-              `Funds paid cannot be disbursed. Contact @${callee} to update their rates.`
-          });
+          const msg =
+            `⚠ @${callee}'s rates post declares escrow @${declaredEscrow}, ` +
+            `but ${federatedCallee.domain} controls @${federatedCallee.escrow}. ` +
+            `Funds paid cannot be disbursed. Contact @${callee} to update their rates.`;
+          if (callId) {
+            const refundMemo = `v4call:refund:${callId}:escrow_mismatch`;
+            ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+            sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(ref => {
+              socket.emit('call-failed', {
+                reason: msg + (ref.success ? ` Ring fee refunded.` : ` Refund pending — contact support.`),
+                refunded: ref.success
+              });
+              if (ref.success) ledgerPaymentUpdate(callId, 'refund', 'sent', ref.txId);
+            }).catch(e => console.error('[call-user] escrow-mismatch refund failed:', e.message));
+          } else {
+            socket.emit('call-failed', { reason: msg });
+          }
+          return;
         }
-      }).catch(() => {});
-      // Let the rest of the flow proceed — worst case the clean error reaches
-      // the user before the callee's server rejects the on-chain re-verify.
+      } catch (e) {
+        console.warn('[call-user] escrow pre-check fetch failed:', e.message);
+        socket.emit('call-failed', { reason: `Could not verify @${callee}'s rates — try again.` });
+        return;
+      }
     }
 
     // Callee must be online (locally or on a federated peer)
@@ -3845,6 +3958,11 @@ io.on('connection', (socket) => {
     if (lobbyUsers[caller]) lobbyUsers[caller].inCall = roomName;
     if (lobbyUsers[callee]) lobbyUsers[callee].inCall = roomName;
     socket._pendingCall = { roomName, callee, federatedTo: federatedCallee?.domain || null };
+
+    // Cooldown only after we actually created the ring — failed pre-checks above must not consume it.
+    if (!ringFeePaid || ringFeePaid === 0) {
+      recordCallCooldown(caller, callee);
+    }
 
     console.log(`📞 @${caller} → @${callee}${federatedCallee ? '@' + federatedCallee.domain : ''} (${callType}) room: ${roomName}`);
 
@@ -4175,6 +4293,21 @@ io.on('connection', (socket) => {
   // ── ROOM JOINING ───────────────────────────────────────────────────────────
 
   socket.on('join', async ({ room, username, pubKey, homeServer }) => {
+    // Enforce that the join uses THIS socket's authenticated identity (set by
+    // lobby-join), not a client-supplied name. Without this, a logged-in socket
+    // could join as any username it puts in the payload.
+    const authUser = socket._username;
+    const authKey  = socket._pubKey;
+    if (!authUser || !authKey) {
+      socket.emit('join-rejected', { room, reason: 'Not authenticated — lobby-join first.' });
+      return;
+    }
+    if (username !== authUser || pubKey !== authKey) {
+      socket.emit('join-rejected', { room, reason: 'Identity mismatch — please refresh.' });
+      return;
+    }
+    username = authUser;
+    pubKey   = authKey;
     // v0.16 Part B — federated joiners send homeServer (their own server's
     // domain). The host server validates against the allowlist's canonical
     // form ('user@server.com'). Token-gate (chain check) uses the bare
@@ -4196,19 +4329,13 @@ io.on('connection', (socket) => {
       }
     }
 
-    // 2. Auto-create room on first join (matches v0.13 behaviour).
+    // 2. Room must already exist — join does not create rooms (prevents name
+    // squatting: a client could otherwise auto-create any room name and become
+    // its admin just by joining). Legitimate rooms are created server-side by
+    // room-create / call-invite / room-import before the client emits join.
     if (!rooms[room]) {
-      rooms[room] = {
-        creator:           username,
-        allowlist:         new Set([username]),
-        banlist:           new Set(),
-        tokenGate:         null,
-        banlistVisibility: 'admin',
-        paidInvitees:      new Map(),
-        members:           [],
-        spotlight:         null,
-        createdAt:         new Date()
-      };
+      socket.emit('join-rejected', { room, reason: 'Room does not exist — ask the admin for an invite or correct name.' });
+      return;
     }
     const r = rooms[room];
 
@@ -4221,9 +4348,9 @@ io.on('connection', (socket) => {
     // so the canonical match wins; the bare-fallback is only for 1:1 calls.
     let joinedVia = null;
     if      (r.allowlist.has(canonicalUser))            joinedVia = 'allowlist';
-    else if (isFed && r.allowlist.has(username))        joinedVia = 'allowlist'; // 1:1 call legacy path
+    else if (isFed && r.isCall && r.allowlist.has(username)) joinedVia = 'allowlist'; // 1:1 call legacy only
     else if (r.paidInvitees.has(canonicalUser))         joinedVia = 'paid';      // v0.17 hook
-    else if (isFed && r.paidInvitees.has(username))     joinedVia = 'paid';      // v0.17 hook (1:1)
+    else if (isFed && r.isCall && r.paidInvitees.has(username)) joinedVia = 'paid'; // 1:1 legacy only
     else if (r.tokenGate) {
       const bal = await getHiveEngineTokenBalance(username, r.tokenGate.symbol);
       if (bal >= r.tokenGate.amount)                    joinedVia = 'token';
@@ -4705,7 +4832,18 @@ io.on('connection', (socket) => {
       const canonical = m.homeServer ? `${m.username}@${m.homeServer}` : m.username;
       return canonical === target || m.username === target;
     });
-    if (member) io.to(member.socketId).emit('kicked', { room, reason: 'You were removed from this room.' });
+    if (member) {
+      io.to(member.socketId).emit('kicked', { room, reason: 'You were removed from this room.' });
+      // Mirror room-ban cleanup — don't rely on the client calling leave-room.
+      r.members = r.members.filter(m => m.socketId !== member.socketId);
+      io.to(room).emit('user-left', member.socketId);
+      const cleared = member.homeServer ? `${member.username}@${member.homeServer}` : member.username;
+      clearSpotlightIfMember(r, room, cleared);
+      clearSpotlightIfMember(r, room, member.username);
+      if (lobbyUsers[member.username]) delete lobbyUsers[member.username].inRoom;
+      const kickedSock = io.sockets.sockets.get(member.socketId);
+      if (kickedSock) { kickedSock.leave(room); kickedSock._room = null; }
+    }
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
   });
@@ -5019,17 +5157,28 @@ io.on('connection', (socket) => {
 
   // ── WebRTC Signalling ──────────────────────────────────────────────────────
 
-  socket.on('offer',         ({ to, offer })     => { io.to(to).emit('offer',         { from: socket.id, offer }); });
-  socket.on('answer',        ({ to, answer })    => { io.to(to).emit('answer',        { from: socket.id, answer }); });
-  socket.on('ice-candidate', ({ to, candidate }) => { io.to(to).emit('ice-candidate', { from: socket.id, candidate }); });
+  function relayRtc(event, { to, ...rest }) {
+    const room = socket._room;
+    if (!room || !rooms[room]) return;
+    if (!rooms[room].members.some(m => m.socketId === socket.id)) return;
+    if (!rooms[room].members.some(m => m.socketId === to)) return;
+    io.to(to).emit(event, { from: socket.id, ...rest });
+  }
+  socket.on('offer',         (p) => relayRtc('offer',         p));
+  socket.on('answer',        (p) => relayRtc('answer',        p));
+  socket.on('ice-candidate', (p) => relayRtc('ice-candidate', p));
 
   // ── Room Chat ──────────────────────────────────────────────────────────────
 
   socket.on('chat-message', ({ room, to, from, ciphertext, broadcast, signature, timestamp }) => {
+    const sender = socket._username;
+    if (!sender || !room || !rooms[room]) return;
+    if (socket._room !== room) return;
+    if (!rooms[room].members.some(m => m.socketId === socket.id)) return;
+    from = sender; // never trust client-supplied sender name
     if (broadcast) {
       socket.to(room).emit('chat-message', { from, to, ciphertext, broadcast: true, signature, timestamp });
     } else {
-      if (!rooms[room]) return;
       const recipient = rooms[room].members.find(u => u.username === to);
       if (!recipient) return;
       io.to(recipient.socketId).emit('chat-message', { from, to, ciphertext, broadcast: false, signature, timestamp });
@@ -5382,7 +5531,8 @@ io.on('connection', (socket) => {
         socket.to(room).emit('peer-hung-up', { by: username });
         const callId = rooms[room].callId;
         if (callId && activePayments[callId]) {
-          processCallEnd(callId, room, io, lobbyUsers);
+          processCallEnd(callId, room, io, lobbyUsers, 'disconnect')
+            .catch(e => console.error(`[billing] processCallEnd on disconnect failed for ${callId}:`, e.message));
         }
       } else {
         console.log(`[disconnect] @${username} disconnected from multi-party room #${room} (${rooms[room].members.length} remaining) — no peer-hung-up emitted`);
