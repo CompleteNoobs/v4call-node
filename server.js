@@ -95,14 +95,14 @@ const SERVER_HIVE_ACCOUNT = process.env.SERVER_HIVE_ACCOUNT || 'v4call';
 const ESCROW_ACCOUNT      = process.env.ESCROW_ACCOUNT      || 'v4call-escrow';
 const PLATFORM_FEE        = parseFloat(process.env.DEFAULT_PLATFORM_FEE || '10') / 100;
 
-// v0.16.8 — Universal precision floor for paid rates.
-// Rates below this are treated as free (picker filters them out, validator
-// ignores them, disbursement skips them). 0.001 matches HBD's 3-decimal
-// precision and the existing `.toFixed(3)` rounding throughout the disbursement
-// pipeline. For high-precision tokens (e.g. SWAP.BTC, 8 decimals) this means
-// the minimum settable rate is 0.001 of the token. To support sub-millicent
-// token rates (Path B in the v0.16.8 design), make this per-currency AND
-// replace `.toFixed(3)` in disbursement code with per-currency precision.
+// v0.16.8 — Precision floor for paid rates. Default for HBD/HIVE (3 decimals).
+// Path B (per-currency precision) is now IMPLEMENTED: getCurrencyFloor(currency)
+// returns 10^-precision for the actual currency (0.001 for HBD/HIVE, 1e-8 for an
+// 8-decimal token like SWAP.BTC). RATE_FLOOR remains the HBD/HIVE default and the
+// safe fallback when a token's precision can't be fetched. Rates below the
+// currency's floor are treated as free (picker filters them, resolver ignores
+// them, disbursement skips them). All `.toFixed(3)` in the disbursement pipeline
+// was replaced with `.toFixed(getCurrencyPrecision(currency))`.
 const RATE_FLOOR = 0.001;
 const PORT                = parseInt(process.env.PORT        || '3000');
 const BIND_HOST           = process.env.BIND_HOST            || '127.0.0.1';
@@ -1401,6 +1401,63 @@ async function getHiveEngineTokenBalance(account, symbol) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Per-currency precision (Path B) ──────────────────────────────────────────
+// HBD/HIVE are always 3 decimals. Hive-Engine tokens have their own precision
+// (SWAP.BTC = 8). We need it so sub-0.001 token rates can be offered, paid,
+// verified, and disbursed without `.toFixed(3)` rounding them to zero.
+// Precision is effectively immutable per token → long cache TTL. On any fetch
+// failure we conservatively fall back to 3 (current behaviour — never offer a
+// rate finer than we can verify). Errors are NOT cached.
+// ─────────────────────────────────────────────────────────────────────────────
+const currencyPrecisionCache = {}; // key: SYMBOL → { precision, fetchedAt }
+const CURRENCY_PRECISION_TTL  = 60 * 60 * 1000; // 1 hour
+
+async function getCurrencyPrecision(currency) {
+  const cur = (currency || 'HBD').toUpperCase();
+  if (cur === 'HBD' || cur === 'HIVE') return 3;
+
+  const cached = currencyPrecisionCache[cur];
+  if (cached && (Date.now() - cached.fetchedAt) < CURRENCY_PRECISION_TTL) {
+    return cached.precision;
+  }
+  try {
+    const res = await fetch('https://api.hive-engine.com/rpc/contracts', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        jsonrpc: '2.0',
+        id:      1,
+        method:  'findOne',
+        params:  { contract: 'tokens', table: 'tokens', query: { symbol: cur } }
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) {
+      console.warn(`[token] Precision lookup ${cur} → HTTP ${res.status} — falling back to 3 (not cached)`);
+      return 3;
+    }
+    const data = await res.json();
+    if (data.error || !data.result || typeof data.result.precision !== 'number') {
+      console.warn(`[token] Precision lookup ${cur} → unexpected response: ${JSON.stringify(data).slice(0,200)} — falling back to 3 (not cached)`);
+      return 3;
+    }
+    // Clamp defensively — Hive-Engine precision is 0..8.
+    const precision = Math.max(0, Math.min(8, Math.round(data.result.precision)));
+    currencyPrecisionCache[cur] = { precision, fetchedAt: Date.now() };
+    return precision;
+  } catch(e) {
+    console.warn(`[token] Precision lookup failed ${cur}: ${e.message} — falling back to 3 (not cached)`);
+    return 3; // safe fallback — behaves like the old universal 0.001 floor
+  }
+}
+
+// Smallest processable unit for a currency (10^-precision). 0.001 for HBD/HIVE,
+// 1e-8 for an 8-decimal token. Rates/amounts below this are treated as free.
+async function getCurrencyFloor(currency) {
+  return Math.pow(10, -(await getCurrencyPrecision(currency)));
+}
+
 // Clean expired token balance cache entries every 15 minutes
 setInterval(() => {
   const cutoff = Date.now() - TOKEN_CACHE_TTL;
@@ -1899,8 +1956,8 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
         if (tokSection) {
           console.log(`[rates] Applying ${bypassToken} token rates for bypassed @${caller}`);
           const result = { currency: bypassToken, ...buildCallRateResult(tokSection, callType, escrow, platformFee) };
-          if (isOptionBelowFloor(result)) {
-            console.log(`[rates] @${caller} ${bypassToken} rate below floor (${RATE_FLOOR}) — treating as free`);
+          if (await isOptionBelowFloor(result)) {
+            console.log(`[rates] @${caller} ${bypassToken} rate below the currency floor — treating as free`);
             return null;
           }
           return result;
@@ -1921,8 +1978,8 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     if (bal > 0) {
       console.log(`[rates] @${caller} qualifies for ${tok.symbol} token rates (bal: ${bal})`);
       const result = { currency: tok.symbol, ...buildCallRateResult(tok, callType, escrow, platformFee) };
-      if (isOptionBelowFloor(result)) {
-        console.log(`[rates] @${caller} ${tok.symbol} rate below floor (${RATE_FLOOR}) — treating as free`);
+      if (await isOptionBelowFloor(result)) {
+        console.log(`[rates] @${caller} ${tok.symbol} rate below the currency floor — treating as free`);
         return null;
       }
       return result;
@@ -1939,7 +1996,7 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     if (win) {
       console.log(`[rates] @${caller} matched list "${list.name}"`);
       const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
-      if (isOptionBelowFloor(result)) {
+      if (await isOptionBelowFloor(result)) {
         console.log(`[rates] @${caller} HBD rate from list "${list.name}" below floor (${RATE_FLOOR}) — treating as free`);
         return null;
       }
@@ -1955,7 +2012,7 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     );
     if (win) {
       const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
-      if (isOptionBelowFloor(result)) {
+      if (await isOptionBelowFloor(result)) {
         console.log(`[rates] @${caller} HBD rate from default list below floor (${RATE_FLOOR}) — treating as free`);
         return null;
       }
@@ -1970,17 +2027,19 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── isOptionBelowFloor ────────────────────────────────────────────────────────
-// True if the option has at least one nonzero rate field below RATE_FLOOR.
-// Such options can't be processed end-to-end (validator threshold + disbursement
-// rounding both kick in at 0.001), so they're filtered from the picker and
-// treated as free by the resolver.
-function isOptionBelowFloor(opt) {
+// True if the option has at least one nonzero rate field below the currency's
+// floor (10^-precision). Such options can't be processed end-to-end (verify
+// tolerance + disbursement rounding both kick in at the floor), so they're
+// filtered from the picker and treated as free by the resolver. Async because
+// the floor depends on a (cached) Hive-Engine token-precision lookup.
+async function isOptionBelowFloor(opt) {
   if (!opt) return false;
+  const floor = await getCurrencyFloor(opt.currency || 'HBD');
   if (opt.type === 'text' || opt.type === 'invite') {
-    return opt.flat > 0 && opt.flat < RATE_FLOOR;
+    return opt.flat > 0 && opt.flat < floor;
   }
   // voice or video
-  return [opt.ring, opt.connect, opt.rate].some(v => v > 0 && v < RATE_FLOOR);
+  return [opt.ring, opt.connect, opt.rate].some(v => v > 0 && v < floor);
 }
 
 // ── computePaymentOptions ─────────────────────────────────────────────────────
@@ -2041,13 +2100,15 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   const options = [];
   let belowFloor = false;
 
-  // Helper: push if above floor, otherwise flag belowFloor and skip.
-  const pushOrFlag = (opt) => {
-    if (isOptionBelowFloor(opt)) {
+  // Helper: push if above floor, otherwise flag belowFloor and skip. Attaches
+  // the currency's precision so the client formats payment amounts correctly.
+  const pushOrFlag = async (opt) => {
+    if (await isOptionBelowFloor(opt)) {
       belowFloor = true;
-      console.log(`[rates] Option for ${opt.currency} below floor (${RATE_FLOOR}) — filtered`);
+      console.log(`[rates] Option for ${opt.currency} below floor (${await getCurrencyFloor(opt.currency)}) — filtered`);
       return;
     }
+    opt.precision = await getCurrencyPrecision(opt.currency || 'HBD');
     options.push(opt);
   };
 
@@ -2055,7 +2116,7 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   for (const tok of (rates.tokens || [])) {
     const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
     if (bal > 0) {
-      pushOrFlag({
+      await pushOrFlag({
         currency: tok.symbol,
         balance:  bal,
         ...buildCallRateResult(tok, callType, escrow, platformFee)
@@ -2087,7 +2148,7 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
       }
     }
   }
-  if (hbdOption) pushOrFlag(hbdOption);
+  if (hbdOption) await pushOrFlag(hbdOption);
 
   return { options, blocked: false, feeRejected: false, belowFloor };
 }
@@ -2109,7 +2170,7 @@ async function getInviteOptions(inviteeUsername, inviterUsername) {
   // 0-rate option is meaningful (the picker still shows the currency); for
   // invite it just means "free in this currency". Filter zero-rate options
   // so options.length === 0 reliably means "free invite, no payment needed."
-  const paidOptions = (res.options || []).filter(o => o.flat >= RATE_FLOOR);
+  const paidOptions = (res.options || []).filter(o => o.flat >= Math.pow(10, -(typeof o.precision === 'number' ? o.precision : 3)));
   return { ...res, options: paidOptions, escrow: rates.escrow || ESCROW_ACCOUNT };
 }
 
@@ -2120,10 +2181,12 @@ async function disbursePaidInvite(inviteId) {
   e.status = 'accepted';
 
   const platformFee  = PLATFORM_FEE;
-  const platformCut  = parseFloat((e.paid * platformFee).toFixed(3));
-  const inviteeNet   = parseFloat((e.paid - platformCut).toFixed(3));
+  const prec  = await getCurrencyPrecision(e.currency);
+  const floor = Math.pow(10, -prec);
+  const platformCut  = parseFloat((e.paid * platformFee).toFixed(prec));
+  const inviteeNet   = parseFloat((e.paid - platformCut).toFixed(prec));
 
-  if (inviteeNet >= RATE_FLOOR) {
+  if (inviteeNet >= floor) {
     const payoutMemo = `v4call:invite-payout:${inviteId}`;
     ledgerPayment(inviteId, 'invite_payout', ESCROW_ACCOUNT, e.invitee, inviteeNet, payoutMemo, 'pending', null, e.currency);
     sendFromEscrow(e.invitee, inviteeNet, payoutMemo, e.currency, inviteId).then(r => {
@@ -2131,7 +2194,7 @@ async function disbursePaidInvite(inviteId) {
         ledgerPaymentUpdate(inviteId, 'invite_payout', 'sent', r.txId);
         const lu = lobbyUsers[e.invitee];
         if (lu) io.to(lu.socketId).emit('lobby-info', {
-          text: `💰 @${e.inviter} paid you ${inviteeNet.toFixed(3)} ${e.currency} for the invite to #${e.room}.`
+          text: `💰 @${e.inviter} paid you ${inviteeNet.toFixed(prec)} ${e.currency} for the invite to #${e.room}.`
         });
       } else {
         console.error(`[paid-invite] Payout to @${e.invitee} failed: ${r && r.reason}`);
@@ -2140,7 +2203,7 @@ async function disbursePaidInvite(inviteId) {
     });
   }
 
-  if (platformCut >= RATE_FLOOR) {
+  if (platformCut >= floor) {
     const feeMemo = `v4call:invite-fee:${inviteId}`;
     ledgerPayment(inviteId, 'invite_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, e.currency);
     sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, e.currency, inviteId).then(r => {
@@ -2151,7 +2214,7 @@ async function disbursePaidInvite(inviteId) {
   const lu = lobbyUsers[e.inviter];
   const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
   if (lu) io.to(lu.socketId).emit('lobby-info', {
-    text: `✓ ${inviteeLabel} accepted your invite to #${e.room}. Net ${inviteeNet.toFixed(3)} ${e.currency} sent.`
+    text: `✓ ${inviteeLabel} accepted your invite to #${e.room}. Net ${inviteeNet.toFixed(prec)} ${e.currency} sent.`
   });
   console.log(`[paid-invite] ${inviteId} accepted — net ${inviteeNet} ${e.currency} → @${e.invitee}, fee ${platformCut} → @${SERVER_HIVE_ACCOUNT}`);
 }
@@ -2357,7 +2420,7 @@ async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null)
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
     return { success: false, reason: 'Escrow key not configured' };
   }
-  if (amount < 0.001) {
+  if (amount < 0.001) { // HBD/HIVE only here (tokens routed above) → 3-decimal floor
     console.log(`[escrow] Amount ${amount} too small — skipping transfer to @${to}`);
     return { success: true, skipped: true };
   }
@@ -2411,8 +2474,9 @@ async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
     return { success: false, reason: 'Escrow key not configured' };
   }
-  if (amount < 0.001) {
-    console.log(`[escrow-token] Amount ${amount} too small — skipping transfer to @${to}`);
+  const tokenPrec = await getCurrencyPrecision(symbol);
+  if (amount < Math.pow(10, -tokenPrec)) {
+    console.log(`[escrow-token] Amount ${amount} below ${symbol} precision (${tokenPrec}) — skipping transfer to @${to}`);
     return { success: true, skipped: true };
   }
 
@@ -2432,7 +2496,9 @@ async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
       contractPayload: {
         symbol,
         to,
-        quantity: amount.toFixed(8).replace(/\.?0+$/, ''), // Hive-Engine uses variable precision
+        // Format to the token's real precision, then strip only zeros AFTER a
+        // decimal point (never trailing zeros of a whole number, e.g. "100").
+        quantity: amount.toFixed(tokenPrec).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, ''),
         memo
       }
     });
@@ -2460,10 +2526,11 @@ async function verifyHiveEnginePayment(fromUser, toUser, amount, symbol, memo, r
   // Instead, we verify by checking that the escrow account holds enough of the token.
   // The payment was already signed via Keychain — we trust the client-side broadcast
   // succeeded if the escrow balance reflects the expected amount.
+  const tol = await getCurrencyFloor(symbol); // per-currency epsilon (1e-8 for 8-decimal tokens, not a flat 0.001)
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const bal = await getHiveEngineTokenBalance(toUser, symbol);
-      if (bal >= amount - 0.001) {
+      if (bal >= amount - tol) {
         console.log(`[payment] ✓ Verified ${symbol} balance on @${toUser}: ${bal} (need ${amount}) — attempt ${attempt}`);
         // Clear the balance cache so next check is fresh
         delete tokenBalanceCache[`${toUser}:${symbol}`];
@@ -2541,6 +2608,9 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   const ringPaid    = payment.ringPaid    || 0;
   const platformFee = payment.platformFee || 0.10;
   const currency    = payment.currency    || 'HBD';
+  // Per-currency precision (Path B): HBD/HIVE=3, tokens=their HE precision.
+  const prec  = await getCurrencyPrecision(currency);
+  const floor = Math.pow(10, -prec);
 
   // ── Money flow ──────────────────────────────────────────────────────────────
   // Total received = ring + connect + deposit
@@ -2548,19 +2618,19 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   // connect fee    → callee (non-refundable answer fee, minus platform %)
   // deposit        → duration cost to callee; unused portion refunded to caller
 
-  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(3));
-  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(3));
-  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(3));
-  const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(3));
-  const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(3));
-  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(3));
+  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(prec));
+  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(prec));
+  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
+  const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
+  const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
+  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(prec));
 
   // Sanity check
   const totalIn  = ringPaid + connectPaid + depositPaid;
   const totalOut = calleeNet + refundAmount + platformTotal;
-  const delta    = parseFloat((totalIn - totalOut).toFixed(3));
-  if (Math.abs(delta) > 0.002) {
-    console.warn(`[billing] ⚠ Accounting delta: in=${totalIn} out=${totalOut} diff=${delta} HBD`);
+  const delta    = parseFloat((totalIn - totalOut).toFixed(prec));
+  if (Math.abs(delta) > 2 * floor) {
+    console.warn(`[billing] ⚠ Accounting delta: in=${totalIn} out=${totalOut} diff=${delta} ${currency}`);
   }
 
   console.log(`[billing] Call ${callId} ended (${endReason})`);
@@ -2578,7 +2648,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     startTime: new Date(startTime).toISOString(), endTime: new Date(now).toISOString(),
     durationMin: parseFloat(durationMin.toFixed(2)),
     ringPaid, connectPaid, depositPaid, durationCost, refundAmount,
-    calleeNet, platformTotal, platformOnCall, currency, endReason
+    calleeNet, platformTotal, platformOnCall, currency, precision: prec, endReason
   };
 
   // Update SQLite ledger
@@ -2602,7 +2672,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   // ── Disburse from escrow ────────────────────────────────────────────────────
 
   // 1. Callee payout
-  if (calleeNet >= 0.001) {
+  if (calleeNet >= floor) {
     const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
     ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
     const result = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
@@ -2615,7 +2685,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   }
 
   // 2. Refund unused deposit to caller
-  if (refundAmount >= 0.001) {
+  if (refundAmount >= floor) {
     const refundMemo = `v4call:refund:${callId}:unused-credit`;
     ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
     const refundResult = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
@@ -2632,7 +2702,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   }
 
   // 3. Platform fee (ring fee + % cut)
-  if (platformTotal >= 0.001) {
+  if (platformTotal >= floor) {
     const feeMemo   = `v4call:fee:${callId}:ring+cut`;
     ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
     const feeResult = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
@@ -2685,13 +2755,15 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   // this is the "callee's server takes the platform fee" rule in Model 3.
   const platformFee = PLATFORM_FEE;
   const currency    = payment.currency    || 'HBD';
+  const prec  = await getCurrencyPrecision(currency);
+  const floor = Math.pow(10, -prec);
 
-  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(3));
-  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(3));
-  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(3));
-  const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(3));
-  const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(3));
-  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(3));
+  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(prec));
+  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(prec));
+  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
+  const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
+  const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
+  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(prec));
 
   console.log(`[fed-billing] Call ${callId} ended (${endReason}) — disbursing`);
   console.log(`[fed-billing]   Duration:   ${durationMin.toFixed(2)} min`);
@@ -2723,7 +2795,7 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   });
 
   // 1. Callee payout (local user, our escrow)
-  if (calleeNet >= 0.001) {
+  if (calleeNet >= floor) {
     const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
     ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
     const r = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
@@ -2732,7 +2804,7 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   }
 
   // 2. Refund to remote caller (our escrow → their Hive account)
-  if (refundAmount >= 0.001) {
+  if (refundAmount >= floor) {
     const refundMemo = `v4call:refund:${callId}:unused-credit`;
     ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
     const r = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
@@ -2741,7 +2813,7 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   }
 
   // 3. Platform fee to us
-  if (platformTotal >= 0.001) {
+  if (platformTotal >= floor) {
     const feeMemo = `v4call:fee:${callId}:ring+cut`;
     ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
     const r = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
@@ -3384,11 +3456,13 @@ io.on('connection', (socket) => {
     const textRate     = applicable?.flat || 0;
     const cur          = textCurrency || applicable?.currency || 'HBD';
     const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
+    const dmPrec       = await getCurrencyPrecision(cur);
+    const dmFloor      = Math.pow(10, -dmPrec);
 
     // For paid federated DMs, the callee's rates-post escrow MUST match the
     // peer server's own ESCROW_ACCOUNT — otherwise the peer holds no key to
     // disburse from it. Fail loudly instead of silently dropping the message.
-    if (isFederated && textRate >= 0.001 && routeEscrow && routeEscrow !== calleeEscrow) {
+    if (isFederated && textRate >= dmFloor && routeEscrow && routeEscrow !== calleeEscrow) {
       socket.emit('lobby-dm-error',
         `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ` +
         `${routeDomain} controls @${routeEscrow}. They need to ` +
@@ -3397,7 +3471,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (textRate >= 0.001) {
+    if (textRate >= dmFloor) {
       // ── Payment required ─────────────────────────────────────────────────
       if (!textPaid || !textMemo || !msgId) {
         socket.emit('lobby-dm-payment-required', {
@@ -3427,10 +3501,10 @@ io.on('connection', (socket) => {
       // recipients we forward the payment info and let their server disburse.
       if (recipient) {
         const platformFee  = applicable.platformFee || PLATFORM_FEE;
-        const platformCut  = parseFloat((textPaid * platformFee).toFixed(3));
-        const recipientNet = parseFloat((textPaid - platformCut).toFixed(3));
+        const platformCut  = parseFloat((textPaid * platformFee).toFixed(dmPrec));
+        const recipientNet = parseFloat((textPaid - platformCut).toFixed(dmPrec));
 
-        if (recipientNet >= 0.001) {
+        if (recipientNet >= dmFloor) {
           const payoutMemo = `v4call:text-payout:${msgId}`;
           ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
           sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
@@ -3445,7 +3519,7 @@ io.on('connection', (socket) => {
           });
         }
 
-        if (platformCut >= 0.001) {
+        if (platformCut >= dmFloor) {
           const feeMemo = `v4call:text-fee:${msgId}`;
           ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
           sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
@@ -5346,11 +5420,13 @@ io.on('connection', (socket) => {
       const textRate     = applicable?.flat || 0;
       const cur          = env.textCurrency || applicable?.currency || 'HBD';
       const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
+      const dmPrec       = await getCurrencyPrecision(cur);
+      const dmFloor      = Math.pow(10, -dmPrec);
 
       // Escrow-mismatch guard for paid federated attachments — mirrors lobby-dm.
       // If the recipient's rate-post escrow isn't controlled by the peer, the
       // peer can't disburse and the caller's funds would orphan. Fail loudly.
-      if (isFederated && textRate >= RATE_FLOOR && routeEscrow && routeEscrow !== calleeEscrow) {
+      if (isFederated && textRate >= dmFloor && routeEscrow && routeEscrow !== calleeEscrow) {
         socket.emit('dm-attachment-error', {
           msgId: env.msgId || null,
           error: `⚠ @${to}'s rates post declares escrow @${calleeEscrow}, but ${routeDomain} controls @${routeEscrow}. They need to update their rates post for paid attachments to work across federation.`
@@ -5358,7 +5434,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (textRate >= RATE_FLOOR) {
+      if (textRate >= dmFloor) {
         // Payment required
         if (!env.textPaid || !env.textMemo || !env.msgId) {
           socket.emit('dm-attachment-payment-required', {
@@ -5388,10 +5464,10 @@ io.on('connection', (socket) => {
         // after its own re-verification (per design rule #15).
         if (recipient) {
           const platformFee  = applicable.platformFee || PLATFORM_FEE;
-          const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(3));
-          const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(3));
+          const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(dmPrec));
+          const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= 0.001) {
+          if (recipientNet >= dmFloor) {
             const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
             ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
             sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
@@ -5406,7 +5482,7 @@ io.on('connection', (socket) => {
             });
           }
 
-          if (platformCut >= 0.001) {
+          if (platformCut >= dmFloor) {
             const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
             ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
             sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
@@ -6173,6 +6249,8 @@ async function fedHandleMessage(ws, raw) {
       const recipient = lobbyUsers[to];
       const cur       = textCurrency || 'HBD';
       const paid      = textPaid || 0;
+      const dmPrec    = await getCurrencyPrecision(cur);
+      const dmFloor   = Math.pow(10, -dmPrec);
 
       const deliver = () => {
         if (recipient) {
@@ -6190,7 +6268,7 @@ async function fedHandleMessage(ws, raw) {
         fedSend(ws, { type: 'dm-delivered', from, to, msgId: msgId || null });
       };
 
-      if (paid >= 0.001 && textMemo && msgId) {
+      if (paid >= dmFloor && textMemo && msgId) {
         // Re-verify on-chain (caller's server already verified, but trust-but-verify)
         const verifier = (cur !== 'HBD' && cur !== 'HIVE')
           ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
@@ -6231,7 +6309,7 @@ async function fedHandleMessage(ws, raw) {
               rejectReason = `recipient does not accept ${cur} for paid DMs`;
             } else {
               const requiredRate = opt.flat || 0;
-              if (requiredRate >= 0.001 && paid < requiredRate) {
+              if (requiredRate >= dmFloor && paid < requiredRate) {
                 rejectReason = `underpaid (required ${requiredRate} ${cur}, paid ${paid} ${cur})`;
               }
             }
@@ -6258,10 +6336,10 @@ async function fedHandleMessage(ws, raw) {
           ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified');
 
           // Disburse from our escrow — recipient gets net, we keep platform cut.
-          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(3));
-          const recipientNet = parseFloat((paid - platformCut).toFixed(3));
+          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
+          const recipientNet = parseFloat((paid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= 0.001) {
+          if (recipientNet >= dmFloor) {
             const payoutMemo = `v4call:text-payout:${msgId}`;
             ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
             sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
@@ -6275,7 +6353,7 @@ async function fedHandleMessage(ws, raw) {
               }
             });
           }
-          if (platformCut >= 0.001) {
+          if (platformCut >= dmFloor) {
             const feeMemo = `v4call:text-fee:${msgId}`;
             ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
             sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
@@ -6316,6 +6394,8 @@ async function fedHandleMessage(ws, raw) {
       const recipient = lobbyUsers[to];
       const cur       = textCurrency || 'HBD';
       const paid      = textPaid || 0;
+      const dmPrec    = await getCurrencyPrecision(cur);
+      const dmFloor   = Math.pow(10, -dmPrec);
 
       const deliver = () => {
         // Persist on our side so recipient's dm-attachments-history replay
@@ -6325,7 +6405,7 @@ async function fedHandleMessage(ws, raw) {
         if (recipient) io.to(recipient.socketId).emit('dm-attachment', envelope);
       };
 
-      if (paid >= 0.001 && textMemo && msgId) {
+      if (paid >= dmFloor && textMemo && msgId) {
         // Re-verify on-chain to OUR escrow (we're the treasurer here).
         const verifier = (cur !== 'HBD' && cur !== 'HIVE')
           ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
@@ -6351,7 +6431,7 @@ async function fedHandleMessage(ws, raw) {
               rejectReason = `recipient does not accept ${cur} for paid attachments`;
             } else {
               const requiredRate = opt.flat || 0;
-              if (requiredRate >= 0.001 && paid < requiredRate) {
+              if (requiredRate >= dmFloor && paid < requiredRate) {
                 rejectReason = `underpaid (required ${requiredRate} ${cur}, paid ${paid} ${cur})`;
               }
             }
@@ -6376,10 +6456,10 @@ async function fedHandleMessage(ws, raw) {
           ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified', null, cur);
 
           // Disburse net to recipient, fee to platform.
-          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(3));
-          const recipientNet = parseFloat((paid - platformCut).toFixed(3));
+          const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
+          const recipientNet = parseFloat((paid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= 0.001) {
+          if (recipientNet >= dmFloor) {
             const payoutMemo = `v4call:dm-att-payout:${msgId}`;
             ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
             sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
@@ -6393,7 +6473,7 @@ async function fedHandleMessage(ws, raw) {
               }
             });
           }
-          if (platformCut >= 0.001) {
+          if (platformCut >= dmFloor) {
             const feeMemo = `v4call:dm-att-fee:${msgId}`;
             ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
             sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
@@ -6576,7 +6656,7 @@ async function fedHandleMessage(ws, raw) {
               rejectReason = `recipient does not accept ${cur} for paid calls`;
             } else {
               const requiredRing = opt.ring || 0;
-              if (requiredRing >= 0.001 && amount < requiredRing) {
+              if (requiredRing >= await getCurrencyFloor(cur) && amount < requiredRing) {
                 rejectReason = `ring fee underpaid (required ${requiredRing} ${cur}, paid ${amount} ${cur})`;
               }
               computedRatePerHour = opt.rate;
