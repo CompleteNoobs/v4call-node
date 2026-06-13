@@ -1458,6 +1458,18 @@ async function getCurrencyFloor(currency) {
   return Math.pow(10, -(await getCurrencyPrecision(currency)));
 }
 
+// Synchronous display formatter for user-facing notification strings (NOT for
+// on-chain quantities — those use the exact per-currency precision). HBD/HIVE
+// keep 3 decimals; tokens show up to 8 with trailing zeros stripped, so a
+// sub-millicent token amount reads as e.g. "0.0000001" instead of "0.000".
+function fmtAmt(amount, currency) {
+  const cur = (currency || 'HBD').toUpperCase();
+  if (cur === 'HBD' || cur === 'HIVE') return Number(amount || 0).toFixed(3);
+  let s = Number(amount || 0).toFixed(8);
+  if (s.indexOf('.') >= 0) s = s.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+  return s;
+}
+
 // Clean expired token balance cache entries every 15 minutes
 setInterval(() => {
   const cutoff = Date.now() - TOKEN_CACHE_TTL;
@@ -2263,7 +2275,8 @@ function startCreditBurn(callId, roomName) {
       warned5 = true;
       io.to(roomName).emit('credit-warning', {
         minutesLeft: parseFloat(minLeft.toFixed(1)),
-        creditLeft:  parseFloat(p.creditRemaining.toFixed(3)),
+        creditLeft:  p.creditRemaining,           // raw — client formats per currency
+        currency:    p.currency || 'HBD',
         level:       '5min'
       });
     }
@@ -2272,7 +2285,8 @@ function startCreditBurn(callId, roomName) {
       warned2 = true;
       io.to(roomName).emit('credit-warning', {
         minutesLeft: parseFloat(minLeft.toFixed(1)),
-        creditLeft:  parseFloat(p.creditRemaining.toFixed(3)),
+        creditLeft:  p.creditRemaining,
+        currency:    p.currency || 'HBD',
         level:       '2min'
       });
     }
@@ -2678,7 +2692,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     const result = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
     if (!result.success) {
       console.error(`[billing] Callee payout FAILED to @${payment.callee}: ${result.reason}`);
-      if (calleeSid) io.to(calleeSid).emit('payout-failed', { amount: calleeNet, reason: result.reason, callId });
+      if (calleeSid) io.to(calleeSid).emit('payout-failed', { amount: calleeNet, reason: result.reason, callId, currency });
     } else {
       ledgerPaymentUpdate(callId, 'payout', 'sent', result.txId);
     }
@@ -2695,7 +2709,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     } else {
       console.error(`[billing] Refund FAILED to @${payment.caller}: ${refundResult.reason}`);
       if (callerSid) io.to(callerSid).emit('payout-failed', {
-        amount: refundAmount, reason: refundResult.reason, callId,
+        amount: refundAmount, reason: refundResult.reason, callId, currency,
         message: 'Your unused credit refund could not be sent automatically'
       });
     }
@@ -3976,8 +3990,8 @@ io.on('connection', (socket) => {
         ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
         sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(r => {
           const msg = r.success
-            ? `${offlineReason} Ring fee of ${ringFeePaid.toFixed(3)} ${ringCurrency} refunded.`
-            : `${offlineReason} Refund of ${ringFeePaid.toFixed(3)} ${ringCurrency} pending — contact support.`;
+            ? `${offlineReason} Ring fee of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} refunded.`
+            : `${offlineReason} Refund of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} pending — contact support.`;
           socket.emit('call-failed', { reason: msg, refunded: r.success });
           if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
         });
@@ -4717,7 +4731,7 @@ io.on('connection', (socket) => {
         }
       });
       console.log(`[paid-invite][fed] ${payment.inviteId} — @${fedInviter} paid ${payment.paid} ${fedCur} to invite @${fedInvitee}@${handle.server} → #${room}`);
-      socket.emit('allowlist-info', { room, message: `📨 Paid invite (${payment.paid.toFixed(3)} ${fedCur}) sent to @${fedInvitee}@${handle.server}.` });
+      socket.emit('allowlist-info', { room, message: `📨 Paid invite (${fmtAmt(payment.paid, fedCur)} ${fedCur}) sent to @${fedInvitee}@${handle.server}.` });
       emitRoomInfoToMembers(r, room);
       broadcastRooms();
       return;
@@ -4842,7 +4856,7 @@ io.on('connection', (socket) => {
       paid_amount:    payment.paid,
       paid_currency:  cur
     });
-    socket.emit('allowlist-info', { room, message: `📨 Paid invite (${payment.paid.toFixed(3)} ${cur}) sent to @${invitee}.` });
+    socket.emit('allowlist-info', { room, message: `📨 Paid invite (${fmtAmt(payment.paid, cur)} ${cur}) sent to @${invitee}.` });
     emitRoomInfoToMembers(r, room);
     broadcastRooms();
     console.log(`[paid-invite] ${payment.inviteId} — @${inviter} paid ${payment.paid} ${cur} to invite @${invitee} → #${room}`);
@@ -7089,7 +7103,7 @@ async function refundPaidInvite(inviteId, newStatus) {
       const lu = lobbyUsers[e.inviter];
       const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
       if (lu) io.to(lu.socketId).emit('lobby-info', {
-        text: `↩️ Invite to ${inviteeLabel} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${e.paid.toFixed(3)} ${e.currency}.`
+        text: `↩️ Invite to ${inviteeLabel} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${fmtAmt(e.paid, e.currency)} ${e.currency}.`
       });
       console.log(`[paid-invite] ↩ Refunded ${e.paid} ${e.currency} to @${e.inviter} for ${inviteId} (${newStatus})`);
     } else {
