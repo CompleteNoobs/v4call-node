@@ -82,7 +82,30 @@ const server = http.createServer(app);
 // cross-server call flow below).
 const io     = new Server(server, { cors: { origin: true, credentials: true } });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// ── Headless (decoupling §11 step 2): this node serves NO HTML. The GUIs live in
+//    v4call-app and reach this node cross-origin via nodeBase(), so express.static
+//    is removed and replaced with a CORS layer. Admin endpoints stay protected by
+//    ADMIN_KEY regardless of CORS — CORS only governs which browser origins may
+//    READ responses; it is not the auth gate.
+const CORS_ALLOWLIST = (process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  // Reflect the requesting origin (needed for Authorization to be sent) — narrowed
+  // to CORS_ALLOWED_ORIGINS when set; reflect-any when unset (dev convenience).
+  if (origin && (CORS_ALLOWLIST.length === 0 || CORS_ALLOWLIST.includes(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  if (req.method === 'OPTIONS') {                       // CORS preflight
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Max-Age', '600');
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2950,6 +2973,25 @@ app.get('/api/info', (req, res) => {
   });
 });
 
+// Domain-proof file — served from a route because v4call-node has no nginx/static
+// layer (it used to be a static file under public/.well-known). Returns the
+// operator's signed v4call-server.json VERBATIM: peers re-hash the signed fields
+// (verifyPeer), so we must NOT re-serialize/reorder. The operator generates it
+// offline via server-sign.html (in v4call-app) and drops the signed file at
+// V4CALL_SERVER_JSON_PATH (default ./data/v4call-server.json on a mounted volume).
+app.get('/.well-known/v4call-server.json', (req, res) => {
+  const p = process.env.V4CALL_SERVER_JSON_PATH || path.join(__dirname, 'data', 'v4call-server.json');
+  res.set('Access-Control-Allow-Origin', '*');   // public; peers fetch server-to-server
+  res.set('Cache-Control', 'no-store');
+  fs.readFile(p, 'utf8', (err, body) => {
+    if (err) return res.status(404).json({
+      error:  'v4call-server.json not configured',
+      detail: 'set V4CALL_SERVER_JSON_PATH to the signed file (generate it via server-sign.html in v4call-app)'
+    });
+    res.type('application/json').send(body);
+  });
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Admin & Debug Endpoints ───────────────────────────────────────────────────
@@ -2959,10 +3001,7 @@ app.get('/api/info', (req, res) => {
 // GET /admin/ledger?key=ADMIN_KEY&limit=50
 // GET /admin/ledger?key=ADMIN_KEY&call_id=CALL_ID
 app.get('/admin/ledger', (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey || req.query.key !== adminKey) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+  if (!_requireAdmin(req, res)) return;
   const limit  = Math.min(parseInt(req.query.limit) || 50, 500);
   const callId = req.query.call_id;
   try {
@@ -2991,8 +3030,7 @@ app.get('/admin/ledger', (req, res) => {
 
 // GET /admin/balance?key=ADMIN_KEY
 app.get('/admin/balance', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey || req.query.key !== adminKey) return res.status(403).json({ error: 'Forbidden' });
+  if (!_requireAdmin(req, res)) return;
   const balance = await getEscrowBalance();
   res.json({ account: ESCROW_ACCOUNT, balance_hbd: balance });
 });
@@ -3017,9 +3055,17 @@ app.use(express.json());
 // POST /admin/peers/rescan?key=ADMIN_KEY
 //      Forces an immediate Hive-tag rescan (normally runs every 2h).
 // ─────────────────────────────────────────────────────────────────────────
+// Admin key now travels in an `Authorization: Bearer <ADMIN_KEY>` header (the GUI
+// lives at a separate origin — keys in the query string get logged/cached/leaked
+// via Referer). The legacy `?key=` is still accepted as a transition fallback.
+function _adminKeyFromReq(req) {
+  const auth = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth);
+  return m ? m[1].trim() : req.query.key;
+}
 function _requireAdmin(req, res) {
   const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey || req.query.key !== adminKey) {
+  if (!adminKey || _adminKeyFromReq(req) !== adminKey) {
     res.status(403).json({ error: 'Forbidden' });
     return false;
   }

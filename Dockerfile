@@ -1,4 +1,4 @@
-# ── v4call Dockerfile ─────────────────────────────────────────────────────────
+# ── v4call-node Dockerfile (headless) ────────────────────────────────────────
 FROM node:20-alpine
 
 # Install build tools needed for better-sqlite3 native module + curl for the
@@ -12,15 +12,16 @@ RUN npm install --omit=dev
 
 COPY server.js ./
 COPY nostr-fed.mjs ./
-COPY public/ ./public/
+# Headless: no public/ (GUIs live in v4call-app). The signed domain-proof file is
+# mounted at runtime via V4CALL_SERVER_JSON_PATH (default /app/data/v4call-server.json),
+# not baked into the image.
 
-# Create logs + nostr-key directories and give the node user ownership.
-# This must happen before switching to USER node. (The /app/nostr bind-mount
-# from the host may still be root-owned — see WalkThrough: if you see
-# "EACCES ... nostr-key.json", run `chown -R 1000:1000 ./data/nostr` on host.)
-RUN mkdir -p /app/logs /app/nostr && chown -R node:node /app/logs /app/nostr
+# Create logs + nostr-key + data directories and give the node user ownership.
+# This must happen before switching to USER node. (Bind-mounts from the host may
+# still be root-owned — if you see "EACCES", run `chown -R 1000:1000 ./data` on host.)
+RUN mkdir -p /app/logs /app/nostr /app/data && chown -R node:node /app/logs /app/nostr /app/data
 
-VOLUME ["/app/logs", "/app/nostr"]
+VOLUME ["/app/logs", "/app/nostr", "/app/data"]
 
 EXPOSE 3000
 

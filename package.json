@@ -1,7 +1,7 @@
 {
-  "name": "v4call",
-  "version": "0.16.29",
-  "description": "Decentralised video/audio calling with Hive blockchain identity and HBD micropayments",
+  "name": "v4call-node",
+  "version": "0.1.0",
+  "description": "Headless v4call server (CLI/API-only) — fed/discovery/presence/routing/chat + HTTP API. Serves no HTML. Succeeds the v4call monolith (v0.16.29).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
