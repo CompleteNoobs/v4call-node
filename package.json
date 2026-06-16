@@ -1,6 +1,6 @@
 {
   "name": "v4call",
-  "version": "1.0.0",
+  "version": "0.16.29",
   "description": "Decentralised video/audio calling with Hive blockchain identity and HBD micropayments",
   "main": "server.js",
   "scripts": {
