@@ -74,6 +74,9 @@ const fs         = require('fs');
 const Database   = require('better-sqlite3');
 const dhive      = require('@hiveio/dhive');
 const WebSocket  = require('ws');
+const escrowCore = require('escrow-core');   // pinned engine (escrow-core@^0.1) — durable, replay-guarded money core
+                                             // (NOT `escrow`: many handlers destructure an `escrow` ACCOUNT param)
+const { createEscrowVerify } = require('./escrow-verify');
 
 const app    = express();
 const server = http.createServer(app);
@@ -299,6 +302,25 @@ db.exec(`
 `);
 
 console.log('[ledger] SQLite ready:', path.join(LOG_DIR, 'v4call-ledger.db'));
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Escrow-core ledger (durable, replay-guarded money rows) ──────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// The decoupled escrow engine (escrow-core@^0.1). Its `payments`/`refunds` tables
+// are the durable settlement source of truth that supersedes the in-memory
+// `activePayments` map (decoupling §11 step 4 / handover-v4call-escrow-migration.md).
+// It MUST be its own DB file — escrow-core's `payments` schema (tx_id UNIQUE / ref /
+// settle_state) is unrelated to the legacy `payments` table in v4call-ledger.db above.
+// The v4call adapter supplies the metering/precision/release seam and the per-service
+// ledger columns (rate_per_hour, start_ts, connect_paid, ring_paid, platform_fee, callee).
+const ESCROW_DB_PATH = process.env.ESCROW_DB_PATH || path.join(LOG_DIR, 'v4call-escrow.db');
+const escrowAdapter = escrowCore.createV4callAdapter();   // reads ESCROW_ACCOUNT / V4CALL_ESCROW_KEY from env
+const escrowLedger = escrowCore.openLedger(ESCROW_DB_PATH, {
+  adapterMigrations: escrowAdapter.ledgerMigrations(),
+});
+console.log('[escrow] escrow-core', escrowCore.version, 'ledger ready:', ESCROW_DB_PATH,
+  `(account @${escrowAdapter.account}, currency ${escrowAdapter.currency})`);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2558,6 +2580,10 @@ async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
   }
 }
 
+// ⚠ DEPRECATED / DEAD (Step-4 escrow migration). Replaced by escrow-core's
+// tx_id-anchored verifyPayment via verifyAndRecordPayment(). This balance-scan
+// verify captured NO tx_id and gave NO replay guard — do NOT reuse it for any
+// paid path (it's the exact gap the migration closed). Kept only until a cleanup pass.
 async function verifyHiveEnginePayment(fromUser, toUser, amount, symbol, memo, retries = PAYMENT_VERIFY_RETRIES) {
   // Hive-Engine doesn't expose transferHistory via the contracts RPC reliably.
   // Instead, we verify by checking that the escrow account holds enough of the token.
@@ -2880,6 +2906,10 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
 // ── Payment Verification — checks Hive blockchain for a transfer ──────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ⚠ DEPRECATED / DEAD (Step-4 escrow migration). Replaced by escrow-core's
+// tx_id-anchored verifyPayment via verifyAndRecordPayment(). This account-history
+// SCAN verify captured NO tx_id and gave NO replay guard — do NOT reuse it for any
+// paid path (it's the exact gap the migration closed). Kept only until a cleanup pass.
 async function verifyHivePayment(fromUser, toUser, amount, memo, retries = PAYMENT_VERIFY_RETRIES) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -2915,6 +2945,23 @@ async function verifyHivePayment(fromUser, toUser, amount, memo, retries = PAYME
   console.error(`[payment] ✗ Payment not found after ${retries} attempts`);
   return false;
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── escrow-core verify + durable record (tx_id-anchored, replay-guarded) ──────
+// ─────────────────────────────────────────────────────────────────────────────
+// The Step-4 money-safety upgrade (handover-v4call-escrow-migration.md §2–§4):
+// every paid path now verifies the SPECIFIC broadcast tx via escrowCore.verifyPayment
+// (tx_id-anchored + EXACT-memo) instead of scanning account history / balances, and
+// writes a durable, replay-guarded row to the escrow-core ledger (tx_id UNIQUE). The
+// client MUST supply the Keychain txId — owner decision: require txId, NO legacy scan
+// fallback. The logic lives in ./escrow-verify.js (a factory) so it is unit-testable
+// against a temp ledger; here we just bind it to the live escrowCore + escrowLedger.
+//
+// NOTE: this REPLACES the verify boolean at each call site; it does NOT yet move
+// settlement off `activePayments` (that is Step 3/Step 6). The legacy ledgerPayment
+// audit rows stay for now — this only ADDS the durable, replay-guarded escrow row.
+const { verifyAndRecordPayment } = createEscrowVerify({ escrowCore, escrowLedger });
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3456,7 +3503,7 @@ io.on('connection', (socket) => {
   //           Server verifies on-chain before relaying, then disburses to recipient.
   // Blocked senders are rejected server-side regardless of client state.
 
-  socket.on('lobby-dm', async ({ to, ciphertext, senderCiphertext, signature, timestamp, msgId, textPaid, textMemo, textCurrency }) => {
+  socket.on('lobby-dm', async ({ to, ciphertext, senderCiphertext, signature, timestamp, msgId, textPaid, textMemo, textCurrency, textTxId }) => {
     const from = socket._username;
     if (!from) return;
 
@@ -3546,16 +3593,20 @@ io.on('connection', (socket) => {
       // Verify the transfer against the CALLEE's escrow (their rates post says
       // where to pay) — for federated recipients this is the peer's escrow,
       // not ours. We're only the verifier; disbursement happens on the
-      // recipient's server (it owns the escrow key).
-      const ok = (cur !== 'HBD' && cur !== 'HIVE')
-        ? await verifyHiveEnginePayment(from, calleeEscrow, textPaid, cur, textMemo)
-        : await verifyHivePayment(from, calleeEscrow, textPaid, textMemo);
-      if (!ok) {
-        socket.emit('lobby-dm-error', `Payment not found on blockchain — message not sent. Funds are safe if ${cur} left your account.`);
+      // recipient's server (it owns the escrow key). tx-anchored + replay-guarded.
+      const res = await verifyAndRecordPayment({
+        txId: textTxId, sender: from, escrowAccount: calleeEscrow, currency: cur,
+        memo: textMemo, expectedAmount: textPaid, ref: msgId, recordAmount: textPaid,
+        cols: { callee: to },
+      });
+      if (!res.ok) {
+        socket.emit('lobby-dm-error', res.replay
+          ? 'This payment was already used for another message.'
+          : `Payment not valid on blockchain — message not sent. Funds are safe if ${cur} left your account. (${res.reason})`);
         return;
       }
 
-      ledgerPayment(msgId, 'text', from, calleeEscrow, textPaid, textMemo, 'verified');
+      ledgerPayment(msgId, 'text', from, calleeEscrow, textPaid, textMemo, 'verified', textTxId);
 
       // For LOCAL recipients we disburse from our own escrow; for FEDERATED
       // recipients we forward the payment info and let their server disburse.
@@ -3602,6 +3653,7 @@ io.on('connection', (socket) => {
         from, to, ciphertext, signature, timestamp,
         textPaid:    textPaid    || 0,
         textMemo:    textMemo    || null,
+        textTxId:    textTxId    || null,
         textCurrency: cur,
         msgId:       msgId       || null,
         fromServer:  SERVER_DOMAIN
@@ -3700,7 +3752,7 @@ io.on('connection', (socket) => {
 
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
 
-  socket.on('verify-ring-payment', async ({ callId, callee, amount, memo, currency, escrow }, cb) => {
+  socket.on('verify-ring-payment', async ({ callId, txId, callee, amount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb({ verified: false, reason: 'Not authenticated' });
     const cur = currency || 'HBD';
@@ -3708,33 +3760,47 @@ io.on('connection', (socket) => {
     // this is the peer's escrow account, not our local one.
     const targetEscrow = escrow || ESCROW_ACCOUNT;
 
-    console.log(`[payment] Verifying ring: @${caller} → @${targetEscrow} ${amount} ${cur} (memo: ${memo})`);
-    const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(caller, targetEscrow, amount, cur, memo)
-      : await verifyHivePayment(caller, targetEscrow, amount, memo);
+    // Lock the applicable rate/fee BEFORE recording so they ride on the durable
+    // escrow row (the home for what activePayments holds today — handover §5).
+    let lockedRate = 0, lockedMinDeposit = 0, lockedPlatformFee = PLATFORM_FEE;
+    const rates = await fetchRates(callee);
+    if (rates) {
+      const applicable = await getRatesForCaller(rates, caller, 'voice', new Date());
+      if (applicable && !applicable.blocked && !applicable.feeRejected) {
+        lockedRate        = applicable.rate       || 0;
+        lockedMinDeposit  = applicable.minDeposit || 0;
+        lockedPlatformFee = applicable.platformFee || PLATFORM_FEE;
+      }
+    }
+
+    console.log(`[payment] Verifying ring: @${caller} → @${targetEscrow} ${amount} ${cur} (memo: ${memo}, tx: ${txId})`);
+    // tx-anchored VERIFY-ONLY. v4call bundles ring+connect+deposit into ONE on-chain
+    // transfer, so ring and deposit share a tx_id — the single durable row is written
+    // by the deposit step (which knows the full breakdown + the deposit cap). Recording
+    // here too would collide on tx_id UNIQUE. Ring just confirms the payment is real
+    // and locks the rate into activePayments.
+    const res = await verifyAndRecordPayment({
+      txId, sender: caller, escrowAccount: targetEscrow, currency: cur,
+      memo, expectedAmount: amount, ref: callId, record: false,
+    });
+    const ok = res.ok;
 
     if (ok) {
       if (!activePayments[callId]) activePayments[callId] = {};
       activePayments[callId].ringPaid    = amount;
       activePayments[callId].ringMemo    = memo;
+      activePayments[callId].ringTxId    = txId;
       activePayments[callId].caller      = caller;
       activePayments[callId].callee      = callee;
       activePayments[callId].currency    = cur;
       activePayments[callId].escrow      = targetEscrow;
+      activePayments[callId].ratePerHour = lockedRate;
+      activePayments[callId].minDeposit  = lockedMinDeposit;
+      activePayments[callId].platformFee = lockedPlatformFee;
+      console.log(`[payment] Ring fee verified for ${callId} — rate: ${lockedRate} ${cur}/hr`);
 
-      // Fetch and store rate info for billing at call end
-      const rates = await fetchRates(callee);
-      if (rates) {
-        const applicable = await getRatesForCaller(rates, caller, 'voice', new Date());
-        if (applicable && !applicable.blocked && !applicable.feeRejected) {
-          activePayments[callId].ratePerHour = applicable.rate       || 0;
-          activePayments[callId].minDeposit  = applicable.minDeposit || 0;
-          activePayments[callId].platformFee = applicable.platformFee || PLATFORM_FEE;
-        }
-      }
-      console.log(`[payment] Ring fee verified for ${callId} — rate: ${activePayments[callId].ratePerHour} ${cur}/hr`);
-
-      // If callee is on a federated peer, forward verified payment so peer can settle at end.
+      // If callee is on a federated peer, forward verified payment (incl. txId so the
+      // peer can tx-anchor its own re-verify) so it can settle at end.
       if (FEDERATION_ENABLED) {
         const peer = peerForUser(callee);
         if (peer) {
@@ -3742,9 +3808,9 @@ io.on('connection', (socket) => {
           fedSend(peer.ws, {
             type: 'payment-verified',
             paymentType: 'ring',
-            callId, from: caller, to: callee, amount, currency: cur, memo,
-            ratePerHour: activePayments[callId].ratePerHour,
-            platformFee: activePayments[callId].platformFee,
+            callId, txId, from: caller, to: callee, amount, currency: cur, memo,
+            ratePerHour: lockedRate,
+            platformFee: lockedPlatformFee,
             callType: 'voice',
             callerServer: SERVER_DOMAIN
           });
@@ -3752,31 +3818,49 @@ io.on('connection', (socket) => {
       }
     }
 
-    cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
+    cb({ verified: ok, reason: ok ? null : (res.reason || 'Payment not found on blockchain') });
   });
 
-  socket.on('verify-deposit-payment', async ({ callId, callee, totalAmount, depositAmount, connectAmount, memo, currency, escrow }, cb) => {
+  socket.on('verify-deposit-payment', async ({ callId, txId, callee, totalAmount, depositAmount, connectAmount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false, reason: 'Not authenticated' });
     const cur = currency || 'HBD';
     const targetEscrow = escrow || ESCROW_ACCOUNT;
 
-    console.log(`[payment] Verifying deposit: @${caller} → @${targetEscrow} ${totalAmount} ${cur} (memo: ${memo})`);
-    const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(caller, targetEscrow, totalAmount, cur, memo)
-      : await verifyHivePayment(caller, targetEscrow, totalAmount, memo);
+    console.log(`[payment] Verifying deposit: @${caller} → @${targetEscrow} ${totalAmount} ${cur} (memo: ${memo}, tx: ${txId})`);
+    // This is the SINGLE durable row for the whole call payment (ring+connect+deposit
+    // are one on-chain transfer). Verify the FULL transfer (= totalAmount), but store
+    // amount = depositAmount as the refundable settlement cap, with the non-refundable
+    // ring/connect portions as adapter columns (handover §5). ring_paid is derivable:
+    // ring = total − connect − deposit. rate/fee were locked by the ring step.
+    const ap = activePayments[callId] || {};
+    const ringPortion = Math.max(0, parseFloat((totalAmount - (depositAmount || 0) - (connectAmount || 0)).toFixed(8)));
+    const res = await verifyAndRecordPayment({
+      txId, sender: caller, escrowAccount: targetEscrow, currency: cur,
+      memo, expectedAmount: totalAmount, ref: callId,
+      recordAmount: depositAmount,
+      cols: {
+        connect_paid:  connectAmount || 0,
+        ring_paid:     ringPortion,
+        rate_per_hour: ap.ratePerHour,
+        platform_fee:  ap.platformFee,
+        callee,
+      },
+    });
+    const ok = res.ok;
 
     if (ok) {
       if (!activePayments[callId]) activePayments[callId] = {};
       activePayments[callId].depositPaid     = depositAmount;
       activePayments[callId].connectPaid     = connectAmount || 0;
       activePayments[callId].creditRemaining = depositAmount;
+      activePayments[callId].depositTxId     = txId;
       activePayments[callId].caller          = caller;
       activePayments[callId].callee          = callee;
       activePayments[callId].currency        = cur;
       activePayments[callId].escrow          = targetEscrow;
       console.log(`[payment] ✓ Deposit verified ${callId}: total=${totalAmount} connect=${connectAmount} deposit=${depositAmount} ${cur}`);
-      ledgerPayment(callId, 'deposit', caller, targetEscrow, totalAmount, memo, 'verified');
+      ledgerPayment(callId, 'deposit', caller, targetEscrow, totalAmount, memo, 'verified', txId);
 
       if (FEDERATION_ENABLED) {
         const peer = peerForUser(callee);
@@ -3785,7 +3869,7 @@ io.on('connection', (socket) => {
           fedSend(peer.ws, {
             type: 'payment-verified',
             paymentType: 'deposit',
-            callId, from: caller, to: callee,
+            callId, txId, from: caller, to: callee,
             amount: totalAmount, depositAmount, connectAmount: connectAmount || 0,
             currency: cur, memo,
             callerServer: SERVER_DOMAIN
@@ -3794,18 +3878,22 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (cb) cb({ verified: ok, reason: ok ? null : 'Payment not found on blockchain' });
+    if (cb) cb({ verified: ok, reason: ok ? null : (res.reason || 'Payment not found on blockchain') });
   });
 
-  socket.on('verify-topup-payment', async ({ callId, amount, memo, currency, escrow }, cb) => {
+  socket.on('verify-topup-payment', async ({ callId, txId, amount, memo, currency, escrow }, cb) => {
     const caller = socket._username;
     if (!caller) return cb && cb({ verified: false });
     const cur = currency || 'HBD';
     const targetEscrow = escrow || activePayments[callId]?.escrow || ESCROW_ACCOUNT;
 
-    const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(caller, targetEscrow, amount, cur, memo)
-      : await verifyHivePayment(caller, targetEscrow, amount, memo);
+    // Each top-up is its own on-chain transfer → its own durable row (same ref=callId).
+    const res = await verifyAndRecordPayment({
+      txId, sender: caller, escrowAccount: targetEscrow, currency: cur,
+      memo, expectedAmount: amount, ref: callId, recordAmount: amount,
+      cols: { callee: activePayments[callId]?.callee },
+    });
+    const ok = res.ok;
 
     if (ok && activePayments[callId]) {
       activePayments[callId].depositPaid     = (activePayments[callId].depositPaid     || 0) + amount;
@@ -3815,7 +3903,7 @@ io.on('connection', (socket) => {
       if (room) io.to(room).emit('credit-topup', {
         amount, creditRemaining: activePayments[callId].creditRemaining, minutesLeft: minLeft
       });
-      ledgerPayment(callId, 'topup', caller, targetEscrow, amount, memo, 'verified');
+      ledgerPayment(callId, 'topup', caller, targetEscrow, amount, memo, 'verified', txId);
       console.log(`[payment] Top-up ${amount} ${cur} for call ${callId}`);
 
       if (FEDERATION_ENABLED && activePayments[callId].calleeServer) {
@@ -3824,24 +3912,32 @@ io.on('connection', (socket) => {
           fedSend(peer.ws, {
             type: 'payment-verified',
             paymentType: 'topup',
-            callId, from: caller, to: activePayments[callId].callee,
+            callId, txId, from: caller, to: activePayments[callId].callee,
             amount, currency: cur, memo,
             callerServer: SERVER_DOMAIN
           });
         }
       }
     }
-    if (cb) cb({ verified: ok });
+    if (cb) cb({ verified: ok, reason: ok ? null : (res.reason || 'Payment not found on blockchain') });
   });
 
-  socket.on('verify-connect-payment', async ({ callId, callee, amount, memo }) => {
+  // Legacy/dead path: the current client folds the connect fee into the deposit
+  // transfer (verify-deposit-payment's connectAmount). Kept tx-anchored for parity —
+  // requires a txId like every other paid path (no scan fallback).
+  socket.on('verify-connect-payment', async ({ callId, txId, callee, amount, memo, currency }) => {
     const caller = socket._username;
     if (!caller) return;
     if (!activePayments[callId]) activePayments[callId] = {};
-    const ok = await verifyHivePayment(caller, ESCROW_ACCOUNT, amount, memo);
-    if (ok) {
+    const cur = currency || 'HBD';
+    const res = await verifyAndRecordPayment({
+      txId, sender: caller, escrowAccount: ESCROW_ACCOUNT, currency: cur,
+      memo, expectedAmount: amount, ref: callId, recordAmount: amount,
+      cols: { connect_paid: amount, callee },
+    });
+    if (res.ok) {
       activePayments[callId].connectPaid = amount;
-      console.log(`[payment] Connect fee verified for ${callId}: ${amount} HBD`);
+      console.log(`[payment] Connect fee verified for ${callId}: ${amount} ${cur}`);
     }
   });
 
@@ -4722,13 +4818,18 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Verify on-chain — payment is to OUR escrow (inviter-holds-funds).
+      // Verify on-chain (tx-anchored + replay-guarded) — payment is to OUR escrow
+      // (inviter-holds-funds), so this durable row is the settlement authority.
       const fedCur = payment.currency;
-      const fedOk = (fedCur !== 'HBD' && fedCur !== 'HIVE')
-        ? await verifyHiveEnginePayment(fedInviter, ESCROW_ACCOUNT, payment.paid, fedCur, payment.memo)
-        : await verifyHivePayment(fedInviter, ESCROW_ACCOUNT, payment.paid, payment.memo);
-      if (!fedOk) {
-        socket.emit('allowlist-error', { room, reason: `Payment not found on blockchain. If ${fedCur} left your account, it can be recovered manually — note the memo: ${payment.memo}` });
+      const fedRes = await verifyAndRecordPayment({
+        txId: payment.txId, sender: fedInviter, escrowAccount: ESCROW_ACCOUNT, currency: fedCur,
+        memo: payment.memo, expectedAmount: payment.paid, ref: payment.inviteId, recordAmount: payment.paid,
+        cols: { callee: fedInvitee },
+      });
+      if (!fedRes.ok) {
+        socket.emit('allowlist-error', { room, reason: fedRes.replay
+          ? 'This payment transaction has already been used.'
+          : `Payment not valid on blockchain. If ${fedCur} left your account, it can be recovered manually — note the memo: ${payment.memo} (${fedRes.reason})` });
         return;
       }
 
@@ -4757,7 +4858,7 @@ io.on('connection', (socket) => {
         created_at:    Date.now(),
         paid_invite:   true
       };
-      ledgerPayment(payment.inviteId, 'invite', fedInviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', null, fedCur);
+      ledgerPayment(payment.inviteId, 'invite', fedInviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', payment.txId, fedCur);
 
       r.allowlist.add(canonical);
       fedSend(peer.ws, {
@@ -4772,6 +4873,7 @@ io.on('connection', (socket) => {
             currency:      fedCur,
             paid:          payment.paid,
             memo:          payment.memo,
+            txId:          payment.txId, // additive (no version bump): peer tx-anchors its re-verify
             source_escrow: ESCROW_ACCOUNT // recipient verifies the on-chain payment was here
           }
         }
@@ -4869,13 +4971,18 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Verify on-chain. Funds went to OUR escrow (recipient is local on this server).
+    // Verify on-chain (tx-anchored + replay-guarded). Funds went to OUR escrow
+    // (recipient is local on this server).
     const cur = payment.currency;
-    const ok = (cur !== 'HBD' && cur !== 'HIVE')
-      ? await verifyHiveEnginePayment(inviter, ESCROW_ACCOUNT, payment.paid, cur, payment.memo)
-      : await verifyHivePayment(inviter, ESCROW_ACCOUNT, payment.paid, payment.memo);
-    if (!ok) {
-      socket.emit('allowlist-error', { room, reason: `Payment not found on blockchain. If ${cur} left your account, it can be recovered manually — note the memo: ${payment.memo}` });
+    const res = await verifyAndRecordPayment({
+      txId: payment.txId, sender: inviter, escrowAccount: ESCROW_ACCOUNT, currency: cur,
+      memo: payment.memo, expectedAmount: payment.paid, ref: payment.inviteId, recordAmount: payment.paid,
+      cols: { callee: invitee },
+    });
+    if (!res.ok) {
+      socket.emit('allowlist-error', { room, reason: res.replay
+        ? 'This payment transaction has already been used.'
+        : `Payment not valid on blockchain. If ${cur} left your account, it can be recovered manually — note the memo: ${payment.memo} (${res.reason})` });
       return;
     }
 
@@ -4892,7 +4999,7 @@ io.on('connection', (socket) => {
       created_at: Date.now(),
       type:       'allowlist'
     };
-    ledgerPayment(payment.inviteId, 'invite', inviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', null, cur);
+    ledgerPayment(payment.inviteId, 'invite', inviter, ESCROW_ACCOUNT, payment.paid, payment.memo, 'verified', payment.txId, cur);
 
     r.allowlist.add(invitee);
     const lu = lobbyUsers[invitee];
@@ -5509,15 +5616,20 @@ io.on('connection', (socket) => {
 
         // Caller-side on-chain verification against the recipient's declared
         // escrow (the peer's escrow for federated, or our own for local).
-        const ok = (cur !== 'HBD' && cur !== 'HIVE')
-          ? await verifyHiveEnginePayment(from, calleeEscrow, env.textPaid, cur, env.textMemo)
-          : await verifyHivePayment(from, calleeEscrow, env.textPaid, env.textMemo);
-        if (!ok) {
-          socket.emit('dm-attachment-error', { msgId: env.msgId, error: `Payment not found on blockchain — attachment not sent. Funds are safe if ${cur} left your account.` });
+        // tx-anchored + replay-guarded.
+        const res = await verifyAndRecordPayment({
+          txId: env.textTxId, sender: from, escrowAccount: calleeEscrow, currency: cur,
+          memo: env.textMemo, expectedAmount: env.textPaid, ref: env.msgId, recordAmount: env.textPaid,
+          cols: { callee: to },
+        });
+        if (!res.ok) {
+          socket.emit('dm-attachment-error', { msgId: env.msgId, error: res.replay
+            ? 'This payment was already used for another message.'
+            : `Payment not valid on blockchain — attachment not sent. Funds are safe if ${cur} left your account. (${res.reason})` });
           return;
         }
 
-        ledgerPayment(env.msgId, 'text', from, calleeEscrow, env.textPaid, env.textMemo, 'verified', null, cur);
+        ledgerPayment(env.msgId, 'text', from, calleeEscrow, env.textPaid, env.textMemo, 'verified', env.textTxId, cur);
 
         // Disbursement ONLY runs on the local-recipient path. For federated
         // recipients the peer's server owns the escrow and does the disburse
@@ -5576,6 +5688,7 @@ io.on('connection', (socket) => {
           msgId:        env.msgId        || null,
           textPaid:     env.textPaid     || 0,
           textMemo:     env.textMemo     || null,
+          textTxId:     env.textTxId     || null,
           textCurrency: cur,
           fromServer:   SERVER_DOMAIN
         });
@@ -6304,7 +6417,7 @@ async function fedHandleMessage(ws, raw) {
       // Paid DMs include payment fields; we verify on-chain against OUR escrow
       // (the destination per recipient's rates post) and disburse from it.
       const { from, to, ciphertext, signature, timestamp,
-              textPaid, textMemo, textCurrency, msgId, fromServer } = msg;
+              textPaid, textMemo, textTxId, textCurrency, msgId, fromServer } = msg;
       if (!from || !to || !ciphertext) return;
       const recipient = lobbyUsers[to];
       const cur       = textCurrency || 'HBD';
@@ -6329,14 +6442,17 @@ async function fedHandleMessage(ws, raw) {
       };
 
       if (paid >= dmFloor && textMemo && msgId) {
-        // Re-verify on-chain (caller's server already verified, but trust-but-verify)
-        const verifier = (cur !== 'HBD' && cur !== 'HIVE')
-          ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
-          : verifyHivePayment(from, ESCROW_ACCOUNT, paid, textMemo);
-        verifier.then(async ok => {
-          if (!ok) {
-            console.warn(`[fed-text] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo})`);
-            fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: 'payment not on chain' });
+        // Re-verify on-chain against OUR escrow (we hold the funds + disburse).
+        // tx-anchored + durable replay guard — this closes the redelivery gap
+        // (a re-delivered fed DM with the same txId is rejected as replay).
+        const verifier = verifyAndRecordPayment({
+          txId: textTxId, sender: from, escrowAccount: ESCROW_ACCOUNT, currency: cur,
+          memo: textMemo, expectedAmount: paid, ref: msgId, recordAmount: paid, cols: { callee: to },
+        });
+        verifier.then(async res => {
+          if (!res.ok) {
+            console.warn(`[fed-text] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo}) — ${res.reason}`);
+            fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: res.replay ? 'payment already used (replay)' : 'payment not on chain' });
             return;
           }
 
@@ -6393,7 +6509,7 @@ async function fedHandleMessage(ws, raw) {
             return;
           }
 
-          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified');
+          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified', textTxId, cur);
 
           // Disburse from our escrow — recipient gets net, we keep platform cut.
           const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
@@ -6446,7 +6562,7 @@ async function fedHandleMessage(ws, raw) {
       // see plaintext. Paid path: re-verify on-chain to OUR escrow (we're the
       // recipient's home server = treasurer), recipient-side rate enforcement
       // per design rule #15, refund on reject.
-      const { from, to, envelope, msgId, textPaid, textMemo, textCurrency, fromServer } = msg;
+      const { from, to, envelope, msgId, textPaid, textMemo, textTxId, textCurrency, fromServer } = msg;
       if (!from || !to || !envelope || !envelope.cid || !envelope.envelope_sig) return;
       if (!envelope.per_recipient || typeof envelope.per_recipient !== 'object') return;
       if (!(from in envelope.per_recipient) || !(to in envelope.per_recipient)) return;
@@ -6467,13 +6583,15 @@ async function fedHandleMessage(ws, raw) {
 
       if (paid >= dmFloor && textMemo && msgId) {
         // Re-verify on-chain to OUR escrow (we're the treasurer here).
-        const verifier = (cur !== 'HBD' && cur !== 'HIVE')
-          ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, paid, cur, textMemo)
-          : verifyHivePayment(from, ESCROW_ACCOUNT, paid, textMemo);
-        verifier.then(async ok => {
-          if (!ok) {
-            console.warn(`[fed-att] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo})`);
-            fedSend(ws, { type: 'dm-attachment-failed', from, to, msgId, reason: 'payment not on chain' });
+        // tx-anchored + durable replay guard (closes the redelivery gap).
+        const verifier = verifyAndRecordPayment({
+          txId: textTxId, sender: from, escrowAccount: ESCROW_ACCOUNT, currency: cur,
+          memo: textMemo, expectedAmount: paid, ref: msgId, recordAmount: paid, cols: { callee: to },
+        });
+        verifier.then(async res => {
+          if (!res.ok) {
+            console.warn(`[fed-att] ✗ Payment re-verify failed: @${from} → @${ESCROW_ACCOUNT} ${paid} ${cur} (memo: ${textMemo}) — ${res.reason}`);
+            fedSend(ws, { type: 'dm-attachment-failed', from, to, msgId, reason: res.replay ? 'payment already used (replay)' : 'payment not on chain' });
             return;
           }
 
@@ -6513,7 +6631,7 @@ async function fedHandleMessage(ws, raw) {
             return;
           }
 
-          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified', null, cur);
+          ledgerPayment(msgId, 'text', from, ESCROW_ACCOUNT, paid, textMemo, 'verified', textTxId, cur);
 
           // Disburse net to recipient, fee to platform.
           const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
@@ -6681,16 +6799,41 @@ async function fedHandleMessage(ws, raw) {
       // Caller's server forwarded a verified payment. We re-verify on-chain
       // (the payment should have landed in OUR escrow since we host the callee)
       // and record it in activePayments so processFederatedCallEnd can settle.
-      const { paymentType, callId, from, to, amount, currency, memo } = msg;
+      const { paymentType, callId, txId, from, to, amount, currency, memo } = msg;
       if (!callId || !from || !to) break;
       const cur = currency || 'HBD';
-      const verifier = (cur !== 'HBD' && cur !== 'HIVE')
-        ? verifyHiveEnginePayment(from, ESCROW_ACCOUNT, amount, cur, memo)
-        : verifyHivePayment(from, ESCROW_ACCOUNT, amount, memo);
-      verifier.then(async ok => {
-        if (!ok) {
-          console.warn(`[fed-payment] ✗ Re-verify failed for ${paymentType} ${callId} (@${from} → @${ESCROW_ACCOUNT} ${amount} ${cur})`);
-          fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: 'on-chain not found' });
+      // ring+connect+deposit are ONE on-chain transfer (shared tx_id), arriving as two
+      // payment-verified messages. The DEPOSIT message writes the single durable row
+      // (cap = depositAmount, with ring/connect portions + the recipient-recomputed
+      // rate/fee from activePayments as columns); RING is verify-only (recording it too
+      // would collide on tx_id UNIQUE). topup is a separate transfer → its own row.
+      const isRing    = paymentType === 'ring';
+      const isDeposit = paymentType === 'deposit';
+      const recAmount = isDeposit ? (msg.depositAmount || amount) : amount;
+      let recCols = { callee: to };
+      if (isDeposit) {
+        const ap = activePayments[callId] || {};
+        const ringPortion = Math.max(0, parseFloat((amount - (msg.depositAmount || 0) - (msg.connectAmount || 0)).toFixed(8)));
+        recCols = {
+          connect_paid:  msg.connectAmount || 0,
+          ring_paid:     ringPortion,
+          rate_per_hour: ap.ratePerHour,        // recipient-recomputed (set by the ring msg), not the peer's claim
+          platform_fee:  ap.posterPlatformFee,
+          callee:        to,
+        };
+      }
+      // tx-anchored verify + durable replay-guarded record. The replay short-circuit
+      // (already-seen txId → rejected before any work) is what makes this redelivery-
+      // prone federated path safe (closes the :1234 relay-redelivery gap).
+      const verifier = verifyAndRecordPayment({
+        txId, sender: from, escrowAccount: ESCROW_ACCOUNT, currency: cur,
+        memo, expectedAmount: amount, ref: callId, recordAmount: recAmount, cols: recCols,
+        record: !isRing,   // ring shares the deposit's tx_id → verify-only here
+      });
+      verifier.then(async res => {
+        if (!res.ok) {
+          console.warn(`[fed-payment] ✗ Re-verify failed for ${paymentType} ${callId} (@${from} → @${ESCROW_ACCOUNT} ${amount} ${cur}) — ${res.reason}`);
+          fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: res.replay ? 'payment already used (replay)' : 'on-chain not found' });
           return;
         }
 
@@ -6762,7 +6905,7 @@ async function fedHandleMessage(ws, raw) {
           if (msg.callType    !== undefined) p.callType    = msg.callType;
           ledgerCallCreate(callId, from, to, msg.callType || 'voice');
           // v0.16.9 — pass currency so missed-call popup shows the actual token
-          ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
+          ledgerPayment(callId, 'ring', from, ESCROW_ACCOUNT, amount, memo, 'verified', txId, cur);
           // Also mark this call as 'ringing' so the missed/cancelled status
           // updates from federation `call-missed` / `call-cancelled` find a row.
           ledgerCallUpdate(callId, { status: 'ringing' });
@@ -6770,11 +6913,11 @@ async function fedHandleMessage(ws, raw) {
           p.depositPaid     = msg.depositAmount || amount;
           p.connectPaid     = msg.connectAmount || 0;
           p.creditRemaining = p.depositPaid;
-          ledgerPayment(callId, 'deposit', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
+          ledgerPayment(callId, 'deposit', from, ESCROW_ACCOUNT, amount, memo, 'verified', txId, cur);
         } else if (paymentType === 'topup') {
           p.depositPaid     = (p.depositPaid     || 0) + amount;
           p.creditRemaining = (p.creditRemaining || 0) + amount;
-          ledgerPayment(callId, 'topup', from, ESCROW_ACCOUNT, amount, memo, 'verified', null, cur);
+          ledgerPayment(callId, 'topup', from, ESCROW_ACCOUNT, amount, memo, 'verified', txId, cur);
           // Let the local callee's UI know the caller added more credit.
           const calleeSid = lobbyUsers[to]?.socketId;
           if (calleeSid) io.to(calleeSid).emit('credit-topup', {
@@ -6885,7 +7028,7 @@ async function fedHandleMessage(ws, raw) {
       }
 
       if (payment) {
-        const { currency, paid, memo, source_escrow } = payment;
+        const { currency, paid, memo, source_escrow, txId: payTxId } = payment;
         if (!currency || !(paid > 0) || !memo || !source_escrow) {
           fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'malformed payment payload' });
           console.log(`[federation] ← room-invite paid but malformed payment payload — rejected`);
@@ -6920,15 +7063,18 @@ async function fedHandleMessage(ws, raw) {
           return;
         }
 
-        // Re-verify the on-chain payment is from from_user to source_escrow
-        // for the claimed amount + currency + memo. This catches a malicious
-        // source server claiming a payment that didn't actually happen.
-        const ok = (currency !== 'HBD' && currency !== 'HIVE')
-          ? await verifyHiveEnginePayment(from_user, source_escrow, paid, currency, memo)
-          : await verifyHivePayment(from_user, source_escrow, paid, memo);
-        if (!ok) {
+        // Re-verify the on-chain payment (tx-anchored) is from from_user to
+        // source_escrow for the claimed amount + currency + memo. Catches a
+        // malicious source server claiming a payment that didn't happen.
+        // VERIFY-ONLY: inviter-holds-funds — the durable row + replay guard live
+        // on the inviter's server, not ours (we don't settle these funds).
+        const res = await verifyAndRecordPayment({
+          txId: payTxId, sender: from_user, escrowAccount: source_escrow, currency,
+          memo, expectedAmount: paid, record: false,
+        });
+        if (!res.ok) {
           fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'on-chain payment not found' });
-          console.log(`[federation] ← payment ${paid} ${currency} from @${from_user} → @${source_escrow} (memo ${memo}) not found on chain — rejected`);
+          console.log(`[federation] ← payment ${paid} ${currency} from @${from_user} → @${source_escrow} (memo ${memo}) not valid on chain (${res.reason}) — rejected`);
           return;
         }
         console.log(`[paid-invite][fed-recv] ✓ Validated paid invite ${invite_id} — @${from_user}@${ws._domain} paid ${paid} ${currency} to @${source_escrow} for @${target}`);
