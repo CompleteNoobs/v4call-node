@@ -77,6 +77,7 @@ const WebSocket  = require('ws');
 const escrowCore = require('escrow-core');   // pinned engine (escrow-core@^0.1) — durable, replay-guarded money core
                                              // (NOT `escrow`: many handlers destructure an `escrow` ACCOUNT param)
 const { createEscrowVerify } = require('./escrow-verify');
+const { createEscrowReporter } = require('./escrow-report');
 
 const app    = express();
 const server = http.createServer(app);
@@ -321,6 +322,45 @@ const escrowLedger = escrowCore.openLedger(ESCROW_DB_PATH, {
 });
 console.log('[escrow] escrow-core', escrowCore.version, 'ledger ready:', ESCROW_DB_PATH,
   `(account @${escrowAdapter.account}, currency ${escrowAdapter.currency})`);
+
+// Persist a call's connect time onto its durable payment row(s) at answer-time, so the
+// escrow row is self-sufficient for metering at settlement (handover §5: startTime→
+// start_ts). This is the last settlement input that used to live only in the in-memory
+// activePayments cache — once it's on the row, the durable row is the sole settlement
+// source of truth (handover §9) and activePayments is purely a live-call cache. v4call's
+// per-service column; escrow-core exposes its db handle for exactly this adapter write
+// (a setPaymentStartTs() core API would be the eventual cleaner home).
+const _setEscrowStartTsStmt = escrowLedger.db.prepare('UPDATE payments SET start_ts = ? WHERE ref = ?');
+function recordEscrowStartTs(ref, ts) {
+  try { _setEscrowStartTsStmt.run(ts, ref); }      // 0 rows for free/legacy calls — harmless
+  catch (e) { console.warn(`[escrow] could not persist start_ts for ${ref}: ${e.message}`); }
+}
+
+// ── escrow-protocol/0.1 report·receipt seam (handover §6; Step-5 box-readiness) ──
+// The escrow-reporting key IS the node's NOSTR identity (sk_hex), which nostr-fed.mjs
+// writes to NOSTR_KEY_PATH at boot in all modes — escrow-core's schnorr sigs are
+// interoperable with it. Read lazily (the file may not exist for the first few ms of
+// boot); until then the seam degrades to unsigned and settlement is unaffected.
+let _reportingSkCache = null;
+function getEscrowReportingSk() {
+  if (_reportingSkCache) return _reportingSkCache;
+  try {
+    if (fs.existsSync(NOSTR_KEY_PATH)) {
+      const j = JSON.parse(fs.readFileSync(NOSTR_KEY_PATH, 'utf8'));
+      if (j && typeof j.sk_hex === 'string' && /^[0-9a-f]{64}$/i.test(j.sk_hex)) {
+        _reportingSkCache = j.sk_hex.toLowerCase();
+        return _reportingSkCache;
+      }
+    }
+  } catch (e) { /* not ready / unreadable → seam stays unsigned, never blocks money */ }
+  return null;
+}
+const escrowReporter = createEscrowReporter({
+  escrowCore,
+  getSkHex: getEscrowReportingSk,
+  reporter: () => SERVER_HIVE_ACCOUNT,   // the node's on-chain identity (report `reporter`)
+  service: 'v4call',
+});
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2280,6 +2320,13 @@ async function disbursePaidInvite(inviteId) {
 // ── Payment tracking ──────────────────────────────────────────────────────────
 // activePayments: callId → { caller, callee, ringPaid, depositPaid, creditRemaining,
 //                            connectPaid, startTime, ratePerHour, escrow, platformFee, _processing }
+//
+// As of the Step-4 escrow migration this is a LIVE-CALL CACHE only — credit-burn,
+// live UI updates (top-ups / minutes-left), routing, and federation forwarding. It is
+// NO LONGER the settlement source of truth (handover §9): processCallEnd /
+// processFederatedCallEnd read the money facts (amounts, rate, connect/ring, start_ts)
+// from the durable escrow-core payment row and only fall back to this map for legacy
+// in-flight calls (those verified before the migration, which have no durable row).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const activePayments = {};
@@ -2467,18 +2514,18 @@ async function getEscrowBalance() {
   return parseFloat(hbd.split(' ')[0]);
 }
 
+// Custodial disburse from escrow. The on-chain broadcast now goes through
+// escrow-core.disburse (Step-4 §8.5) — native HBD/HIVE here, HE tokens via
+// sendFromEscrowToken. We keep v4call's friendly pre-checks (dust-skip, balance) and
+// the legacy audit rows; only the signer/broadcast is swapped. Return shape is
+// unchanged ({ success, txId, skipped, reason }) plus `noKey` so the caller can leave
+// a refund row PENDING when V4CALL_ESCROW_KEY is unset (never double-paid).
 async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null) {
   // Route token transfers to the Hive-Engine path
   if (currency !== 'HBD' && currency !== 'HIVE') {
     return sendFromEscrowToken(to, amount, memo, currency, callId);
   }
 
-  const escrowKey = process.env.V4CALL_ESCROW_KEY;
-  if (!escrowKey) {
-    console.error('[escrow] V4CALL_ESCROW_KEY not set — cannot disburse');
-    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
-    return { success: false, reason: 'Escrow key not configured' };
-  }
   if (amount < 0.001) { // HBD/HIVE only here (tokens routed above) → 3-decimal floor
     console.log(`[escrow] Amount ${amount} too small — skipping transfer to @${to}`);
     return { success: true, skipped: true };
@@ -2492,22 +2539,19 @@ async function sendFromEscrow(to, amount, memo, currency = 'HBD', callId = null)
   }
 
   try {
-    const client    = new dhive.Client(HIVE_API_NODES);
-    const key       = dhive.PrivateKey.fromString(escrowKey);
     const amountStr = amount.toFixed(3) + ' ' + currency;
-
     console.log(`[escrow] Transfer: ${amountStr} → @${to} | memo: ${memo}`);
-    const result = await client.broadcast.transfer({
-      from: ESCROW_ACCOUNT, to, amount: amountStr, memo
-    }, key);
-
-    console.log(`[escrow] ✓ Sent ${amountStr} to @${to} — tx: ${result.id}`);
-    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', result.id);
-    return { success: true, txId: result.id, amount: amountStr };
+    const { txId } = await escrowCore.disburse({
+      to, amount, currency, memo, fromAccount: ESCROW_ACCOUNT, keyEnv: 'V4CALL_ESCROW_KEY',
+    });
+    console.log(`[escrow] ✓ Sent ${amountStr} to @${to} — tx: ${txId}`);
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', txId);
+    return { success: true, txId, amount: amountStr };
   } catch(e) {
-    console.error(`[escrow] ✗ TRANSFER FAILED to @${to}: ${e.message}`);
+    const noKey = e.code === 'no_key';
+    console.error(`[escrow] ✗ TRANSFER ${noKey ? 'SKIPPED (V4CALL_ESCROW_KEY not set)' : 'FAILED'} to @${to}: ${e.message}`);
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
-    return { success: false, reason: e.message };
+    return { success: false, reason: e.message, noKey };
   }
 }
 
@@ -2527,12 +2571,6 @@ async function getEscrowTokenBalance(symbol) {
 }
 
 async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
-  const escrowKey = process.env.V4CALL_ESCROW_KEY;
-  if (!escrowKey) {
-    console.error('[escrow-token] V4CALL_ESCROW_KEY not set — cannot disburse');
-    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
-    return { success: false, reason: 'Escrow key not configured' };
-  }
   const tokenPrec = await getCurrencyPrecision(symbol);
   if (amount < Math.pow(10, -tokenPrec)) {
     console.log(`[escrow-token] Amount ${amount} below ${symbol} precision (${tokenPrec}) — skipping transfer to @${to}`);
@@ -2547,36 +2585,20 @@ async function sendFromEscrowToken(to, amount, memo, symbol, callId = null) {
   }
 
   try {
-    const client = new dhive.Client(HIVE_API_NODES);
-    const key    = dhive.PrivateKey.fromString(escrowKey);
-    const json   = JSON.stringify({
-      contractName:   'tokens',
-      contractAction: 'transfer',
-      contractPayload: {
-        symbol,
-        to,
-        // Format to the token's real precision, then strip only zeros AFTER a
-        // decimal point (never trailing zeros of a whole number, e.g. "100").
-        quantity: amount.toFixed(tokenPrec).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, ''),
-        memo
-      }
-    });
-
+    // escrow-core.disburse builds the HE custom_json (ssc-mainnet-hive, ACTIVE auth)
+    // and formats the quantity at the token's locked precision (places).
     console.log(`[escrow-token] Transfer: ${amount} ${symbol} → @${to} | memo: ${memo}`);
-    const result = await client.broadcast.json({
-      required_auths:         [ESCROW_ACCOUNT],
-      required_posting_auths: [],
-      id:                     'ssc-mainnet-hive',
-      json
-    }, key);
-
-    console.log(`[escrow-token] ✓ Sent ${amount} ${symbol} to @${to} — tx: ${result.id}`);
-    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', result.id);
-    return { success: true, txId: result.id, amount: `${amount} ${symbol}` };
+    const { txId } = await escrowCore.disburse({
+      to, amount, currency: symbol, memo, fromAccount: ESCROW_ACCOUNT, keyEnv: 'V4CALL_ESCROW_KEY', places: tokenPrec,
+    });
+    console.log(`[escrow-token] ✓ Sent ${amount} ${symbol} to @${to} — tx: ${txId}`);
+    if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'sent', txId);
+    return { success: true, txId, amount: `${amount} ${symbol}` };
   } catch(e) {
-    console.error(`[escrow-token] ✗ TOKEN TRANSFER FAILED to @${to}: ${e.message}`);
+    const noKey = e.code === 'no_key';
+    console.error(`[escrow-token] ✗ TOKEN TRANSFER ${noKey ? 'SKIPPED (V4CALL_ESCROW_KEY not set)' : 'FAILED'} to @${to}: ${e.message}`);
     if (callId) ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, to, amount, memo, 'failed');
-    return { success: false, reason: e.message };
+    return { success: false, reason: e.message, noKey };
   }
 }
 
@@ -2615,6 +2637,27 @@ async function verifyHiveEnginePayment(fromUser, toUser, amount, symbol, memo, r
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Call End — calculate bill, disburse from escrow, send receipts ────────────
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Close out one durable escrow-core refund row after a disburse attempt, and mirror
+// the legacy audit row (handover §4). The durable row is what makes a crash mid-settle
+// safe: atomicClose already made THIS the sole settlement, so an unsettled row can be
+// retried without ever double-paying.
+//   success            → 'sent'    (+ legacy row → sent)
+//   dust-skip          → 'skipped' (escrow-core skips sub-precision amounts)
+//   missing escrow key → leave PENDING (operator transfers manually / retry later)
+//   other broadcast err→ 'failed'
+function finalizeOutflow(refundId, callId, legacyType, result) {
+  if (result.success) {
+    escrowLedger.markRefundSettled(refundId, result.skipped ? 'skipped' : 'sent', result.txId || null);
+    ledgerPaymentUpdate(callId, legacyType, 'sent', result.txId);   // preserve legacy audit behaviour
+  } else if (result.noKey) {
+    // disburse threw code:'no_key' → leave the durable refund row 'pending' (retryable;
+    // never double-paid, since atomicClose already made this the sole settlement).
+    console.warn(`[billing] ${legacyType} for ${callId} left PENDING — escrow key not configured`);
+  } else {
+    escrowLedger.markRefundSettled(refundId, 'failed', null);
+  }
+}
 
 async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unknown') {
   const payment = activePayments[callId];
@@ -2659,30 +2702,77 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     return;
   }
 
-  const now         = Date.now();
-  const startTime   = payment.startTime || now;
-  const durationMs  = payment.startTime ? (now - startTime) : 0;
-  const durationMin = Math.min(durationMs / 60000, MAX_CALL_DURATION_MIN);
-  const durationHr  = durationMin / 60;
+  const now = Date.now();
 
-  const ratePerHour = payment.ratePerHour || 0;
-  const depositPaid = payment.depositPaid || 0;
-  const connectPaid = payment.connectPaid || 0;
-  const ringPaid    = payment.ringPaid    || 0;
-  const platformFee = payment.platformFee || 0.10;
-  const currency    = payment.currency    || 'HBD';
+  // ── Durable single-winner settle guard (handover §2/§4) ─────────────────────
+  // atomicClose flips THIS call's escrow row(s) open→closed in one statement; only the
+  // first caller wins (changes>0). A crash or a duplicate call-end therefore cannot
+  // double-disburse. Legacy in-flight calls verified before this migration have no
+  // durable row — they fall through and settle from activePayments (the _processing
+  // flag set above still guards in-process re-entry for them).
+  const payRows = escrowLedger.getPaymentsByRef(callId);
+  if (payRows.length > 0 && !escrowLedger.atomicClose(callId)) {
+    console.warn(`[billing] Call ${callId} already settled (durable row closed) — skipping disburse`);
+    delete activePayments[callId];
+    return;
+  }
+  if (payRows.length === 0) {
+    console.warn(`[billing] Call ${callId} has no durable escrow row — settling from in-memory state (legacy/in-flight)`);
+  }
+
+  // ── Money facts: the durable row is the source of truth (handover §5/§9); fall back
+  // to activePayments only for legacy in-flight calls. The PRIMARY row carries the
+  // locked per-call facts (ring/connect/rate/fee); top-ups are amount-only credits, so
+  // the deposit cap is the SUM of all rows' amounts.
+  const primary = payRows.find(r => r.rate_per_hour != null || r.ring_paid != null || r.connect_paid != null) || payRows[0] || {};
+  const currency    = primary.currency      ?? payment.currency    ?? 'HBD';
+  const depositPaid = payRows.length ? payRows.reduce((s, r) => s + (Number(r.amount) || 0), 0) : (payment.depositPaid || 0);
+  const ringPaid    = (primary.ring_paid     != null) ? Number(primary.ring_paid)     : (payment.ringPaid    || 0);
+  const connectPaid = (primary.connect_paid  != null) ? Number(primary.connect_paid)  : (payment.connectPaid || 0);
+  const ratePerHour = (primary.rate_per_hour != null) ? Number(primary.rate_per_hour) : (payment.ratePerHour || 0);
+  const platformFee = (primary.platform_fee  != null) ? Number(primary.platform_fee)  : (payment.platformFee || 0.10);
+  const caller      = primary.sender || payment.caller;
+  const callee      = primary.callee || payment.callee;
+
   // Per-currency precision (Path B): HBD/HIVE=3, tokens=their HE precision.
   const prec  = await getCurrencyPrecision(currency);
   const floor = Math.pow(10, -prec);
 
-  // ── Money flow ──────────────────────────────────────────────────────────────
-  // Total received = ring + connect + deposit
-  // ring fee       → platform (non-refundable interrupt cost)
-  // connect fee    → callee (non-refundable answer fee, minus platform %)
-  // deposit        → duration cost to callee; unused portion refunded to caller
+  // Connect time: the durable row is the authority (start_ts is persisted at answer-
+  // time via recordEscrowStartTs); activePayments.startTime is only the legacy/in-flight
+  // fallback. activePayments is now a live-call cache, NOT the settlement source of truth.
+  const connectedAt = (primary.start_ts != null) ? Number(primary.start_ts) : (payment.startTime || null);
+  const startTime   = connectedAt || now;
+  const durationMs  = connectedAt ? (now - connectedAt) : 0;
+  const durationMin = Math.min(durationMs / 60000, MAX_CALL_DURATION_MIN);
 
-  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(prec));
-  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(prec));
+  // ── NODE → ESCROW: signed event report (escrow-protocol/0.1 seam, §6). In-process the
+  // node and escrow are the same host; the Step-5 box extraction swaps this for a Nostr
+  // round-trip with the SAME payload. Best-effort + non-gating here (the durable ledger
+  // is the settlement guard); on the box, verify/dedup become hard gates.
+  const _evReport = escrowReporter.buildSignedReport({
+    ref: callId, subject: callId,
+    facts: { kind: 'call-end', endReason, durationMs, endedAt: now, metered: ratePerHour },
+    nonce: escrowReporter.settleNonce(callId), createdAt: now,
+  });
+  const _accept = escrowReporter.acceptReport(_evReport);
+  if (_evReport && (!_accept.verified || _accept.replay)) {
+    console.warn(`[escrow-report] call ${callId} report verdict: verified=${_accept.verified} fresh=${_accept.fresh} (in-process self-check — proceeding; box would gate)`);
+  }
+
+  // ── Money flow ──────────────────────────────────────────────────────────────
+  // ring fee → platform (non-refundable); connect fee → callee (non-refundable, minus
+  // platform %); deposit → duration cost to callee, unused portion refunded to caller.
+  // The cap (durationCost = min(metered usage, deposit), refund = the rest) is the
+  // money-safety invariant — computed by escrow-core.settle, never inline.
+  const meteredUsage = escrowAdapter.meteredUsage(
+    { rate_per_hour: ratePerHour, start_ts: connectedAt, max_duration_min: MAX_CALL_DURATION_MIN },
+    now
+  );
+  const { settlement: durationCost, refund: refundAmount } = escrowCore.settle({
+    deposit: depositPaid, meteredUsage, currency, places: prec, dustFloor: floor
+  });
+
   const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
   const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
   const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
@@ -2707,14 +2797,14 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
 
   const receipt = {
     callId,
-    caller: payment.caller, callee: payment.callee,
+    caller, callee,
     startTime: new Date(startTime).toISOString(), endTime: new Date(now).toISOString(),
     durationMin: parseFloat(durationMin.toFixed(2)),
     ringPaid, connectPaid, depositPaid, durationCost, refundAmount,
     calleeNet, platformTotal, platformOnCall, currency, precision: prec, endReason
   };
 
-  // Update SQLite ledger
+  // Update SQLite ledger (legacy audit — unchanged)
   ledgerCallUpdate(callId, {
     ended_at:      new Date().toISOString(),
     duration_min:  parseFloat(durationMin.toFixed(2)),
@@ -2727,36 +2817,42 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     end_reason:    endReason
   });
 
-  const callerSid = lobbyUsers[payment.caller]?.socketId;
-  const calleeSid = lobbyUsers[payment.callee]?.socketId;
+  const callerSid = lobbyUsers[caller]?.socketId;
+  const calleeSid = lobbyUsers[callee]?.socketId;
   if (callerSid) io.to(callerSid).emit('call-receipt', { ...receipt, perspective: 'caller' });
   if (calleeSid) io.to(calleeSid).emit('call-receipt', { ...receipt, perspective: 'callee' });
 
-  // ── Disburse from escrow ────────────────────────────────────────────────────
+  // ── Disburse from escrow (durable refund lifecycle: record pending → broadcast →
+  // finalizeOutflow marks sent/skipped/failed; a missing key leaves it PENDING for
+  // retry — never double-paid, because atomicClose already made this the sole settle).
 
   // 1. Callee payout
+  let payoutTx = null, settleStatus = 'settled';   // primary outcome for the settlement receipt
   if (calleeNet >= floor) {
     const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
-    ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
-    const result = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: callee, amount: calleeNet, currency, memo: payoutMemo, reason: 'payout' });
+    ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, callee, calleeNet, payoutMemo, 'pending', null, currency);
+    const result = await sendFromEscrow(callee, calleeNet, payoutMemo, currency, callId);
+    finalizeOutflow(refund_id, callId, 'payout', result);
+    payoutTx     = result.txId || null;
+    settleStatus = result.success ? 'settled' : (result.noKey ? 'pending' : 'failed');
     if (!result.success) {
-      console.error(`[billing] Callee payout FAILED to @${payment.callee}: ${result.reason}`);
+      console.error(`[billing] Callee payout FAILED to @${callee}: ${result.reason}`);
       if (calleeSid) io.to(calleeSid).emit('payout-failed', { amount: calleeNet, reason: result.reason, callId, currency });
-    } else {
-      ledgerPaymentUpdate(callId, 'payout', 'sent', result.txId);
     }
   }
 
   // 2. Refund unused deposit to caller
   if (refundAmount >= floor) {
     const refundMemo = `v4call:refund:${callId}:unused-credit`;
-    ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
-    const refundResult = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: caller, amount: refundAmount, currency, memo: refundMemo, reason: 'refund' });
+    ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, refundAmount, refundMemo, 'pending', null, currency);
+    const refundResult = await sendFromEscrow(caller, refundAmount, refundMemo, currency, callId);
+    finalizeOutflow(refund_id, callId, 'refund', refundResult);
     if (refundResult.success) {
-      ledgerPaymentUpdate(callId, 'refund', 'sent', refundResult.txId);
-      console.log(`[billing] Refunded ${refundAmount} ${currency} to @${payment.caller}`);
+      console.log(`[billing] Refunded ${refundAmount} ${currency} to @${caller}`);
     } else {
-      console.error(`[billing] Refund FAILED to @${payment.caller}: ${refundResult.reason}`);
+      console.error(`[billing] Refund FAILED to @${caller}: ${refundResult.reason}`);
       if (callerSid) io.to(callerSid).emit('payout-failed', {
         amount: refundAmount, reason: refundResult.reason, callId, currency,
         message: 'Your unused credit refund could not be sent automatically'
@@ -2767,14 +2863,26 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   // 3. Platform fee (ring fee + % cut)
   if (platformTotal >= floor) {
     const feeMemo   = `v4call:fee:${callId}:ring+cut`;
-    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: SERVER_HIVE_ACCOUNT, amount: platformTotal, currency, memo: feeMemo, reason: 'platform_fee' });
+    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending', null, currency);
     const feeResult = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
+    finalizeOutflow(refund_id, callId, 'platform_fee', feeResult);
     if (feeResult.success) {
-      ledgerPaymentUpdate(callId, 'platform_fee', 'sent', feeResult.txId);
       console.log(`[billing] Platform fee sent: ${platformTotal} ${currency}`);
     } else {
       console.error(`[billing] Platform fee FAILED: ${feeResult.reason}`);
     }
+  }
+
+  // ── ESCROW → NODE: signed settlement receipt (escrow-protocol/0.1 seam, §6). The
+  // box would return this over Nostr; here we build+sign+self-verify it for Step-5
+  // readiness (the durable refund rows remain the authoritative per-outflow record).
+  const _receipt = escrowReporter.buildSignedReceipt({
+    ref: callId, settlement: durationCost, refund: refundAmount, dust: 0,
+    currency, disburseTx: payoutTx, status: settleStatus, createdAt: now,
+  });
+  if (_receipt && _receipt.sig && !escrowReporter.verifyReceipt(_receipt)) {
+    console.warn(`[escrow-report] settlement receipt for ${callId} failed self-verify (in-process bug — investigate before box extraction)`);
   }
 
   delete activePayments[callId];
@@ -2806,23 +2914,66 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   if (payment._processing) return;
   payment._processing = true;
 
-  const now         = Date.now();
-  const durationMin = Math.min((durationMs || 0) / 60000, MAX_CALL_DURATION_MIN);
-  const durationHr  = durationMin / 60;
+  const now = Date.now();
 
-  const ratePerHour = payment.ratePerHour || 0;
-  const depositPaid = payment.depositPaid || 0;
-  const connectPaid = payment.connectPaid || 0;
-  const ringPaid    = payment.ringPaid    || 0;
-  // Use OUR server's minimum, matching what the callee's rates post promised —
-  // this is the "callee's server takes the platform fee" rule in Model 3.
+  // ── Durable single-winner settle guard (handover §2/§4) ─────────────────────
+  // THE redelivery-prone path (the :1234 relay-redelivery gap): a re-delivered
+  // `call-ended` loses the atomicClose race and cannot double-disburse. Legacy
+  // in-flight calls with no durable row fall through to activePayments (the
+  // _processing flag above still guards in-process re-entry).
+  const payRows = escrowLedger.getPaymentsByRef(callId);
+  if (payRows.length > 0 && !escrowLedger.atomicClose(callId)) {
+    console.warn(`[fed-billing] Call ${callId} already settled (durable row closed) — skipping disburse`);
+    delete activePayments[callId];
+    return;
+  }
+  if (payRows.length === 0) {
+    console.warn(`[fed-billing] Call ${callId} has no durable escrow row — settling from in-memory state (legacy/in-flight)`);
+  }
+
+  // ── Money facts: durable row is the source of truth (handover §5/§9); fall back to
+  // activePayments for legacy in-flight calls. Deposit cap = SUM of all rows (deposit +
+  // top-ups). platformFee stays OUR server minimum — the "callee's server takes the
+  // platform fee" rule (Model 3), unchanged from before.
+  const primary = payRows.find(r => r.rate_per_hour != null || r.ring_paid != null || r.connect_paid != null) || payRows[0] || {};
+  const currency    = primary.currency      ?? payment.currency    ?? 'HBD';
+  const depositPaid = payRows.length ? payRows.reduce((s, r) => s + (Number(r.amount) || 0), 0) : (payment.depositPaid || 0);
+  const ringPaid    = (primary.ring_paid     != null) ? Number(primary.ring_paid)     : (payment.ringPaid    || 0);
+  const connectPaid = (primary.connect_paid  != null) ? Number(primary.connect_paid)  : (payment.connectPaid || 0);
+  const ratePerHour = (primary.rate_per_hour != null) ? Number(primary.rate_per_hour) : (payment.ratePerHour || 0);
   const platformFee = PLATFORM_FEE;
-  const currency    = payment.currency    || 'HBD';
+  const caller      = primary.sender || payment.caller;
+  const callee      = primary.callee || payment.callee;
+
   const prec  = await getCurrencyPrecision(currency);
   const floor = Math.pow(10, -prec);
 
-  const durationCost   = parseFloat(Math.min(ratePerHour * durationHr, depositPaid).toFixed(prec));
-  const refundAmount   = parseFloat(Math.max(0, depositPaid - durationCost).toFixed(prec));
+  // Duration is authoritative from the caller's server (the call-ended message);
+  // synthesize a start so the shared metering seam yields rate × clamped-hours, and
+  // the deposit cap goes through escrow-core.settle (min(usage, deposit)).
+  const durationMin  = Math.min((durationMs || 0) / 60000, MAX_CALL_DURATION_MIN);
+
+  // ── NODE → ESCROW: signed event report (escrow-protocol/0.1 seam, §6). Here the
+  // call-ended event (with the caller-server-authoritative duration) is the report;
+  // best-effort + non-gating in-process (the durable ledger guards settlement).
+  const _evReport = escrowReporter.buildSignedReport({
+    ref: callId, subject: callId,
+    facts: { kind: 'call-end', endReason, durationMs: durationMs || 0, callerServer, federated: true },
+    nonce: escrowReporter.settleNonce(callId), createdAt: now,
+  });
+  const _accept = escrowReporter.acceptReport(_evReport);
+  if (_evReport && (!_accept.verified || _accept.replay)) {
+    console.warn(`[escrow-report] fed call ${callId} report verdict: verified=${_accept.verified} fresh=${_accept.fresh} (in-process self-check — proceeding; box would gate)`);
+  }
+
+  const meteredUsage = escrowAdapter.meteredUsage(
+    { rate_per_hour: ratePerHour, start_ts: now - (durationMs || 0), max_duration_min: MAX_CALL_DURATION_MIN },
+    now
+  );
+  const { settlement: durationCost, refund: refundAmount } = escrowCore.settle({
+    deposit: depositPaid, meteredUsage, currency, places: prec, dustFloor: floor
+  });
+
   const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
   const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
   const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
@@ -2830,13 +2981,13 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
 
   console.log(`[fed-billing] Call ${callId} ended (${endReason}) — disbursing`);
   console.log(`[fed-billing]   Duration:   ${durationMin.toFixed(2)} min`);
-  console.log(`[fed-billing]   Callee net: ${calleeNet} ${currency} → @${payment.callee}`);
+  console.log(`[fed-billing]   Callee net: ${calleeNet} ${currency} → @${callee}`);
   console.log(`[fed-billing]   Platform:   ${platformTotal} ${currency} → @${SERVER_HIVE_ACCOUNT}`);
-  console.log(`[fed-billing]   Refund:     ${refundAmount} ${currency} → @${payment.caller}@${callerServer}`);
+  console.log(`[fed-billing]   Refund:     ${refundAmount} ${currency} → @${caller}@${callerServer}`);
 
   const receipt = {
     callId,
-    caller: payment.caller, callee: payment.callee,
+    caller, callee,
     startTime: payment.startTime ? new Date(payment.startTime).toISOString() : null,
     endTime:   new Date(now).toISOString(),
     durationMin: parseFloat(durationMin.toFixed(2)),
@@ -2857,35 +3008,45 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
     end_reason:    endReason
   });
 
+  // ── Disburse from OUR escrow (durable refund lifecycle; finalizeOutflow marks
+  // sent/skipped/failed, leaves PENDING if the key is missing — atomicClose already
+  // made this the sole settlement, so a retry never double-pays).
+
   // 1. Callee payout (local user, our escrow)
+  let payoutTx = null, settleStatus = 'settled';   // primary outcome for the settlement receipt
   if (calleeNet >= floor) {
     const payoutMemo = `v4call:payout:${callId}:${durationMin.toFixed(1)}min`;
-    ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, payment.callee, calleeNet, payoutMemo, 'pending');
-    const r = await sendFromEscrow(payment.callee, calleeNet, payoutMemo, currency, callId);
-    if (r.success) ledgerPaymentUpdate(callId, 'payout', 'sent', r.txId);
-    else           console.error(`[fed-billing] Payout FAILED: ${r.reason}`);
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: callee, amount: calleeNet, currency, memo: payoutMemo, reason: 'payout' });
+    ledgerPayment(callId, 'payout', ESCROW_ACCOUNT, callee, calleeNet, payoutMemo, 'pending', null, currency);
+    const r = await sendFromEscrow(callee, calleeNet, payoutMemo, currency, callId);
+    finalizeOutflow(refund_id, callId, 'payout', r);
+    payoutTx     = r.txId || null;
+    settleStatus = r.success ? 'settled' : (r.noKey ? 'pending' : 'failed');
+    if (!r.success) console.error(`[fed-billing] Payout FAILED: ${r.reason}`);
   }
 
   // 2. Refund to remote caller (our escrow → their Hive account)
   if (refundAmount >= floor) {
     const refundMemo = `v4call:refund:${callId}:unused-credit`;
-    ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, payment.caller, refundAmount, refundMemo, 'pending');
-    const r = await sendFromEscrow(payment.caller, refundAmount, refundMemo, currency, callId);
-    if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
-    else           console.error(`[fed-billing] Refund FAILED to @${payment.caller}: ${r.reason}`);
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: caller, amount: refundAmount, currency, memo: refundMemo, reason: 'refund' });
+    ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, refundAmount, refundMemo, 'pending', null, currency);
+    const r = await sendFromEscrow(caller, refundAmount, refundMemo, currency, callId);
+    finalizeOutflow(refund_id, callId, 'refund', r);
+    if (!r.success) console.error(`[fed-billing] Refund FAILED to @${caller}: ${r.reason}`);
   }
 
   // 3. Platform fee to us
   if (platformTotal >= floor) {
     const feeMemo = `v4call:fee:${callId}:ring+cut`;
-    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending');
+    const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: SERVER_HIVE_ACCOUNT, amount: platformTotal, currency, memo: feeMemo, reason: 'platform_fee' });
+    ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending', null, currency);
     const r = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
-    if (r.success) ledgerPaymentUpdate(callId, 'platform_fee', 'sent', r.txId);
-    else           console.error(`[fed-billing] Fee FAILED: ${r.reason}`);
+    finalizeOutflow(refund_id, callId, 'platform_fee', r);
+    if (!r.success) console.error(`[fed-billing] Fee FAILED: ${r.reason}`);
   }
 
   // Emit receipt to local callee
-  const calleeSid = lobbyUsers[payment.callee]?.socketId;
+  const calleeSid = lobbyUsers[callee]?.socketId;
   if (calleeSid) io.to(calleeSid).emit('call-receipt', { ...receipt, perspective: 'callee' });
 
   // Send receipt for caller back to caller's server
@@ -2896,6 +3057,15 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
       callId,
       receipt: { ...receipt, perspective: 'caller' }
     });
+  }
+
+  // ── ESCROW → NODE: signed settlement receipt (escrow-protocol/0.1 seam, §6).
+  const _receipt = escrowReporter.buildSignedReceipt({
+    ref: callId, settlement: durationCost, refund: refundAmount, dust: 0,
+    currency, disburseTx: payoutTx, status: settleStatus, createdAt: now,
+  });
+  if (_receipt && _receipt.sig && !escrowReporter.verifyReceipt(_receipt)) {
+    console.warn(`[escrow-report] fed settlement receipt for ${callId} failed self-verify (in-process bug — investigate before box extraction)`);
   }
 
   delete activePayments[callId];
@@ -4298,6 +4468,7 @@ io.on('connection', (socket) => {
       socket.emit('call-accepted', { caller, roomName });
       const now = Date.now();
       if (activePayments[room.callId]) activePayments[room.callId].startTime = now;
+      recordEscrowStartTs(room.callId, now);   // durable row is the settlement authority
       ledgerCallUpdate(room.callId, { connected_at: new Date(now).toISOString(), status: 'connected' });
       startCreditBurn(room.callId, roomName);
 
@@ -6718,6 +6889,7 @@ async function fedHandleMessage(ws, raw) {
         if (room) {
           const now = Date.now();
           if (activePayments[room.callId]) activePayments[room.callId].startTime = now;
+          recordEscrowStartTs(room.callId, now);   // durable row is the settlement authority
           ledgerCallUpdate(room.callId, { connected_at: new Date(now).toISOString(), status: 'connected' });
           startCreditBurn(room.callId, roomName);
 
