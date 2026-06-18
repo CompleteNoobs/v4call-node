@@ -1,0 +1,791 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= v4call-node — Deploy the Headless v4call Server on Ubuntu 24.04 =
+
+From CompleteNoobs
+
+This guide walks through deploying '''v4call-node''' — the headless ("no screens") v4call server — from scratch on a fresh Vultr Ubuntu 24.04 VPS. By the end you'll have a working server at <code>https://node.yourdomain.com</code> that the separate v4call client app talks to, with on-chain Hive payments handled by the built-in escrow engine.
+
+v4call-node is the "brain" of v4call: it does login routing, presence, federation, chat storage, and the HTTP/WebSocket API. '''It serves no HTML''' (the screens live in a separate project, [[#What_Changed:_v4call_Is_Now_Three_Pieces|v4call-app]]) and — for now — runs the money engine (escrow-core) in-process.
+
+'''Source code''': [https://github.com/CompleteNoobs/v4call-node https://github.com/CompleteNoobs/v4call-node]
+
+'''Version''': v4call-node 0.1.0 · Federation protocol 0.4 · succeeds the v4call monolith (final v0.16.29)
+
+'''Source of truth for the split''': <code>handover-decoupling.md</code> in the project root.
+
+'''End result''': A headless v4call server at <code>https://node.yourdomain.com</code> answering <code>/api/info</code>, serving WebSocket traffic for the client, verifying + disbursing Hive payments, and (optionally) federated with other v4call servers.
+
+== Contents ==
+
+* [[#What_You_Need|1 What You Need]]
+* [[#What_Changed:_v4call_Is_Now_Three_Pieces|2 What Changed: v4call Is Now Three Pieces]]
+* [[#Step_1:_Create_Your_Vultr_VPS|3 Step 1: Create Your Vultr VPS]]
+* [[#Step_2:_Point_Your_Domain_at_the_VPS|4 Step 2: Point Your Domain at the VPS]]
+* [[#Step_3:_Log_into_Your_VPS|5 Step 3: Log into Your VPS]]
+* [[#Step_4:_Update_and_Install_Node.js_+_Build_Tools|6 Step 4: Update and Install Node.js + Build Tools]]
+* [[#Step_5:_Get_the_Code_(two_repos,_side_by_side)|7 Step 5: Get the Code (two repos, side by side)]]
+* [[#Step_6:_Install_Dependencies|8 Step 6: Install Dependencies]]
+* [[#Step_7:_Configure_the_Node_(.env_file)|9 Step 7: Configure the Node (.env file)]]
+* [[#Step_8:_First_Run_—_Prove_It_Boots|10 Step 8: First Run — Prove It Boots]]
+* [[#Step_9:_Keep_It_Running_(systemd)|11 Step 9: Keep It Running (systemd)]]
+* [[#Step_10:_Put_Nginx_in_Front_—_HTTP_First|12 Step 10: Put Nginx in Front — HTTP First]]
+* [[#Step_11:_Get_Your_SSL_Certificate|13 Step 11: Get Your SSL Certificate]]
+* [[#Step_12:_Enable_the_Full_Headless_HTTPS_Config|14 Step 12: Enable the Full Headless HTTPS Config]]
+* [[#Step_13:_Provide_the_Signed_Domain-Proof_File|15 Step 13: Provide the Signed Domain-Proof File]]
+* [[#Step_14:_Connect_the_Client_(v4call-app)|16 Step 14: Connect the Client (v4call-app)]]
+* [[#Step_15:_Test_Everything|17 Step 15: Test Everything]]
+* [[#Step_16:_Federation_(Optional)|18 Step 16: Federation (Optional)]]
+* [[#Running_with_Docker_Instead|19 Running with Docker Instead]]
+* [[#Escrow:_What_Lives_Where|20 Escrow: What Lives Where]]
+* [[#Admin_and_Debug_Endpoints|21 Admin and Debug Endpoints]]
+* [[#.env_Reference|22 .env Reference]]
+* [[#Updating_Your_Node|23 Updating Your Node]]
+* [[#Common_Problems_and_Fixes|24 Common Problems and Fixes]]
+* [[#Quick_Reference|25 Quick Reference]]
+
+== What You Need ==
+
+* '''A Vultr account''' — sign up at [https://vultr.com vultr.com]. Please use our [https://www.vultr.com/?ref=7704739 Vultr Referral link] to help cover server costs.
+* '''A domain name''' with DNS access — e.g. <code>node.yourdomain.com</code>.
+* '''Two Hive accounts''' — one for your server identity (receives platform fees), one for escrow (holds caller funds during calls). Create free accounts at [https://signup.hive.io signup.hive.io].
+* '''Hive Keychain browser extension''' — used by the client app and the operator tool pages. Install from [https://hive-keychain.com hive-keychain.com].
+* '''A GitHub account''' — free at [https://github.com github.com].
+* '''A terminal''' — Mac: Terminal app. Windows: PowerShell or PuTTY.
+
+You do not need to know how to code. Every command can be copy-pasted exactly as shown.
+
+== What Changed: v4call Is Now Three Pieces ==
+
+The old v4call was one big program that showed the screens, ran the server, '''and''' held the money keys all in one box. It has been split ("decoupled") into focused pieces. Reading this before you start will save a lot of confusion.
+
+{| class="wikitable"
+|-
+! Piece !! What it is !! Holds the money key? !! Serves HTML?
+|-
+| '''v4call-app''' || The screens users open (desktop + mobile layout files + operator tool pages). Runs anywhere; connects to a node you choose. || No || Yes (it ''is'' the HTML)
+|-
+| '''v4call-node''' (this repo) || The server "brain" — routing, presence, federation, chat, the HTTP/WebSocket API. || '''Yes, for now''' (escrow-core runs in-process) || '''No'''
+|-
+| '''escrow-core''' || The shared money-handling '''library''' the node loads in-process today. Becomes its own isolated box later. || (it ''is'' the money code) || No
+|-
+| '''nGate''' || The "bouncer" controlling which servers are allowed into the federation. Holds no keys. || No || No
+|}
+
+'''Three consequences you must plan for:'''
+
+# '''This node serves no web pages.''' Opening <code>https://node.yourdomain.com</code> in a browser will not show a login screen. You point the separate '''v4call-app''' client at this node's URL (see [[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]]). What this node ''does'' answer: <code>/api/info</code>, the Socket.io WebSocket, <code>/federation</code>, <code>/.well-known/v4call-server.json</code>, <code>/rates/USERNAME</code>, <code>/join-token</code>, <code>/debug-state</code>, and the <code>/admin/*</code> endpoints.
+# '''The escrow key still lives on this node — for now.''' The money paths already run on the durable, replay-guarded escrow-core engine ''in-process'' on the node. A later phase moves escrow-core and <code>V4CALL_ESCROW_KEY</code> onto a separate, isolated <code>v4call-escrow</code> box. Until then, treat this node as a money box: keep the key secret and the box patched. See [[#Escrow:_What_Lives_Where|Escrow: What Lives Where]].
+# '''escrow-core is a sibling dependency.''' v4call-node depends on escrow-core as a local path (<code>file:../escrow-core</code>). You must clone '''both''' repos side by side or installation fails. See [[#Step_5:_Get_the_Code_(two_repos,_side_by_side)|Step 5]].
+
+== Step 1: Create Your Vultr VPS ==
+
+# Log into [https://my.vultr.com my.vultr.com]
+# Click '''Deploy New Server'''
+# Choose '''Cloud Compute — Shared CPU'''
+# Choose a location close to you
+# Choose '''Ubuntu 24.04 LTS x64'''
+# Choose the '''$6/month''' plan (1 CPU, 1GB RAM) — fine for a small node
+# Set Server Hostname to something like <code>v4call-node</code>
+# Click '''Deploy Now'''
+
+Wait ~60 seconds. Click the server to find:
+* '''IP Address''' — looks like <code>123.456.789.012</code> — write it down
+* '''Password''' — click the eye icon — write it down
+
+== Step 2: Point Your Domain at the VPS ==
+
+Log into your DNS provider and add an A record:
+
+{| class="wikitable"
+|-
+! Field !! Value
+|-
+| Type || A
+|-
+| Name || <code>node</code> (or whatever subdomain you chose)
+|-
+| Value || Your VPS IP address
+|-
+| TTL || 300
+|}
+
+DNS takes a few minutes. Check from your computer:
+
+ nslookup node.yourdomain.com
+
+Must show your VPS IP before [[#Step_11:_Get_Your_SSL_Certificate|Step 11]]. You can continue with the other steps while you wait.
+
+== Step 3: Log into Your VPS ==
+
+ ssh root@YOUR_SERVER_IP
+
+Type <code>yes</code> at the fingerprint prompt, then paste the password from Vultr. When you see <code>root@v4call-node:~#</code> you are in.
+
+ apt update && apt upgrade -y
+
+(1–2 minutes.)
+
+== Step 4: Update and Install Node.js + Build Tools ==
+
+v4call-node is a Node.js app. The <code>better-sqlite3</code> dependency is a native module, so it needs a C/C++ toolchain to build at install time.
+
+Install the build tools, git, and nginx:
+
+ apt install -y git build-essential python3 nginx curl
+
+Install Node.js 20 (LTS) from the NodeSource repo:
+
+ curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+ apt install -y nodejs
+
+Verify:
+
+ node --version    # should print v20.x.x
+ npm --version
+
+== Step 5: Get the Code (two repos, side by side) ==
+
+'''This layout matters.''' v4call-node depends on escrow-core via a local path (<code>file:../escrow-core</code>), so the two folders must sit '''next to each other''' under the same parent directory.
+
+ mkdir -p /opt/v4call
+ cd /opt/v4call
+ git clone https://github.com/CompleteNoobs/escrow-core.git
+ git clone https://github.com/CompleteNoobs/v4call-node.git
+
+You should now have:
+
+<pre>
+/opt/v4call/
+├── escrow-core/      ← the money engine (library)
+└── v4call-node/      ← this server  (depends on ../escrow-core)
+</pre>
+
+Confirm the dependency line is the local path:
+
+ grep escrow-core /opt/v4call/v4call-node/package.json
+
+You should see <code>"escrow-core": "file:../escrow-core"</code>. If you ever move <code>v4call-node</code> somewhere else, escrow-core has to move with it (or stay one level up).
+
+==== Fork on GitHub — Optional ====
+
+If you want your own customisable copy, fork both repos on GitHub first ('''Fork''' button, top-right), then clone '''your''' forks:
+
+ git clone https://github.com/YOURUSERNAME/escrow-core.git
+ git clone https://github.com/YOURUSERNAME/v4call-node.git
+
+== Step 6: Install Dependencies ==
+
+Install escrow-core first (it builds its own native SQLite module), then v4call-node:
+
+ cd /opt/v4call/escrow-core
+ npm install
+
+ cd /opt/v4call/v4call-node
+ npm install
+
+The first install compiles <code>better-sqlite3</code> — this is why you installed <code>build-essential</code> and <code>python3</code> in Step 4. If it errors with <code>node-gyp</code> / <code>make: not found</code>, re-run the apt install from Step 4.
+
+'''Expect two native compile passes.''' escrow-core pins <code>better-sqlite3 ^11.x</code> and v4call-node pins <code>^9.x</code>, so you'll see <code>better-sqlite3</code> build twice (once per repo). That's normal — the version gap is not a problem; don't panic at it.
+
+'''Quick confidence check — run the test suites''' (fully offline, no keys or network needed):
+
+ cd /opt/v4call/escrow-core && npm test     # escrow-core money engine — expect 67 passing
+ cd /opt/v4call/v4call-node && npm test     # node's escrow integration — expect 40 passing
+
+Green tests here mean the money engine and its wiring into the node are sound before you ever touch a real key.
+
+== Step 7: Configure the Node (.env file) ==
+
+All settings live in a single <code>.env</code> file. Copy the template:
+
+ cd /opt/v4call/v4call-node
+ cp .env.example .env
+ nano .env
+
+The template is heavily commented. The values you '''must''' set:
+
+<pre>
+# ── Server Identity ──────────────────────────────────────
+SERVER_NAME=yourcallapp
+SERVER_DOMAIN=node.yourdomain.com
+SERVER_HIVE_ACCOUNT=yourhiveaccount
+
+# ── Escrow (money — runs IN-PROCESS on this node for now) ─
+ESCROW_ACCOUNT=yourescrowaccount
+V4CALL_ESCROW_KEY=5Kxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Durable, replay-guarded escrow ledger DB (its own file — NOT the legacy ledger).
+# Default is logs/v4call-escrow.db; leave commented unless you have a reason.
+# ESCROW_DB_PATH=/opt/v4call/v4call-node/logs/v4call-escrow.db
+
+# ── Platform Fee ─────────────────────────────────────────
+DEFAULT_PLATFORM_FEE=10
+
+# ── Admin (now travels in an Authorization: Bearer header) ─
+ADMIN_KEY=make-up-a-long-random-string-at-least-20-characters
+
+# ── Decoupling: which browser origins may call this node ──
+# The v4call-app client + admin-peers GUI live on their OWN origin now and call
+# this node cross-origin. List them comma-separated (scheme+host, no trailing slash).
+# BLANK = reflect any origin (dev convenience). Admin endpoints are still gated by
+# ADMIN_KEY regardless of this setting.
+CORS_ALLOWED_ORIGINS=https://app.yourdomain.com
+
+# ── File paths — ⚠ repoint these for bare metal (see note below) ──
+# Path to your SIGNED domain-proof file (federation only — see Step 13).
+V4CALL_SERVER_JSON_PATH=/opt/v4call/v4call-node/data/v4call-server.json
+# Where the node writes its Nostr identity key. The shipped .env.example uses a
+# container path (/app/nostr/...); on bare metal repoint it under the project.
+NOSTR_KEY_PATH=/opt/v4call/v4call-node/nostr/nostr-key.json
+
+# ── Network ──────────────────────────────────────────────
+PORT=3000
+BIND_HOST=127.0.0.1
+
+# ── Federation (optional — leave blank for standalone) ───
+FEDERATION_PEERS=
+</pre>
+
+Key points:
+
+* <code>V4CALL_ESCROW_KEY</code> — must be the '''active''' private key for your escrow account. Find it in your Hive wallet → Keys & Permissions → Active. Starts with <code>5K</code>. '''Never share or commit this.''' Anyone with it can drain the escrow account.
+* <code>ADMIN_KEY</code> — a secret password for the <code>/admin/*</code> endpoints. Generate one with <code>openssl rand -hex 32</code>.
+* '''⚠ <code>.env.example</code> ships container (Docker) paths — repoint two of them on bare metal.''' As shipped, <code>V4CALL_SERVER_JSON_PATH=/app/data/v4call-server.json</code> and <code>NOSTR_KEY_PATH=/app/nostr/nostr-key.json</code>. Those <code>/app/...</code> paths only make sense inside the container. On a bare-metal host, if you leave <code>NOSTR_KEY_PATH</code> at the default the node will create a stray <code>/app/nostr/nostr-key.json</code> at your filesystem '''root'''. Repoint '''both''' under the project directory (as in the sample above).
+* <code>CORS_ALLOWED_ORIGINS</code> — '''new for the headless split.''' Because the client is now hosted on a different origin than the node, the browser will only read this node's responses if its origin is allowed here. Set it to wherever you host v4call-app (e.g. <code>https://app.yourdomain.com</code>). Leave blank only while testing. (If you host the client same-origin under the node — see [[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]] — you don't need CORS at all.)
+* <code>BIND_HOST</code> — keep <code>127.0.0.1</code> so only the local Nginx reverse proxy can reach Node directly. (When running under Docker, the compose file overrides this to <code>0.0.0.0</code> so Nginx in another container can reach it — that's expected.)
+* <code>FEDERATION_PEERS</code> — leave blank for standalone. Add peers later (see [[#Step_16:_Federation_(Optional)|Step 16]]). '''Must be one comma-separated line''' — two <code>FEDERATION_PEERS=</code> lines silently keep only the last.
+* '''"Standalone" is not network-silent.''' <code>.env.example</code> ships <code>FED_DISCOVERY_MODE=both</code> with a populated <code>NOSTR_RELAYS</code> list, so even with <code>FEDERATION_PEERS</code> blank the node still generates a Nostr identity and publishes a discovery/announce event to those relays on boot. This is benign and self-heals (see [[#Step_8:_First_Run_—_Prove_It_Boots|Step 8]] / [[#Step_16:_Federation_(Optional)|Step 16]]). For a truly quiet standalone node, set <code>FED_DISCOVERY_MODE=hive</code>. (Presence and payload transport stay off by default — only discovery/announce fires.)
+
+Save: '''Ctrl+X''' → '''Y''' → '''Enter'''
+
+== Step 8: First Run — Prove It Boots ==
+
+Before wiring up Nginx and SSL, confirm the node starts and the escrow engine initialises:
+
+ cd /opt/v4call/v4call-node
+ node server.js
+
+You should see startup lines like:
+
+<pre>
+[ledger] SQLite ready: .../logs/v4call-ledger.db
+[escrow] escrow-core 0.1.0 ledger ready: .../logs/v4call-escrow.db (@yourescrowaccount, HBD)
+[chat] SQLite ready: .../logs/v4call-chat.db
+v4call server running on 127.0.0.1:3000
+</pre>
+
+The <code>[escrow] escrow-core ... ledger ready</code> line is the important one — it proves the in-process money engine opened its durable, replay-guarded database and bound your escrow adapter.
+
+'''You'll also see Nostr relay chatter on boot — that's expected.''' Because discovery ships as <code>both</code> (see Step 7), a fresh node publishes a discovery/announce event to the relays and you'll likely see lines like <code>wss://nostr.v4call.com REJECTED: blocked: not on relay whitelist</code>. That is '''normal''' and self-heals once nGate whitelists your key (see [[#Step_16:_Federation_(Optional)|Step 16]]); it does not stop the node. Set <code>FED_DISCOVERY_MODE=hive</code> if you want a silent standalone node.
+
+In '''a second terminal''' (SSH in again), test the health endpoint:
+
+ curl http://127.0.0.1:3000/api/info
+
+Should return a small JSON blob (server name, domain, version). If it does, the node is alive.
+
+Press '''Ctrl+C''' in the first terminal to stop it — the next step makes it run as a proper background service.
+
+'''If you see <code>Cannot find module 'escrow-core'</code>''' — escrow-core isn't installed or isn't a sibling folder. Re-check [[#Step_5:_Get_the_Code_(two_repos,_side_by_side)|Step 5]] and run <code>npm install</code> in both folders.
+
+== Step 9: Keep It Running (systemd) ==
+
+Run the node as a systemd service so it survives reboots and restarts on crash. Create the unit file:
+
+ nano /etc/systemd/system/v4call-node.service
+
+Paste:
+
+<pre>
+[Unit]
+Description=v4call-node (headless v4call server)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/v4call/v4call-node
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+# Run as a non-root user in production. For a quick start root is fine, but
+# create a dedicated user later and chown /opt/v4call to it.
+User=root
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+</pre>
+
+Save, then enable + start it:
+
+ systemctl daemon-reload
+ systemctl enable --now v4call-node
+ systemctl status v4call-node --no-pager
+
+You should see <code>active (running)</code>. Watch the logs any time with:
+
+ journalctl -u v4call-node -f
+
+Look again for the <code>[escrow] escrow-core ... ledger ready</code> and <code>v4call server running on 127.0.0.1:3000</code> lines.
+
+== Step 10: Put Nginx in Front — HTTP First ==
+
+The node listens on plain HTTP on <code>127.0.0.1:3000</code>. Nginx terminates TLS for the public internet and proxies both normal HTTP and WebSocket traffic to it.
+
+'''This step is critical — HTTP only first.''' A very common mistake is putting the HTTPS/SSL config in Nginx ''before'' the certificate exists. Nginx then crashes in a restart loop and Certbot can't get the cert. Always start HTTP-only, get the cert, then add HTTPS.
+
+ nano /etc/nginx/sites-available/v4call-node
+
+Paste this HTTP-only config (replace <code>node.yourdomain.com</code>):
+
+<pre>
+server {
+    listen 80;
+    server_name node.yourdomain.com;
+
+    # Certbot challenge path — do not remove
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Proxy everything to the headless node
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400;
+    }
+}
+</pre>
+
+Enable the site, make the challenge dir, drop the default site, and reload:
+
+ mkdir -p /var/www/certbot
+ ln -sf /etc/nginx/sites-available/v4call-node /etc/nginx/sites-enabled/v4call-node
+ rm -f /etc/nginx/sites-enabled/default
+ nginx -t && systemctl reload nginx
+
+Test HTTP works end-to-end (Nginx → Node):
+
+ curl http://node.yourdomain.com/api/info
+
+Should return the same JSON you saw in Step 8.
+
+== Step 11: Get Your SSL Certificate ==
+
+Install Certbot, then confirm the ACME challenge path actually serves a file through Nginx (this is what Let's Encrypt will check):
+
+ apt install -y certbot
+ mkdir -p /var/www/certbot/.well-known/acme-challenge
+ echo "test" > /var/www/certbot/.well-known/acme-challenge/testfile
+ curl http://node.yourdomain.com/.well-known/acme-challenge/testfile
+
+Must return <code>test</code>. If it returns nothing or a 404, Nginx isn't serving the challenge path — re-check the HTTP config from Step 10. When it returns <code>test</code>, request the certificate via the webroot:
+
+ certbot certonly --webroot -w /var/www/certbot \
+   -d node.yourdomain.com \
+   --email your@email.com --agree-tos --no-eff-email
+
+Success looks like:
+
+<pre>
+Successfully received certificate.
+Certificate is saved at: /etc/letsencrypt/live/node.yourdomain.com/fullchain.pem
+Key is saved at:         /etc/letsencrypt/live/node.yourdomain.com/privkey.pem
+</pre>
+
+Certbot installs a systemd timer that auto-renews; no cron needed for the bare-metal path. Verify with <code>systemctl list-timers | grep certbot</code>.
+
+== Step 12: Enable the Full Headless HTTPS Config ==
+
+Now the cert exists, switch Nginx to HTTPS. '''This is the headless config''' — note what is deliberately ''absent'' versus the old monolith: no <code>info.html</code> static block, no <code>auth_basic</code> login gate, no static file serving at all. The node serves only JSON + WebSocket.
+
+ nano /etc/nginx/sites-available/v4call-node
+
+Replace the whole file with (substitute your domain throughout):
+
+<pre>
+# HTTP — certbot challenge + redirect to HTTPS
+server {
+    listen 80;
+    server_name node.yourdomain.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS — headless v4call-node
+server {
+    listen 443 ssl;
+    server_name node.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/node.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/node.yourdomain.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header X-Content-Type-Options nosniff;
+
+    # Socket.io — the client's main WebSocket transport
+    location /socket.io/ {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 86400;
+    }
+
+    # Federation WebSocket — server-to-server. NEVER auth-gate this.
+    location /federation {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400;
+    }
+
+    # Everything else — the JSON API (/api/info, /rates, /admin/*,
+    # /.well-known/v4call-server.json, /join-token, /debug-state)
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300;
+        proxy_send_timeout 300;
+    }
+}
+</pre>
+
+Test and reload:
+
+ nginx -t && systemctl reload nginx
+
+Confirm HTTPS:
+
+ curl https://node.yourdomain.com/api/info
+
+'''Why no <code>auth_basic</code>?''' In the monolith, operators sometimes password-protected the whole site during testing. A headless node has no site to protect — and basic-auth on <code>/socket.io/</code> would break the client, while basic-auth on <code>/federation</code> would break every peer. CORS (Step 7) governs which ''browser pages'' may read responses; <code>ADMIN_KEY</code> guards the admin endpoints. That is the correct security model here.
+
+== Step 13: Provide the Signed Domain-Proof File ==
+
+'''Only needed if you plan to federate''' (otherwise skip to Step 14). In the monolith this file was a static file under <code>public/.well-known/</code>. A headless node has no static layer, so it serves the file from a path you give it via <code>V4CALL_SERVER_JSON_PATH</code> (default <code>data/v4call-server.json</code>).
+
+# On a browser with Hive Keychain, open '''server-sign.html''' (it lives in the v4call-app project — see [[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]]).
+# Fill in: Hive account (= <code>SERVER_HIVE_ACCOUNT</code>), domain (<code>node.yourdomain.com</code>), escrow account, fee account, federation WS URL (<code>wss://node.yourdomain.com/federation</code>).
+# Click '''⚡ Sign with Hive Keychain''', then '''⬇ Download''' — you get <code>v4call-server.json</code>.
+# Upload it to the path the node expects:
+
+ mkdir -p /opt/v4call/v4call-node/data
+ # from your local machine:
+ # scp v4call-server.json root@YOUR_SERVER_IP:/opt/v4call/v4call-node/data/
+
+Restart the node so the path is picked up (it reads the file per request, so a restart isn't strictly required, but it's a good check):
+
+ systemctl restart v4call-node
+
+Verify it serves:
+
+ curl https://node.yourdomain.com/.well-known/v4call-server.json
+
+You should see your signed JSON. nGate and peer servers fetch exactly these bytes to verify you — same format the monolith used, so migrating monolith → node keeps verifying clean.
+
+If you get <code>404</code> with a hint about <code>V4CALL_SERVER_JSON_PATH</code>, the file isn't at the configured path. Double-check the path in <code>.env</code> matches where you uploaded the file.
+
+== Step 14: Connect the Client (v4call-app) ==
+
+The node has no screens. Users reach it through the '''v4call-app''' client, which is a set of HTML files you host. The key idea: the client has a <code>nodeBase()</code> setting that points at ''your'' node's URL.
+
+'''⚠ <code>desktop-app.html</code> is NOT a standalone file — host the whole repo.''' This is the single biggest trap, and it cost the most time in real testing. The HTML loads <code>vendor/socket.io.min.js</code> via a '''relative''' path and runs <code>const socket = io(nodeBase())</code> at the top of its script. If <code>vendor/</code> isn't sitting right next to the HTML, <code>io</code> is undefined, that line throws, and the '''entire script aborts''' — which then surfaces downstream as a misleading <code>Uncaught ReferenceError: Cannot access 'HIVE_API' before initialization</code> on login. So: '''do not''' open the file from your desktop, and '''do not''' open it from a GitHub "blob" page or upload only that one file. Host the '''entire''' v4call-app folder so <code>vendor/</code> (and the sibling pages) travel with it.
+
+# Get the client: [https://github.com/CompleteNoobs/v4call-app https://github.com/CompleteNoobs/v4call-app]. It contains <code>desktop-app.html</code>, <code>mobile-app.html</code>, a landing <code>select.html</code>, a <code>vendor/</code> folder (Socket.io etc.), and the operator tool pages (<code>admin-peers.html</code>, <code>server-sign.html</code>, <code>server-announce.html</code>, <code>user-announce.html</code>, etc.). Clone it onto the node box, e.g. into <code>/opt/v4call/v4call-app</code>.
+# '''Easiest hosting — serve it same-origin under the node (no CORS needed).''' Add an <code>/app/</code> location to your HTTPS server block in Nginx ([[#Step_12:_Enable_the_Full_Headless_HTTPS_Config|Step 12]]):
+
+<pre>
+    # Serve the v4call-app client from the same origin as the node.
+    # Use alias + index — do NOT add try_files here (alias+try_files 404s files).
+    location /app/ {
+        alias /opt/v4call/v4call-app/;
+        index select.html;
+    }
+</pre>
+
+: Reload Nginx (<code>nginx -t && systemctl reload nginx</code>). The client is now at <code>https://node.yourdomain.com/app/desktop-app.html</code>, same origin as the node, so '''no <code>CORS_ALLOWED_ORIGINS</code> needed''' and the client's built-in node URL already points at the right place. (This is exactly how the deploy test served it — confirmed working.)
+# '''Or host on a separate origin''' (e.g. <code>https://app.yourdomain.com</code>, GitHub Pages, Netlify): upload the '''whole folder''' (including <code>vendor/</code>) there, '''and''' set <code>CORS_ALLOWED_ORIGINS=https://app.yourdomain.com</code> on the node (reflect-any is for testing only). Point the client at the node with the stored setting (<code>localStorage</code> key <code>v4call:node</code>) or a <code>?node=</code> parameter:
+
+ https://app.yourdomain.com/desktop-app.html?node=https://node.yourdomain.com
+
+'''Console noise you can ignore:''' lines mentioning <code>contentscript.js</code>, <code>ObjectMultiplex</code>, or <code>MaxListenersExceededWarning</code> come from the Hive Keychain browser extension, not from v4call — harmless, don't chase them.
+
+'''Admin pages use a Bearer header now.''' <code>admin-peers.html</code> sends your <code>ADMIN_KEY</code> in an <code>Authorization: Bearer &lt;key&gt;</code> header (cleaner + safer than the old query string). For that cross-origin request to work, the node already:
+* allows the app origin in CORS (your <code>CORS_ALLOWED_ORIGINS</code>),
+* allows the <code>Authorization</code> header, and
+* answers the <code>OPTIONS</code> preflight.
+
+All three are built in. If you host the client '''same-origin''' under the node (the easiest option above) there's nothing to configure — it's not even a cross-origin request. If you host it on a '''separate origin''', just add that origin to <code>CORS_ALLOWED_ORIGINS</code>. (Passing <code>?key=ADMIN_KEY</code> in the URL still works as a fallback for <code>curl</code> testing.)
+
+== Step 15: Test Everything ==
+
+Run these from your laptop after Steps 12–14:
+
+;Health
+: <code>curl https://node.yourdomain.com/api/info</code> → JSON with server name/domain.
+;Debug state (admin key required)
+: <code>curl -H "Authorization: Bearer YOUR_ADMIN_KEY" https://node.yourdomain.com/debug-state</code> → <code>{"lobbyUsers":[],"rooms":[]}</code> on a fresh server. (Without a key this returns '''403''' — it is admin-gated, despite what older notes implied.)
+;Admin balance (Bearer header)
+: <code>curl -H "Authorization: Bearer YOUR_ADMIN_KEY" https://node.yourdomain.com/admin/balance</code> → your escrow account's HBD balance.
+;Admin balance (query fallback)
+: <code>curl "https://node.yourdomain.com/admin/balance?key=YOUR_ADMIN_KEY"</code> → same result.
+;Rates read
+: <code>curl https://node.yourdomain.com/rates/yourusername</code> → parsed rates JSON (after you publish a rates post via <code>user-announce.html</code>).
+;Domain proof (if federating)
+: <code>curl https://node.yourdomain.com/.well-known/v4call-server.json</code> → your signed JSON.
+
+Then open the client (Step 14) and log in with Hive Keychain. If you land in the lobby, the full chain — client → node → Hive → escrow — is working. 🎉
+
+== Step 16: Federation (Optional) ==
+
+Federation lets users on different v4call servers see, call, and DM each other. It is unchanged by the decoupling — the wire protocol stays '''0.4'''.
+
+# '''Domain proof''' — publish your signed <code>v4call-server.json</code> (Step 13) so peers can verify you control this domain.
+# '''Directory listing''' — publish a <code>v4call-server</code> tagged Hive post via <code>server-announce.html</code> (in v4call-app) so other operators discover you.
+# '''Connect to known peers''' — add their WebSocket URLs to <code>FEDERATION_PEERS</code> in <code>.env</code> (one comma-separated line) and restart:
+
+ # in .env
+ FEDERATION_PEERS=wss://hive-book.com/federation,wss://v4call.com/federation
+ systemctl restart v4call-node
+
+Both servers must list each other. Servers in <code>FEDERATION_PEERS</code> are auto-approved on startup. Discovered-but-not-listed peers need manual approval via <code>admin-peers.html</code> (or <code>POST /admin/peers/approve</code>).
+
+'''Watch federation health:'''
+
+ journalctl -u v4call-node -f | grep -E "\[federation\]|\[discovery\]|\[peers\]"
+
+Healthy startup shows <code>Outbound connected</code> and <code>✓ Peer verified</code> lines. The escrow-mismatch guard, recipient-side rate enforcement, and all the federation behaviour documented for the monolith carry over unchanged.
+
+'''nGate note''': nGate (the federation relay bouncer) needs '''no changes''' for the decoupling. It fetches each operator's <code>/.well-known/v4call-server.json</code>, and this node serves exactly the same bytes the monolith did. Deploy nGate per its own <code>walkthrough.wiki</code> / <code>walkthrough-strfry.wiki</code> — nothing here changes that.
+
+== Running with Docker Instead ==
+
+The repo ships a <code>Dockerfile</code> and <code>docker-compose.yml</code>, but they still carry '''monolith-era leftovers''' that need a deploy-time pass before they'll build and run headless. If you prefer Docker, here is what to fix. (If you used the bare-metal path above, you can skip this section entirely.)
+
+'''Fix 1 — the escrow-core dependency can't resolve inside the container.''' The Dockerfile copies only <code>package.json</code> and runs <code>npm install</code>, but the dependency is <code>file:../escrow-core</code> — a path ''outside'' the Docker build context, so the build fails. Vendor escrow-core into the build context:
+
+ cd /opt/v4call/v4call-node
+ rm -rf vendor && mkdir -p vendor
+ cp -r ../escrow-core vendor/escrow-core
+ rm -rf vendor/escrow-core/node_modules vendor/escrow-core/*.db*
+
+Change the dependency in <code>package.json</code> from <code>file:../escrow-core</code> to <code>file:vendor/escrow-core</code>, and add a <code>COPY vendor ./vendor</code> line in the <code>Dockerfile</code> ''before'' the <code>npm install</code> line so the local path exists at install time.
+
+'''Fix 2 — the compose file mounts files a headless node doesn't have.''' The shipped <code>docker-compose.yml</code> nginx service mounts <code>./public/info.html</code> and <code>./nginx/.htpasswd</code> (both monolith artefacts). Remove those two volume lines. Replace the contents of <code>nginx/v4call.conf</code> with the headless HTTPS config from [[#Step_12:_Enable_the_Full_Headless_HTTPS_Config|Step 12]] (swapping <code>proxy_pass http://127.0.0.1:3000</code> for <code>proxy_pass http://app:3000</code>, since under compose the node container is reachable as <code>app</code>). Drop the <code>info.html</code> static block and the <code>auth_basic</code> lines.
+
+'''Fix 3 — get the cert before enabling HTTPS in the container nginx.''' Same rule as Step 10–11: start nginx HTTP-only, issue the cert with the dockerised certbot, then switch the conf to HTTPS. Follow the same certbot flow the v4call monolith WalkThrough uses (<code>docker compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot -d node.yourdomain.com ...</code>).
+
+Then:
+
+ cd /opt/v4call/v4call-node
+ docker compose up -d --build
+ docker compose logs -f app    # look for the [escrow] escrow-core ... ledger ready line
+
+'''In short:''' the bare-metal + systemd path in Steps 4–12 is the verified, reproducible route today. The Docker path works once the three fixes above are applied; the maintainers have flagged this "TLS-terminator-only" cleanup as a known deploy-time task.
+
+== Escrow: What Lives Where ==
+
+This is the most important thing to understand about running a node, because it is mid-migration.
+
+'''Today (in-process escrow):'''
+* The node loads <code>escrow-core</code> as a library and runs the money paths inside the node process.
+* Every paid action (ring/connect/deposit/top-up, paid DM, paid attachment, paid invite — local and federated) is:
+*# '''verified on-chain and tx-anchored''' — the client forwards the Keychain transaction id, the node verifies the exact amount + exact memo landed in escrow, and records a durable row with a '''<code>tx_id UNIQUE</code> replay guard''' (the same payment can never be counted twice);
+*# '''settled with a hard cap''' — settlement is <code>min(metered usage, verified deposit)</code>, so a wrong or over-stated usage report can only re-split the money you actually escrowed, '''never mint money''';
+*# '''closed single-winner''' — an <code>atomicClose</code> flip means a crash or double-click can't double-disburse.
+* The durable escrow database (<code>logs/v4call-escrow.db</code>) is the source of truth for settlement — '''not''' in-memory state — so a restart mid-call doesn't strand or double-pay.
+
+'''Two consequences for you as operator:'''
+* '''The client must send a <code>txId</code> with every paid action.''' Use the matching v4call-app (desktop/mobile) — it forwards the Keychain transaction id. Old monolith clients that don't send a <code>txId</code> will fail paid actions against this node. (Free actions are unaffected.)
+* '''This node is a money box for now.''' Keep <code>V4CALL_ESCROW_KEY</code> secret, keep the box patched, don't run risky extra software on it.
+
+'''Later (the isolated escrow box — not built yet, owner-gated):'''
+* escrow-core and <code>V4CALL_ESCROW_KEY</code> move onto a separate, minimal '''v4call-escrow''' host (its own Hive account, key, and database). The node then holds '''no''' money key and talks to the box over the signed <code>escrow-protocol/0.1</code> seam (already wired in-process, so the move is a transport swap + key move).
+* That box deployment, and its '''TEST-token dry-run''' (verify + refund + replay-reject + crash-no-double-disburse against a throwaway token ''before'' any production node points at it), are described in the '''escrow-core''' <code>walkthrough.wiki</code>. Do not point a production node at a freshly-built escrow box without that dry-run.
+
+== Admin and Debug Endpoints ==
+
+The admin key may be sent either as <code>Authorization: Bearer YOUR_ADMIN_KEY</code> (preferred, used by the GUI) '''or''' as <code>?key=YOUR_ADMIN_KEY</code> (handy for <code>curl</code>). Endpoints return 403 without it; if <code>ADMIN_KEY</code> is unset the node logs a warning and disables them.
+
+{| class="wikitable"
+|-
+! Endpoint !! Auth? !! What it does
+|-
+| <code>GET /api/info</code> || no || Server name/domain/version. Used by the health check.
+|-
+| <code>GET /debug-state</code> || '''yes''' || Current lobby users + active rooms. (Admin-gated in code — returns 403 without a key.)
+|-
+| <code>GET /rates/:username</code> || no || Parsed rates for a user (reads their <code>user-announce</code> post).
+|-
+| <code>GET /.well-known/v4call-server.json</code> || no || Your signed domain-proof file (served from <code>V4CALL_SERVER_JSON_PATH</code>).
+|-
+| <code>GET /join-token</code> || no || Pop-out / deep-link join token resolution.
+|-
+| <code>GET /admin/ledger</code> || yes || Recent payment records.
+|-
+| <code>GET /admin/balance</code> || yes || Escrow account HBD balance.
+|-
+| <code>GET /admin/peers</code> || yes || Discovered + approved federation peers.
+|-
+| <code>POST /admin/peers/approve?domain=peer.com</code> || yes || Approve a discovered peer.
+|-
+| <code>POST /admin/peers/revoke?domain=peer.com</code> || yes || Revoke an approved peer.
+|-
+| <code>POST /admin/peers/rescan</code> || yes || Force a Hive directory rescan.
+|-
+| <code>GET /admin/discovery-test</code> || yes || Per-Hive-node discovery diagnostic.
+|}
+
+== .env Reference ==
+
+After changing <code>.env</code>, restart: <code>systemctl restart v4call-node</code> (bare metal) or rebuild (Docker).
+
+{| class="wikitable"
+|-
+! Variable !! Default !! Description
+|-
+| <code>SERVER_NAME</code> || <code>v4call</code> || Display name for your server.
+|-
+| <code>SERVER_DOMAIN</code> || <code>v4call.com</code> || Your node's domain.
+|-
+| <code>SERVER_HIVE_ACCOUNT</code> || <code>v4call</code> || Hive account that receives platform fees + signs your domain-proof file.
+|-
+| <code>ESCROW_ACCOUNT</code> || <code>v4call-escrow</code> || Hive account that holds funds during calls. Its active key must live on this node (for now).
+|-
+| <code>V4CALL_ESCROW_KEY</code> || ''(none)'' || '''Active''' private key for the escrow account. '''Required for paid flows. Never commit.'''
+|-
+| <code>ESCROW_DB_PATH</code> || <code>logs/v4call-escrow.db</code> || The escrow-core durable, replay-guarded ledger. Its own file — separate from the legacy <code>v4call-ledger.db</code>.
+|-
+| <code>DEFAULT_PLATFORM_FEE</code> || <code>10</code> || Server's minimum platform fee percentage.
+|-
+| <code>ADMIN_KEY</code> || ''(none)'' || Password for <code>/admin/*</code>. Sent as <code>Authorization: Bearer</code> or <code>?key=</code>.
+|-
+| <code>CORS_ALLOWED_ORIGINS</code> || ''(blank = reflect any)'' || Comma-separated browser origins (the v4call-app + admin-peers GUI) allowed to read this node's responses.
+|-
+| <code>V4CALL_SERVER_JSON_PATH</code> || ships as <code>/app/data/v4call-server.json</code> || Path to your signed domain-proof file, served at <code>/.well-known/v4call-server.json</code>. ⚠ The shipped default is a '''container''' path — repoint it under the project dir on bare metal.
+|-
+| <code>NOSTR_KEY_PATH</code> || ships as <code>/app/nostr/nostr-key.json</code> || Where the node writes its Nostr identity key. ⚠ Also a '''container''' path — on bare metal repoint it under the project dir or the node creates a stray <code>/app/</code> at filesystem root.
+|-
+| <code>PORT</code> || <code>3000</code> || Internal listen port.
+|-
+| <code>BIND_HOST</code> || <code>127.0.0.1</code> || Bind address. Keep <code>127.0.0.1</code> behind Nginx; compose overrides to <code>0.0.0.0</code>.
+|-
+| <code>HIVE_API</code> || <code>https://api.hive.blog</code> || Primary Hive node (auto-fallback to others).
+|-
+| <code>FEDERATION_PEERS</code> || ''(blank)'' || Comma-separated peer WS URLs. '''One line only.''' Blank = standalone.
+|-
+| <code>DEFAULT_PLATFORM_FEE</code>, <code>MAX_CALL_DURATION_MIN</code>, <code>CALL_COOLDOWN_MS</code>, <code>PAYMENT_VERIFY_RETRIES</code>, <code>PAYMENT_VERIFY_DELAY_MS</code> || (see <code>.env.example</code>) || Call-behaviour tuning — defaults are fine.
+|-
+| <code>LOBBY_*</code> || (see <code>.env.example</code>) || Lobby notice + anti-spam HP/token gate (carried over from the monolith).
+|-
+| <code>FED_DISCOVERY_MODE</code> || ships as <code>both</code> || Nostr + Hive peer discovery. ⚠ '''Not''' off by default — a fresh node announces over Nostr on boot even when standalone (expected; self-heals once nGate whitelists it). Set to <code>hive</code> for a network-quiet standalone node.
+|-
+| <code>NOSTR_*</code> (presence / transport) || ''(off)'' || <code>FED_PRESENCE_VIA_NOSTR</code> and <code>NOSTR_FED_TRANSPORT</code> '''are''' off by default — only discovery/announce (above) fires on a fresh node.
+|}
+
+== Updating Your Node ==
+
+ cd /opt/v4call/escrow-core && git pull && npm install
+ cd /opt/v4call/v4call-node && git pull && npm install
+ systemctl restart v4call-node
+ journalctl -u v4call-node -f   # confirm the escrow + listen lines
+
+'''Always update escrow-core too''' when you pull the node — they are a matched pair via <code>file:../escrow-core</code>. Run the test suites after a pull (<code>npm test</code> in both) if you want extra confidence before restarting a live money box.
+
+Your data is preserved across updates — the SQLite databases live in <code>logs/</code> and the signed file in <code>data/</code>, neither of which <code>git pull</code> touches.
+
+== Common Problems and Fixes ==
+
+=== <code>Cannot find module 'escrow-core'</code> on startup ===
+escrow-core isn't installed, or isn't a sibling of v4call-node. Confirm the layout from [[#Step_5:_Get_the_Code_(two_repos,_side_by_side)|Step 5]] (<code>/opt/v4call/escrow-core</code> next to <code>/opt/v4call/v4call-node</code>) and run <code>npm install</code> in '''both''' folders.
+
+=== <code>npm install</code> fails building better-sqlite3 (<code>node-gyp</code> / <code>make: not found</code>) ===
+The native build toolchain is missing. Run <code>apt install -y build-essential python3</code> (Step 4) and retry.
+
+=== Opening the node URL in a browser shows nothing / a blank page or JSON ===
+'''Expected.''' This node serves no HTML. Use the v4call-app client and point it at this node ([[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]]).
+
+=== Client console: <code>io is not defined</code> or <code>Cannot access 'HIVE_API' before initialization</code> ===
+You hosted <code>desktop-app.html</code> without its <code>vendor/</code> folder (or opened it from a GitHub blob page / your desktop). <code>vendor/socket.io.min.js</code> 404s → <code>io</code> is undefined → the top-level <code>const socket = io(nodeBase())</code> throws → the whole script aborts → login then reports the misleading <code>HIVE_API</code> error. '''Fix:''' host the '''entire''' v4call-app folder so <code>vendor/</code> sits beside the HTML — easiest is the same-origin <code>/app/</code> Nginx alias in [[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]].
+
+=== A stray <code>/app/nostr/</code> (or <code>/app/data/</code>) appeared at the filesystem root ===
+You left the container-style paths from <code>.env.example</code> in place on a bare-metal host. Repoint <code>NOSTR_KEY_PATH</code> (and <code>V4CALL_SERVER_JSON_PATH</code>) under the project directory (see [[#Step_7:_Configure_the_Node_(.env_file)|Step 7]]), delete the stray <code>/app</code>, and restart.
+
+=== <code>/debug-state</code> returns 403 ===
+'''Expected — it's admin-gated''' (older notes wrongly called it public). Send the admin key: <code>curl -H "Authorization: Bearer KEY" https://node.yourdomain.com/debug-state</code>.
+
+=== A fresh standalone node spams <code>blocked: not on relay whitelist</code> ===
+'''Expected and harmless.''' Discovery ships as <code>both</code>, so the node announces over Nostr on boot; the relay rejects it until nGate whitelists your key. It self-heals (see [[#Step_16:_Federation_(Optional)|Step 16]]). Set <code>FED_DISCOVERY_MODE=hive</code> for a quiet node.
+
+=== Client connects but the browser console shows CORS errors ===
+The app's origin isn't in <code>CORS_ALLOWED_ORIGINS</code>. Set it to the exact scheme+host of where v4call-app is hosted (e.g. <code>https://app.yourdomain.com</code>, no trailing slash), then restart the node. Leaving it blank reflects any origin (fine for testing, not for production).
+
+=== admin-peers.html gets 403 or a preflight (OPTIONS) failure ===
+Two causes: (1) the app origin isn't in <code>CORS_ALLOWED_ORIGINS</code> — add it; (2) wrong <code>ADMIN_KEY</code>. The node already allows the <code>Authorization</code> header and answers the <code>OPTIONS</code> preflight, so once the origin + key are right it works. For a quick check, hit the endpoint with <code>curl -H "Authorization: Bearer KEY"</code>.
+
+=== Paid calls/DMs fail but free ones work ===
+The client isn't sending a transaction id, or the escrow key is wrong. (1) Use the matching v4call-app client — every paid action now requires a <code>txId</code> (the Keychain transaction id); old clients fail paid actions by design. (2) Check the boot log shows <code>[escrow] escrow-core ... ledger ready</code> and that <code>V4CALL_ESCROW_KEY</code> is the '''active''' key (starts with <code>5K</code>), not the posting key.
+
+=== Escrow boot log is missing / node exits immediately ===
+Look at <code>journalctl -u v4call-node -e</code>. A missing/empty <code>V4CALL_ESCROW_KEY</code> only disables disbursement (refunds stay pending); a genuinely failed escrow-ledger open (e.g. unwritable <code>logs/</code>) stops boot. Fix permissions on <code>logs/</code> (<code>chown</code> to the service user) and restart.
+
+=== Nginx <code>[emerg] cannot load certificate ... No such file</code> ===
+You enabled the HTTPS block before the certificate existed. Revert to the HTTP-only config (Step 10), reload Nginx, get the cert (Step 11), then add HTTPS (Step 12).
+
+=== Docker build fails on <code>npm install</code> ===
+The <code>file:../escrow-core</code> dependency is outside the build context. Apply Fix 1 in [[#Running_with_Docker_Instead|Running with Docker Instead]] (vendor escrow-core into the build context). The bare-metal path doesn't hit this.
+
+=== Federation peer verification fails / 404 on v4call-server.json ===
+Confirm <code>V4CALL_SERVER_JSON_PATH</code> points at your uploaded signed file and <code>curl https://node.yourdomain.com/.well-known/v4call-server.json</code> returns it. The directory is <code>.well-known</code> (hyphen), the filename is exactly <code>v4call-server.json</code>. Re-sign in <code>server-sign.html</code> if the signature doesn't validate.
+
+== Quick Reference ==
+
+;Service control
+: <code>systemctl status v4call-node</code> · <code>systemctl restart v4call-node</code> · <code>journalctl -u v4call-node -f</code>
+;Health
+: <code>curl https://node.yourdomain.com/api/info</code>
+;Escrow balance
+: <code>curl -H "Authorization: Bearer KEY" https://node.yourdomain.com/admin/balance</code>
+;Run the money-engine tests
+: <code>cd /opt/v4call/escrow-core && npm test</code> (67) · <code>cd /opt/v4call/v4call-node && npm test</code> (40)
+;The split, in one line
+: '''v4call-app''' = screens · '''v4call-node''' = brain (this repo, holds the key for now) · '''escrow-core''' = money library (in-process today, own box later) · '''nGate''' = federation bouncer (unchanged).
+;Source of truth
+: <code>handover-decoupling.md</code> (the split) · <code>handover-escrow-core.md</code> + the escrow-core <code>walkthrough.wiki</code> (the money engine + the future box).
+
+== Reproduction Notes (deploy test #0, 2026-06-17/18) ==
+
+This guide was reproduced end-to-end by an agent on a fresh Ubuntu 24.04 VPS (<code>node.v4call.com</code>) via the bare-metal + systemd path. '''Verdict: reproducible, no blocking errors.''' Test suites passed exactly as stated (escrow-core 67/67, v4call-node 40/40 — fully offline), Steps 4–15 completed, and client login worked (client → node → Hive Keychain → lobby). '''Live money flows confirmed:''' a real paid DM (HBD 0.02, two users across macOS + Linux on one node) '''and''' a full metered voice + video call (paid with a throwaway TEST token: ring/connect/deposit → <code>min(usage, deposit)</code> settle → refund/disburse) both settled correctly — the in-process escrow path works in production, not just in tests.
+
+The corrections that test surfaced are '''already folded into the steps above''': <code>/debug-state</code> is admin-gated (Step 15 + endpoints table); the <code>.env.example</code> container paths for <code>V4CALL_SERVER_JSON_PATH</code> + <code>NOSTR_KEY_PATH</code> must be repointed on bare metal (Step 7); Nostr discovery ships as <code>both</code> so standalone isn't network-silent (Steps 7–8); two <code>better-sqlite3</code> builds are expected (Step 6); and the big one — <code>desktop-app.html</code> is '''not''' standalone, so host the whole v4call-app folder, easiest same-origin under the node (Step 14).
+
+'''Still recommended''' (follow-ups not yet exercised): the adversarial half of the escrow-core TEST-token dry-run — '''replay-reject''' + '''crash-no-double-disburse''' — now scripted as a one-command harness (<code>cd /opt/v4call/escrow-core && node scripts/dry-run-adversarial.js</code> → expect <code>ALL GUARDS HELD — 13/13</code>; escrow-core <code>walkthrough.wiki</code> Step 10) before scaling real-HBD volume; federation (domain-proof + peer verify); and the Docker path. Full report: <code>decoupling-notes/test1/decoupling-test0.md</code>.
