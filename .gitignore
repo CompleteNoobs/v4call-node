@@ -15,6 +15,12 @@ logs/
 node_modules/
 npm-debug.log*
 
+# ── Docker build vendoring ────────────────────────────────────────────────────
+# `npm run docker:prep` copies escrow-core here for the Docker build context.
+# Never commit a copy of the money library (avoids drift — escrow-core is its
+# own pinned repo). Bare-metal deploys don't use this at all.
+vendor/
+
 # ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

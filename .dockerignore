@@ -1,0 +1,27 @@
+# Keep the Docker build context lean + reproducible. The Dockerfile uses
+# explicit COPYs, but this also guards the vendored escrow-core snapshot from
+# carrying host-built artefacts into the image.
+.git
+node_modules
+data
+logs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+npm-debug.log*
+test
+
+# Vendored escrow-core: source only — never a host-built native module or db.
+vendor/escrow-core/node_modules
+vendor/escrow-core/.git
+vendor/escrow-core/*.db
+vendor/escrow-core/*.db-journal
+vendor/escrow-core/*.db-wal
+vendor/escrow-core/*.db-shm
+
+# Docs / local notes — not needed in the image
+walkthrough.wiki
+README.md
+.env
+.env.example

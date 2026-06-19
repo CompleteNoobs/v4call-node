@@ -1,11 +1,11 @@
-name: v4call
+name: v4call-node
 
 services:
 
-  # ── v4call Node.js App ─────────────────────────────────────────────────────
+  # ── v4call-node (headless server) ──────────────────────────────────────────
   app:
     build: .
-    container_name: v4call-app
+    container_name: v4call-node
     restart: unless-stopped
     env_file: .env
     environment:
@@ -16,6 +16,9 @@ services:
       # `docker compose down && build --no-cache`. Do NOT delete ./data/nostr
       # on the host or the server loses its Nostr identity (re-announce needed).
       - ./data/nostr:/app/nostr
+      # Durable escrow ledger + signed domain-proof JSON live under ./data so
+      # they survive rebuilds (V4CALL_SERVER_JSON_PATH / ESCROW_DB_PATH point here).
+      - ./data:/app/data
     networks:
       - internal
     healthcheck:
@@ -25,7 +28,7 @@ services:
       start_period: 20s
       retries: 3
 
-  # ── Nginx Reverse Proxy ────────────────────────────────────────────────────
+  # ── Nginx Reverse Proxy (TLS terminator only — no static, no auth_basic) ────
   nginx:
     image: nginx:alpine
     container_name: v4call-nginx
@@ -34,11 +37,19 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/v4call.conf:/etc/nginx/conf.d/default.conf:ro
+      # FIRST BOOT (no cert yet): the HTTP-only bootstrap config is the default so
+      # `docker compose up -d --build` comes up without a certificate and serves
+      # the ACME challenge. After issuing the cert (see the certbot service +
+      # walkthrough.wiki "Running with Docker Instead"), switch the line below to
+      # the HTTPS config and `docker compose up -d`:
+      #   - ./nginx/v4call.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/v4call.http.conf:/etc/nginx/conf.d/default.conf:ro
       - ./data/certbot/conf:/etc/letsencrypt:ro
       - ./data/certbot/www:/var/www/certbot:ro
-      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro          # add this
-      - ./public/info.html:/usr/share/nginx/html/info.html:ro  # add this
+      # Optional — serve the v4call-app client same-origin under the node via the
+      # /app/ alias in nginx/v4call.conf (uncomment there too). Point this at your
+      # local v4call-app checkout (sibling of v4call-node):
+      #- ../v4call-app:/usr/share/nginx/v4call-app:ro
     depends_on:
       app:
         condition: service_healthy

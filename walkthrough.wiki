@@ -589,28 +589,36 @@ Healthy startup shows <code>Outbound connected</code> and <code>✓ Peer verifie
 
 == Running with Docker Instead ==
 
-The repo ships a <code>Dockerfile</code> and <code>docker-compose.yml</code>, but they still carry '''monolith-era leftovers''' that need a deploy-time pass before they'll build and run headless. If you prefer Docker, here is what to fix. (If you used the bare-metal path above, you can skip this section entirely.)
+The repo now ships '''headless-ready''' Docker files — <code>Dockerfile</code>, <code>docker-compose.yml</code>, <code>nginx/v4call.conf</code> (headless HTTPS) and <code>nginx/v4call.http.conf</code> (HTTP bootstrap). The monolith-era leftovers (the <code>info.html</code>/<code>.htpasswd</code> mounts, the static + <code>auth_basic</code> blocks) are gone. There is exactly '''one''' manual pre-build step — vendoring escrow-core — because it is a sibling dependency outside the Docker build context. (If you used the bare-metal path above, you can skip this section entirely.)
 
-'''Fix 1 — the escrow-core dependency can't resolve inside the container.''' The Dockerfile copies only <code>package.json</code> and runs <code>npm install</code>, but the dependency is <code>file:../escrow-core</code> — a path ''outside'' the Docker build context, so the build fails. Vendor escrow-core into the build context:
-
- cd /opt/v4call/v4call-node
- rm -rf vendor && mkdir -p vendor
- cp -r ../escrow-core vendor/escrow-core
- rm -rf vendor/escrow-core/node_modules vendor/escrow-core/*.db*
-
-Change the dependency in <code>package.json</code> from <code>file:../escrow-core</code> to <code>file:vendor/escrow-core</code>, and add a <code>COPY vendor ./vendor</code> line in the <code>Dockerfile</code> ''before'' the <code>npm install</code> line so the local path exists at install time.
-
-'''Fix 2 — the compose file mounts files a headless node doesn't have.''' The shipped <code>docker-compose.yml</code> nginx service mounts <code>./public/info.html</code> and <code>./nginx/.htpasswd</code> (both monolith artefacts). Remove those two volume lines. Replace the contents of <code>nginx/v4call.conf</code> with the headless HTTPS config from [[#Step_12:_Enable_the_Full_Headless_HTTPS_Config|Step 12]] (swapping <code>proxy_pass http://127.0.0.1:3000</code> for <code>proxy_pass http://app:3000</code>, since under compose the node container is reachable as <code>app</code>). Drop the <code>info.html</code> static block and the <code>auth_basic</code> lines.
-
-'''Fix 3 — get the cert before enabling HTTPS in the container nginx.''' Same rule as Step 10–11: start nginx HTTP-only, issue the cert with the dockerised certbot, then switch the conf to HTTPS. Follow the same certbot flow the v4call monolith WalkThrough uses (<code>docker compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot -d node.yourdomain.com ...</code>).
-
-Then:
+'''Step A — vendor escrow-core, then build.''' escrow-core is declared <code>file:../escrow-core</code> — a path ''outside'' this folder's build context, so <code>docker build</code> cannot see it. <code>npm run docker:prep</code> copies a clean source snapshot into <code>vendor/escrow-core</code> (stripping its <code>node_modules</code>/<code>.git</code>/DBs); the Dockerfile then installs it into the image. The one-shot helper does both:
 
  cd /opt/v4call/v4call-node
- docker compose up -d --build
- docker compose logs -f app    # look for the [escrow] escrow-core ... ledger ready line
+ cp .env.example .env     # then edit .env (escrow account/key, admin key, etc.)
+ npm run docker:build     # = vendor escrow-core + docker compose up -d --build
 
-'''In short:''' the bare-metal + systemd path in Steps 4–12 is the verified, reproducible route today. The Docker path works once the three fixes above are applied; the maintainers have flagged this "TLS-terminator-only" cleanup as a known deploy-time task.
+: ''Or run the two steps yourself:'' <code>npm run docker:prep && docker compose up -d --build</code>.
+: '''Note:''' you do '''not''' edit <code>package.json</code>. The Dockerfile installs the vendored copy with <code>npm install --install-links</code>, which packs the <code>file:</code> dependency into a real <code>node_modules</code> directory instead of a symlink. That matters: a symlink makes Node resolve escrow-core's own deps (<code>@hiveio/dhive</code>, <code>@noble/curves</code>, <code>better-sqlite3</code>) from the symlink target, which has no <code>node_modules</code> in the image, and the node would crash at boot with <code>Cannot find module '@hiveio/dhive'</code>. <code>--install-links</code> avoids that. (You'll see <code>better-sqlite3</code> compile twice — escrow-core's <code>^11</code> and the node's <code>^9</code> — which is expected.)
+: '''Note:''' <code>vendor/</code> is git-ignored on purpose — the money library is its own pinned repo; never commit a copy. Re-run <code>npm run docker:prep</code> after pulling a new escrow-core.
+
+The app container boots immediately and logs the money engine opening its durable ledger:
+
+ docker compose logs -f app    # look for: [escrow] escrow-core 0.1.0 ledger ready: /app/data... (or /app/logs...)
+
+'''Step B — first boot is HTTP-only (no cert needed).''' The compose file mounts <code>nginx/v4call.http.conf</code> by default: it boots nginx without any certificate, serves the ACME challenge, and proxies the node over plain HTTP so you can smoke-test (<code>curl http://node.yourdomain.com/api/info</code>). Issue the cert with the dockerised certbot:
+
+ docker compose run --rm --entrypoint certbot certbot \
+   certonly --webroot -w /var/www/certbot -d node.yourdomain.com
+
+'''Step C — switch to HTTPS.''' In <code>docker-compose.yml</code>, change the nginx config mount from <code>v4call.http.conf</code> to the headless HTTPS config <code>v4call.conf</code> (the line is commented right above it), then:
+
+ docker compose up -d    # nginx reloads on the HTTPS config
+
+: <code>nginx/v4call.conf</code> is already the headless HTTPS config for compose — it proxies to <code>app:3000</code> (the node's compose service name), serves only JSON + WebSocket (<code>/socket.io/</code>, <code>/federation</code>, the API), and has '''no''' static block and '''no''' <code>auth_basic</code>. Substitute your domain in both nginx files (and in the cert paths).
+
+'''Optional — serve the client same-origin (no CORS).''' Uncomment the <code>/app/</code> <code>location</code> block in <code>nginx/v4call.conf</code> '''and''' the <code>../v4call-app</code> volume in <code>docker-compose.yml</code>'s nginx service. The client is then at <code>https://node.yourdomain.com/app/desktop-app.html</code> — same origin as the node, so no <code>CORS_ALLOWED_ORIGINS</code> needed (see [[#Step_14:_Connect_the_Client_(v4call-app)|Step 14]]).
+
+'''In short:''' both routes are now verified — the bare-metal + systemd path in Steps 4–12, and this Docker path. <code>npm run docker:build</code> boots the headless node (escrow ledger opens, <code>/api/info</code> answers, <code>/debug-state</code> is admin-gated 403); add the cert and flip to the HTTPS config for production.
 
 == Escrow: What Lives Where ==
 
