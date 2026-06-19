@@ -191,8 +191,8 @@ The first install compiles <code>better-sqlite3</code> — this is why you insta
 
 '''Quick confidence check — run the test suites''' (fully offline, no keys or network needed):
 
- cd /opt/v4call/escrow-core && npm test     # escrow-core money engine — expect 67 passing
- cd /opt/v4call/v4call-node && npm test     # node's escrow integration — expect 40 passing
+ cd /opt/v4call/escrow-core && npm test     # escrow-core money engine — expect 72 passing
+ cd /opt/v4call/v4call-node && npm test     # node's escrow integration — expect 43 passing
 
 Green tests here mean the money engine and its wiring into the node are sound before you ever touch a real key.
 
@@ -784,7 +784,7 @@ Confirm <code>V4CALL_SERVER_JSON_PATH</code> points at your uploaded signed file
 ;Escrow balance
 : <code>curl -H "Authorization: Bearer KEY" https://node.yourdomain.com/admin/balance</code>
 ;Run the money-engine tests
-: <code>cd /opt/v4call/escrow-core && npm test</code> (67) · <code>cd /opt/v4call/v4call-node && npm test</code> (40)
+: <code>cd /opt/v4call/escrow-core && npm test</code> (72) · <code>cd /opt/v4call/v4call-node && npm test</code> (43)
 ;The split, in one line
 : '''v4call-app''' = screens · '''v4call-node''' = brain (this repo, holds the key for now) · '''escrow-core''' = money library (in-process today, own box later) · '''nGate''' = federation bouncer (unchanged).
 ;Source of truth
@@ -797,3 +797,5 @@ This guide was reproduced end-to-end by an agent on a fresh Ubuntu 24.04 VPS (<c
 The corrections that test surfaced are '''already folded into the steps above''': <code>/debug-state</code> is admin-gated (Step 15 + endpoints table); the <code>.env.example</code> container paths for <code>V4CALL_SERVER_JSON_PATH</code> + <code>NOSTR_KEY_PATH</code> must be repointed on bare metal (Step 7); Nostr discovery ships as <code>both</code> so standalone isn't network-silent (Steps 7–8); two <code>better-sqlite3</code> builds are expected (Step 6); and the big one — <code>desktop-app.html</code> is '''not''' standalone, so host the whole v4call-app folder, easiest same-origin under the node (Step 14).
 
 '''Still recommended''' (follow-ups not yet exercised): the adversarial half of the escrow-core TEST-token dry-run — '''replay-reject''' + '''crash-no-double-disburse''' — now scripted as a one-command harness (<code>cd /opt/v4call/escrow-core && node scripts/dry-run-adversarial.js</code> → expect <code>ALL GUARDS HELD — 13/13</code>; escrow-core <code>walkthrough.wiki</code> Step 10) before scaling real-HBD volume; federation (domain-proof + peer verify); and the Docker path. Full report: <code>decoupling-notes/test1/decoupling-test0.md</code>.
+
+'''Re-reproduced 2026-06-19 (deploy test #1, fresh <code>node.v4call.com</code>, Ubuntu 24.04 / Node 20).''' Bare-metal path Steps 3–12 + 15, cloning the published repos. '''No blocking errors.''' Differences from #0, now folded into the steps above: the test suites have '''grown''' — escrow-core '''72/72''' and v4call-node '''43/43''' (the in-process 40 plus 3 box-mode loopback tests + the escrow-core re-split tests) — and <code>npm test</code> (<code>node --test test/</code>) runs clean on Node 20 (the bare-directory form only trips on Node 24, e.g. the Alpine escrow box — there use <code>node --test test/*.test.js</code>). Certbot issued the cert via the webroot challenge first try; the headless HTTPS block served <code>/api/info</code>, the http→https 301, <code>/debug-state</code> (403 vs <code>{lobbyUsers,rooms}</code> with a Bearer key), and <code>/admin/balance</code> (read the escrow account's HBD balance) all correctly. Booted with a throwaway escrow key — the documented "key does NOT match" warning appears and the node runs (only disburse is disabled); the Nostr <code>blocked: not on relay whitelist</code> self-heal line appears as documented.
