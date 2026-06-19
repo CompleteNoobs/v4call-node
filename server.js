@@ -78,6 +78,9 @@ const escrowCore = require('escrow-core');   // pinned engine (escrow-core@^0.1)
                                              // (NOT `escrow`: many handlers destructure an `escrow` ACCOUNT param)
 const { createEscrowVerify } = require('./escrow-verify');
 const { createEscrowReporter } = require('./escrow-report');
+// node↔app shared contract (vendored, kept byte-identical with v4call-app/shared/).
+// The canonical domain-proof string the client signs and this node verifies.
+const sharedWellKnown = require('./shared/v4call-wellknown');
 
 const app    = express();
 const server = http.createServer(app);
@@ -120,6 +123,15 @@ const SERVER_NAME         = process.env.SERVER_NAME         || 'v4call';
 const SERVER_DOMAIN       = process.env.SERVER_DOMAIN       || 'v4call.com';
 const SERVER_HIVE_ACCOUNT = process.env.SERVER_HIVE_ACCOUNT || 'v4call';
 const ESCROW_ACCOUNT      = process.env.ESCROW_ACCOUNT      || 'v4call-escrow';
+// ── Escrow settlement mode (decoupling §11 step4 — the escrow-box split) ─────────────────────
+// 'in-process' (default): the node loads escrow-core and settles in-process — BYTE-IDENTICAL to
+// the committed, proven-live path. 'box': the node is KEYLESS and hands every settlement to the
+// isolated escrow box over escrow-protocol/0.1 (see escrow-box-mode.js); the box holds the ONLY
+// money key. Keep the default in-process until the box is deployed + TEST-token dry-run-passed.
+const ESCROW_MODE         = (process.env.ESCROW_MODE || 'in-process').toLowerCase();
+const ESCROW_BOX_PUBKEY   = (process.env.ESCROW_BOX_PUBKEY || '').trim().toLowerCase();   // box reporting pubkey to PIN (verifies receipts)
+const ESCROW_BOX_RELAYS   = (process.env.ESCROW_BOX_RELAYS || '')                          // nGate relays for the box seam; defaults to NOSTR_RELAYS
+  .split(',').map(s => s.trim()).filter(Boolean);
 const PLATFORM_FEE        = parseFloat(process.env.DEFAULT_PLATFORM_FEE || '10') / 100;
 
 // v0.16.8 — Precision floor for paid rates. Default for HBD/HIVE (3 decimals).
@@ -361,6 +373,76 @@ const escrowReporter = createEscrowReporter({
   reporter: () => SERVER_HIVE_ACCOUNT,   // the node's on-chain identity (report `reporter`)
   service: 'v4call',
 });
+
+// ── BOX MODE (ESCROW_MODE=box): the node is keyless — settlement happens on the isolated escrow
+// box, reached over escrow-protocol/0.1 (escrow-box-mode.js). In-process mode leaves escrowBoxMode
+// null and the settlement paths below take their existing, byte-identical branch. ────────────────
+let escrowBoxMode = null;
+if (ESCROW_MODE === 'box') {
+  if (!/^[0-9a-f]{64}$/.test(ESCROW_BOX_PUBKEY)) {
+    console.error('[escrow] ESCROW_MODE=box but ESCROW_BOX_PUBKEY is not a 64-hex schnorr pubkey — refusing to start (a keyless node MUST pin the box key to verify receipts).');
+    process.exit(1);
+  }
+  if (process.env.V4CALL_ESCROW_KEY) {
+    console.warn('[escrow] ⚠ ESCROW_MODE=box: V4CALL_ESCROW_KEY is set on this node but will NOT be used — the box holds the only money key. Remove it from this host (the whole point of the split is that a node compromise cannot drain funds).');
+  }
+  const { createSettlementQueue } = require('./escrow-settlement-queue');
+  const { createEscrowBoxMode } = require('./escrow-box-mode');
+  const escrowQueue = createSettlementQueue({ db: escrowLedger.db, log: (lvl, m) => console.log('[escrow-box-queue]', m) });
+  escrowBoxMode = createEscrowBoxMode({
+    escrowAdapter, escrowReporter, queue: escrowQueue,
+    boxPubkey: ESCROW_BOX_PUBKEY,
+    relays: ESCROW_BOX_RELAYS.length ? ESCROW_BOX_RELAYS : NOSTR_RELAYS,
+    selfSkHex: getEscrowReportingSk,
+    maxDurationMin: MAX_CALL_DURATION_MIN,
+    log: console,
+  });
+
+  // Finalize a box-settled call: the box has already disbursed; the node emits the client receipt,
+  // updates the legacy audit ledger, and (federated) sends the caller's receipt back to their
+  // server. Runs EXACTLY once per call (inline receipt OR drainer redelivery). The numbers come
+  // from the box's signed receipt (the authority); display context comes from the reported facts.
+  escrowBoxMode.onSettled(async (callId, { facts, receipt, meta }) => {
+    const cf = (facts && facts.callFacts) || {};
+    const pays = (facts && Array.isArray(facts.payments)) ? facts.payments : [];
+    const caller = (pays[0] && pays[0].sender) || null;
+    const callee = cf.callee || null;
+    const currency = receipt.currency || (facts && facts.currency) || 'HBD';
+    const durationMin = Math.min(((facts && facts.durationMs) || 0) / 60000, MAX_CALL_DURATION_MIN);
+    const disp = {
+      callId, caller, callee, currency,
+      endTime:      new Date(receipt.created_at || Date.now()).toISOString(),
+      durationMin:  parseFloat(durationMin.toFixed(2)),
+      durationCost: receipt.settlement,
+      refundAmount: receipt.refund,
+      disburseTx:   receipt.disburse_tx || null,
+      status:       receipt.status,
+      endReason:    facts && facts.endReason,
+      federated:    !!(meta && meta.federated),
+      mode: 'box',
+    };
+    try {
+      ledgerCallUpdate(callId, {
+        ended_at:      new Date().toISOString(),
+        duration_min:  disp.durationMin,
+        duration_cost: receipt.settlement,
+        status:        'ended',
+        end_reason:    facts && facts.endReason,
+      });
+    } catch (e) { console.warn(`[escrow-box] ledgerCallUpdate ${callId} failed: ${e.message}`); }
+    const callerSid = caller && lobbyUsers[caller]?.socketId;
+    const calleeSid = callee && lobbyUsers[callee]?.socketId;
+    if (callerSid) io.to(callerSid).emit('call-receipt', { ...disp, perspective: 'caller' });
+    if (calleeSid) io.to(calleeSid).emit('call-receipt', { ...disp, perspective: 'callee' });
+    if (meta && meta.callerServer) {                  // federated: forward the caller's receipt home
+      const peer = federationPeers[meta.callerServer];
+      if (peer?.connected) fedSend(peer.ws, { type: 'call-receipt-fed', callId, receipt: { ...disp, perspective: 'caller' } });
+    }
+  });
+
+  escrowBoxMode.start().catch(e => console.error('[escrow] box mode start failed (settlements will queue + retry):', e.message));
+  console.log(`[escrow] ESCROW_MODE=box — KEYLESS reporter; settling via box ${ESCROW_BOX_PUBKEY.slice(0, 12)}… over ${(ESCROW_BOX_RELAYS.length ? ESCROW_BOX_RELAYS : NOSTR_RELAYS).length} relay(s)`);
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2711,6 +2793,22 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   // durable row — they fall through and settle from activePayments (the _processing
   // flag set above still guards in-process re-entry for them).
   const payRows = escrowLedger.getPaymentsByRef(callId);
+
+  // ── BOX MODE: hand the call-end envelope to the escrow box and return — the box settles
+  // (re-verifies every payment on-chain + disburses with the only money key); finalization (client
+  // receipt + ledger) runs when its signed receipt arrives (escrow-box-mode onSettled). No local
+  // atomicClose/settle/disburse here; the queue's UNIQUE(ref) is the single-winner guard against a
+  // duplicate call-end. (escrowBoxMode is non-null ONLY when ESCROW_MODE=box.)
+  if (escrowBoxMode) {
+    if (payRows.length === 0) {
+      console.warn(`[billing] Call ${callId} has no durable escrow row — nothing to settle (box mode)`);
+    } else {
+      await escrowBoxMode.settleCall({ callId, payRows, endReason, now });
+    }
+    delete activePayments[callId];
+    return;
+  }
+
   if (payRows.length > 0 && !escrowLedger.atomicClose(callId)) {
     console.warn(`[billing] Call ${callId} already settled (durable row closed) — skipping disburse`);
     delete activePayments[callId];
@@ -2922,6 +3020,25 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
   // in-flight calls with no durable row fall through to activePayments (the
   // _processing flag above still guards in-process re-entry).
   const payRows = escrowLedger.getPaymentsByRef(callId);
+
+  // ── BOX MODE: report to the box like the local path — but the duration is caller-server-
+  // authoritative (durationMs) and the platform fee is OURS (Model 3). Synthesize start_ts and
+  // override platform_fee on the primary row before building the envelope, so the box meters the
+  // SAME span and fee the in-process federated path would. Finalization — including the caller's
+  // receipt-back to their server — runs on the box receipt (via meta.callerServer).
+  if (escrowBoxMode) {
+    if (payRows.length === 0) {
+      console.warn(`[fed-billing] Call ${callId} has no durable escrow row — nothing to settle (box mode)`);
+    } else {
+      const fedRows = payRows.map(r => (r.rate_per_hour != null)
+        ? { ...r, start_ts: now - (durationMs || 0), platform_fee: PLATFORM_FEE }
+        : r);
+      await escrowBoxMode.settleCall({ callId, payRows: fedRows, endReason, now, meta: { callerServer, federated: true } });
+    }
+    delete activePayments[callId];
+    return;
+  }
+
   if (payRows.length > 0 && !escrowLedger.atomicClose(callId)) {
     console.warn(`[fed-billing] Call ${callId} already settled (durable row closed) — skipping disburse`);
     delete activePayments[callId];
@@ -6153,21 +6270,10 @@ async function _lookupPostingPubKey(account) {
 // Backward compat: a file with no Nostr fields produces the 9-field shape
 // exactly as before, so peers signed pre-Nostr keep verifying without re-sign.
 function _verifyPayloadString(obj) {
-  const base = [
-    obj.claim, obj.domain, obj.hive_account,
-    obj.escrow, obj.fee_account, obj.federation_ws,
-    obj.issued, obj.expires || '', obj.nonce
-  ];
-  const relays   = Array.isArray(obj.nostr_relays) ? obj.nostr_relays.filter(Boolean) : [];
-  const hasNostr = !!(obj.nostr_npub || obj.nostr_hex || relays.length);
-  if (hasNostr) {
-    base.push(
-      obj.nostr_npub || '',
-      obj.nostr_hex  || '',
-      relays.join(',')
-    );
-  }
-  return base.join('|');
+  // Delegated to the vendored node↔app shared module so the node verifies exactly
+  // the string v4call-app/server-sign.html signs. Behaviour is unchanged — same
+  // 9-field base + conditional 3-field Nostr append, same '|' join.
+  return sharedWellKnown.buildDomainProofPayload(obj);
 }
 
 async function verifyPeer(domain, claimedAccount) {

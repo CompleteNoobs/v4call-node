@@ -92,7 +92,18 @@ function createEscrowReporter({ escrowCore, getSkHex, reporter, service = 'v4cal
     catch { return false; }
   }
 
-  return { buildSignedReport, acceptReport, buildSignedReceipt, verifyReceipt, pubkey, settleNonce, randomNonce };
+  // ── NODE side (BOX MODE): verify a settlement receipt signed by the BOX. In-process the node
+  // signs AND verifies the receipt with its own key (verifyReceipt above); in box mode the box
+  // signs it with ITS reporting key, so the node must verify under the pinned box pubkey
+  // (ESCROW_BOX_PUBKEY) — not its own. Fails closed on a bad/absent sig or a non-hex pubkey.
+  function verifyReceiptFromBox(signed, boxPubkey) {
+    try {
+      return !!(signed && signed.sig && /^[0-9a-f]{64}$/i.test(String(boxPubkey || ''))
+        && escrowCore.verifyReport(signed, String(boxPubkey).toLowerCase()));
+    } catch { return false; }
+  }
+
+  return { buildSignedReport, acceptReport, buildSignedReceipt, verifyReceipt, verifyReceiptFromBox, pubkey, settleNonce, randomNonce };
 }
 
 module.exports = { createEscrowReporter };
