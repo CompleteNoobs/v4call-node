@@ -1059,6 +1059,21 @@ const FED_INVITE_TTL_MS = 15 * 60 * 1000;
 const pendingPaidInvites = {};
 const PAID_INVITE_TTL_MS = 15 * 60 * 1000;
 
+// ── v0.17 Part A — paid expert offers (local/same-server) ────────────────────
+// The lifecycle/authorization state machine lives in expert-offers.js (unit-tested
+// seam); server.js drives the money around its transitions: verifyAndRecordPayment
+// on fund, refundExpertOffer on decline/timeout/room-death, processCallEnd on
+// session end. The offer's escrow row carries the same columns as a 1:1 call row
+// (callee=expert, connect_paid=connectFee, sender=admin) so the ENTIRE settlement
+// path — in-process AND box mode — is reused verbatim with the roles inverted:
+// payout→expert, refund→admin, fee→operator. Federation (payload.paidExpert,
+// protocol v0.5) is Part B — deferred until a fed is up; offers are local-only here.
+const { createExpertOffers } = require('./expert-offers');
+const expertOffers = createExpertOffers({
+  maxDurationCapMin: Math.min(720, MAX_CALL_DURATION_MIN),
+  log: (lvl, m) => console.log('[expert-offer]', m),
+});
+
 // ── Discovery state (populated by scanV4CallDirectory) ──────────────────────
 // domain → { post_author, post_permlink, post_created, parsed, verified,
 //            verify_reason, last_seen }
@@ -5067,6 +5082,40 @@ io.on('connection', (socket) => {
     r.members.push({ socketId: socket.id, username, pubKey, joinedVia, homeServer: isFed ? fedHome : null });
     if (!isFed && lobbyUsers[username]) lobbyUsers[username].inRoom = room;
 
+    // v0.17 — a paid expert entering the room STARTS the metered session: persist
+    // start_ts on the durable escrow row (the settlement clock) and seed the
+    // live-call cache so processCallEnd settles this offer exactly like a 1:1 call
+    // (payout→expert, refund→admin, fee→operator). Reconnect mid-session is a
+    // no-op: the offer is already 'active', so joined() refuses a second start.
+    if (joinedVia === 'paid' && !isFed) {
+      const xoTicket = r.paidInvitees.get(username);
+      const xo = xoTicket && expertOffers.get(xoTicket.offerId);
+      if (xo && expertOffers.joined(xo.offerId, username, Date.now()).ok) {
+        const startTs = xo.startTs;
+        recordEscrowStartTs(xo.offerId, startTs);
+        activePayments[xo.offerId] = {
+          caller: xo.inviter, callee: xo.expert, currency: xo.currency,
+          ratePerHour: xo.ratePerHour, connectPaid: xo.connectFee,
+          depositPaid: parseFloat((xo.cap - xo.connectFee).toFixed(xo.precision)),
+          platformFee: PLATFORM_FEE, startTime: startTs, escrow: ESCROW_ACCOUNT,
+        };
+        io.to(room).emit('lobby-info', { text: `💎 @${username} joined as a paid expert.` });
+        const inv = lobbyUsers[xo.inviter];
+        if (inv) io.to(inv.socketId).emit('expert-session-started', {
+          offerId: xo.offerId, room, expert: xo.expert, startTs,
+          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
+          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
+        });
+        io.to(socket.id).emit('expert-session-started', {
+          offerId: xo.offerId, room, expert: xo.expert, startTs,
+          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
+          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
+          perspective: 'expert', platformFee: PLATFORM_FEE,
+        });
+        console.log(`[expert-offer] 💎 session started: ${xo.offerId} (@${username} in #${room})`);
+      }
+    }
+
     const everyone = r.members.map(u => ({
       socketId: u.socketId, username: u.username, pubKey: u.pubKey,
       joinedVia: u.joinedVia, homeServer: u.homeServer || null
@@ -5509,6 +5558,110 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── v0.17 Part A — PAID EXPERT OFFERS (local/same-server) ──────────────────
+  // The invite IS the contract: the admin sets connectFee + ratePerHour + currency
+  // + maxDuration; the expert accepts those exact terms (their rate post is NOT
+  // consulted — the OFFER: anti-spam fee stays unconsumed until a later build).
+  // Money flow (inviter-holds-funds): the admin pays the full cap
+  // (connectFee + maxDuration×rate) into THIS server's escrow up front; settlement
+  // pays the expert connect + elapsed×rate (capped), refunds the rest to the admin.
+
+  // Step 1 — admin asks to make an offer; server validates and quotes the cap +
+  // escrow + memo for the Keychain transfer. No money has moved yet.
+  socket.on('expert-offer-create', async ({ room, expert, connectFee, ratePerHour, currency, maxDurationMin }, cb) => {
+    const inviter = socket._username;
+    if (!inviter) return cb && cb({ ok: false, reason: 'Not authenticated.' });
+    const r = rooms[room];
+    if (!r) return cb && cb({ ok: false, reason: 'Room not found.' });
+    if (r.creator !== inviter) return cb && cb({ ok: false, reason: 'Only the room admin can send paid expert offers (v0.17 first build).' });
+    const target = String(expert || '').trim().toLowerCase().replace(/^@/, '');
+    if (target.includes('@')) return cb && cb({ ok: false, reason: 'Cross-server paid expert offers arrive with federation v0.5 — local users only for now.' });
+    if (!lobbyUsers[target]) return cb && cb({ ok: false, reason: `@${target} is not online on this server — they must be online to receive the offer.` });
+    if (r.members.some(m => m.username === target && !m.homeServer)) {
+      return cb && cb({ ok: false, reason: `@${target} is already in #${room}.` });
+    }
+    const cur  = String(currency || 'HBD').toUpperCase();
+    const prec = await getCurrencyPrecision(cur);
+    const res  = expertOffers.create({
+      room, inviter, expert: target, connectFee, ratePerHour, currency: cur,
+      maxDurationMin, precision: prec,
+    });
+    if (!res.ok) return cb && cb({ ok: false, reason: res.reason });
+    const o = res.offer;
+    cb && cb({ ok: true, offerId: o.offerId, escrow: ESCROW_ACCOUNT, cap: o.cap, memo: o.memo, currency: o.currency });
+  });
+
+  // Step 2 — admin broadcast the cap transfer via Keychain; verify it on-chain
+  // (tx-anchored + replay-guarded) and record the row with the CALL-SHAPED columns
+  // settlement reads later. Only then does the expert see the popup.
+  socket.on('expert-offer-fund', async ({ offerId, txId }, cb) => {
+    const inviter = socket._username;
+    const o = expertOffers.get(offerId);
+    if (!o || o.inviter !== inviter) return cb && cb({ ok: false, reason: 'Unknown offer.' });
+    if (o.status !== 'awaiting_payment') return cb && cb({ ok: false, reason: `Offer is ${o.status}.` });
+
+    const res = await verifyAndRecordPayment({
+      txId, sender: inviter, escrowAccount: ESCROW_ACCOUNT, currency: o.currency,
+      memo: o.memo, expectedAmount: o.cap, ref: o.offerId,
+      cols: { callee: o.expert, connect_paid: o.connectFee, rate_per_hour: o.ratePerHour, platform_fee: PLATFORM_FEE },
+    });
+    if (!res.ok) return cb && cb({ ok: false, reason: res.reason });
+    expertOffers.fund(o.offerId, inviter, txId);
+
+    const lu = lobbyUsers[o.expert];
+    if (!lu) {
+      // Expert went offline between quote and payment — refund straight away.
+      const claimed = expertOffers.beginRefund(o.offerId, 'expert_offline');
+      if (claimed) refundExpertOffer(claimed, 'expert_offline').catch(() => {});
+      return cb && cb({ ok: false, reason: `@${o.expert} went offline — your payment is being refunded.` });
+    }
+    io.to(lu.socketId).emit('expert-offer-received', {
+      offerId: o.offerId, from: inviter, room: o.room,
+      connectFee: o.connectFee, ratePerHour: o.ratePerHour, currency: o.currency,
+      maxDurationMin: o.maxDurationMin, cap: o.cap,
+    });
+    socket.emit('lobby-info', { text: `💎 Offer sent to @${o.expert} — connect ${o.connectFee} + ${o.ratePerHour}/hr ${o.currency}, max ${o.maxDurationMin} min (cap ${o.cap} ${o.currency} escrowed).` });
+    console.log(`[expert-offer] 💎 ${o.offerId}: @${inviter} → @${o.expert} #${o.room} delivered (cap ${o.cap} ${o.currency})`);
+    cb && cb({ ok: true });
+  });
+
+  // Step 3 — the expert answers the terms modal.
+  socket.on('expert-offer-respond', async ({ offerId, response }) => {
+    const expert = socket._username;
+    if (!expert) return;
+    const o = expertOffers.get(offerId);
+    if (!o || o.expert !== expert) return;
+
+    if (response === 'accept') {
+      const res = expertOffers.respond(offerId, expert, 'accept');
+      if (!res.ok) { socket.emit('lobby-info', { text: `⚠ 💎 offer: ${res.reason}` }); return; }
+      const r = rooms[o.room];
+      if (!r) {
+        // Room died while the popup was open — refund and tell both sides.
+        const claimed = expertOffers.beginRefund(offerId, 'room_gone');
+        if (claimed) refundExpertOffer(claimed, 'room_gone').catch(() => {});
+        socket.emit('lobby-info', { text: `⚠ #${o.room} no longer exists — the offer was cancelled and @${o.inviter} refunded.` });
+        return;
+      }
+      // The paidInvitees entry is the join-gate ticket (joinedVia:'paid').
+      r.paidInvitees.set(o.expert, {
+        offerId: o.offerId, inviter: o.inviter, connectFee: o.connectFee,
+        ratePerHour: o.ratePerHour, currency: o.currency, maxDurationMin: o.maxDurationMin,
+      });
+      socket.emit('expert-offer-accepted', { offerId: o.offerId, room: o.room });
+      const inv = lobbyUsers[o.inviter];
+      if (inv) io.to(inv.socketId).emit('lobby-info', { text: `✓ 💎 @${o.expert} accepted your offer — joining #${o.room}.` });
+      console.log(`[expert-offer] ✓ ${o.offerId} accepted by @${expert}`);
+    } else {
+      const res = expertOffers.respond(offerId, expert, 'decline');
+      if (!res.ok) return;
+      await refundExpertOffer(o, 'declined');
+      const inv = lobbyUsers[o.inviter];
+      if (inv) io.to(inv.socketId).emit('lobby-info', { text: `✗ 💎 @${o.expert} declined your offer to #${o.room}. Refund in flight.` });
+      console.log(`[expert-offer] ✗ ${o.offerId} declined by @${expert}`);
+    }
+  });
+
   socket.on('allowlist-remove', ({ room, username: targetUser }) => {
     const r = rooms[room];
     if (!r || r.creator !== socket._username) return;
@@ -5525,6 +5678,7 @@ io.on('connection', (socket) => {
       // Mirror room-ban cleanup — don't rely on the client calling leave-room.
       r.members = r.members.filter(m => m.socketId !== member.socketId);
       io.to(room).emit('user-left', member.socketId);
+      settleExpertOnExit(r, room, member, 'kicked');   // v0.17 — removed expert settles for elapsed time
       const cleared = member.homeServer ? `${member.username}@${member.homeServer}` : member.username;
       clearSpotlightIfMember(r, room, cleared);
       clearSpotlightIfMember(r, room, member.username);
@@ -5553,10 +5707,12 @@ io.on('connection', (socket) => {
       return canonical === target || m.username === target;
     });
     if (memberIdx >= 0) {
-      const targetSocketId = r.members[memberIdx].socketId;
+      const banned = r.members[memberIdx];
+      const targetSocketId = banned.socketId;
       io.to(targetSocketId).emit('kicked', { room, reason: `You have been banned from #${room}.` });
       r.members.splice(memberIdx, 1);
       io.to(room).emit('user-left', targetSocketId);
+      settleExpertOnExit(r, room, banned, 'kicked');   // v0.17 — banned expert settles for elapsed time
       clearSpotlightIfMember(r, room, target);
     }
     emitRoomInfoToMembers(r, room);
@@ -5584,12 +5740,14 @@ io.on('connection', (socket) => {
     if (!r || r.creator !== socket._username) return;
     for (const m of [...r.members]) {
       io.to(m.socketId).emit('kicked', { room, reason: `Room #${room} was ended by the admin (@${r.creator}).` });
+      settleExpertOnExit(r, room, m, 'room_ended');   // v0.17 — active expert settles for elapsed time
     }
     if (r._capTimer)  clearTimeout(r._capTimer);
     if (r._warnTimer) clearTimeout(r._warnTimer);
     r.members = [];
     delete rooms[room];
     chatDeleteRoom(room);
+    expertOffersOnRoomDeath(room, 'room_ended');      // v0.17 — refund pre-session offers
 
     // v0.16.17 — cancel any pending invites for this room. Without this, an
     // invitee who hadn't responded yet could accept a stale invite afterwards
@@ -5825,8 +5983,10 @@ io.on('connection', (socket) => {
     const room     = socket._room;
     const username = socket._username;
     if (!room || !rooms[room]) return;
+    const leaving = rooms[room].members.find(u => u.socketId === socket.id);
     rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
     socket.to(room).emit('user-left', socket.id);
+    settleExpertOnExit(rooms[room], room, leaving, 'left_room');   // v0.17 — paid expert leaving settles
     clearSpotlightIfMember(rooms[room], room, username);
     if (lobbyUsers[username]) delete lobbyUsers[username].inRoom;
     socket.leave(room);
@@ -5836,6 +5996,7 @@ io.on('connection', (socket) => {
       if (rooms[room]._warnTimer) clearTimeout(rooms[room]._warnTimer);
       delete rooms[room];
       chatDeleteRoom(room);
+      expertOffersOnRoomDeath(room, 'room_closed');                // v0.17 — refund pre-session offers
       console.log(`Room #${room} closed (last member left via leave-room)`);
     } else {
       console.log(`@${username} left #${room} via leave-room (${rooms[room].members.length} remaining)`);
@@ -6243,8 +6404,12 @@ io.on('connection', (socket) => {
     }
 
     if (room && rooms[room]) {
+      const dropped = rooms[room].members.find(u => u.socketId === socket.id);
       rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
       socket.to(room).emit('user-left', socket.id);
+      // v0.17 Part A: a paid expert's disconnect settles IMMEDIATELY for elapsed
+      // time (same as 1:1 calls today). The 30s reconnect grace is the A3 build.
+      settleExpertOnExit(rooms[room], room, dropped, 'disconnect');
       clearSpotlightIfMember(rooms[room], room, username);
 
       if (rooms[room].isCall) {
@@ -6264,6 +6429,7 @@ io.on('connection', (socket) => {
         if (rooms[room]._warnTimer) clearTimeout(rooms[room]._warnTimer);
         delete rooms[room];
         chatDeleteRoom(room); // Clean up stored messages — room is ephemeral
+        expertOffersOnRoomDeath(room, 'room_closed');   // v0.17 — refund pre-session offers
         console.log(`Room #${room} closed`);
       }
       broadcastRooms();
@@ -7828,6 +7994,114 @@ async function refundPaidInvite(inviteId, newStatus) {
     console.error(`[paid-invite] Refund error for ${inviteId}:`, err.message);
   }
 }
+
+// ── v0.17 Part A — expert-offer money movers ─────────────────────────────────
+
+// Full-cap refund to the inviter for an offer that never became a session
+// (decline / timeout / never-joined / room died). The offer must already be in
+// 'refunding' (the state machine is the single-winner gate). Mirrors
+// refundPaidInvite: box mode = pure-refund single-payment settlement (platformFee
+// 0), in-process = direct escrow send. The box's atomicClose on ref=offerId also
+// permanently blocks a later session-settle of the same offer, and vice versa.
+async function refundExpertOffer(offer, why) {
+  if (!offer || offer.status !== 'refunding') return;
+  const refundMemo = `v4call:offer-refund:${offer.offerId}`;
+  const text = `↩️ 💎 Offer to @${offer.expert} (#${offer.room}) — ${String(why).replace(/_/g, ' ')}. ` +
+               `Refunded ${offer.cap} ${offer.currency}.`;
+
+  if (escrowBoxMode) {
+    ledgerPayment(offer.offerId, 'offer_refund', ESCROW_ACCOUNT, offer.inviter, offer.cap, refundMemo, 'pending', null, offer.currency);
+    await escrowBoxMode.settlePayment({
+      ref: offer.offerId, txId: offer.txId, sender: offer.inviter, amount: offer.cap,
+      currency: offer.currency, memo: offer.memo,
+      payoutTo: offer.inviter, platformFee: 0, now: Date.now(),
+      meta: { kind: 'refund', refundType: 'offer_refund',
+        notify: { username: offer.inviter, event: 'lobby-info', payload: { text } } },
+    });
+    expertOffers.markRefunded(offer.offerId);
+    console.log(`[expert-offer] ↩ Refund of ${offer.cap} ${offer.currency} to @${offer.inviter} for ${offer.offerId} (${why}) queued via box`);
+    return;
+  }
+
+  try {
+    const r = await sendFromEscrow(offer.inviter, offer.cap, refundMemo, offer.currency, offer.offerId);
+    if (r && r.success) {
+      ledgerPayment(offer.offerId, 'offer_refund', ESCROW_ACCOUNT, offer.inviter, offer.cap, refundMemo, 'sent', r.txId || null, offer.currency);
+      expertOffers.markRefunded(offer.offerId);
+      const lu = lobbyUsers[offer.inviter];
+      if (lu) io.to(lu.socketId).emit('lobby-info', { text });
+      console.log(`[expert-offer] ↩ Refunded ${offer.cap} ${offer.currency} to @${offer.inviter} for ${offer.offerId} (${why})`);
+    } else {
+      ledgerPayment(offer.offerId, 'offer_refund', ESCROW_ACCOUNT, offer.inviter, offer.cap, refundMemo, 'failed', null, offer.currency);
+      expertOffers.markRefundFailed(offer.offerId);
+      console.error(`[expert-offer] ✗ Refund failed for ${offer.offerId}: ${r && r.reason}`);
+    }
+  } catch (err) {
+    expertOffers.markRefundFailed(offer.offerId);
+    console.error(`[expert-offer] Refund error for ${offer.offerId}:`, err.message);
+  }
+}
+
+// A paid expert is leaving the room (voluntary leave / kick / ban / room end /
+// disconnect — every exit settles the same way per the locked-in design). Claims
+// the settlement (single winner vs a racing duplicate trigger) and runs the SAME
+// settlement path as a 1:1 call: the offer's durable escrow row carries
+// callee=expert / connect_paid / rate_per_hour / platform_fee / start_ts, so
+// processCallEnd (box or in-process) pays connect+elapsed×rate (capped at the
+// funded deposit) to the expert, refunds the rest to the admin, takes the fee.
+function settleExpertOnExit(r, roomName, member, reason) {
+  try {
+    if (!r || !member || member.joinedVia !== 'paid' || member.homeServer) return;
+    const offer = expertOffers.findByExpert(member.username, roomName, ['active']);
+    if (!offer) return;
+    const claimed = expertOffers.beginSettle(offer.offerId, reason);
+    if (!claimed) return;   // a racing exit trigger already claimed it
+    r.paidInvitees.delete(member.username);
+    if (!activePayments[offer.offerId]) {
+      // Node restarted mid-session: the live-cache entry is gone (same limitation as
+      // 1:1 calls — "settlement state persistence" is a post-v0.17 backlog item).
+      // Funds stay safe in escrow; the operator settles/refunds manually.
+      console.error(`[expert-offer] ✗ ${offer.offerId}: no live payment cache (node restarted mid-session?) — NOT auto-settling. Funds remain in escrow; settle manually.`);
+      return;
+    }
+    console.log(`[expert-offer] 💎 session end for ${offer.offerId} (@${offer.expert} in #${roomName}, ${reason})`);
+    processCallEnd(offer.offerId, roomName, io, lobbyUsers, reason)
+      .then(() => expertOffers.markSettled(offer.offerId))
+      .catch(e => console.error(`[expert-offer] settlement failed for ${offer.offerId}: ${e.message}`));
+  } catch (e) {
+    console.error(`[expert-offer] settleExpertOnExit error: ${e.message}`);
+  }
+}
+
+// Room is being destroyed — refund any offer that never became a session.
+// (Active sessions are settled by the member-exit path before the room dies.)
+function expertOffersOnRoomDeath(roomName, reason) {
+  try {
+    for (const offer of expertOffers.cancelForRoom(roomName, reason)) {
+      refundExpertOffer(offer, reason).catch(e =>
+        console.error(`[expert-offer] room-death refund failed for ${offer.offerId}: ${e.message}`));
+      const lu = lobbyUsers[offer.expert];
+      if (lu) io.to(lu.socketId).emit('expert-offer-cancelled', { offerId: offer.offerId, room: roomName, reason });
+    }
+  } catch (e) {
+    console.error(`[expert-offer] expertOffersOnRoomDeath error: ${e.message}`);
+  }
+}
+
+// TTL sweep — unanswered offers refund after 15 min; accepted-but-never-joined
+// refunds after a further 5-min join window; unfunded offers just expire.
+setInterval(() => {
+  for (const { offer, action } of expertOffers.sweep()) {
+    if (action === 'refund') {
+      refundExpertOffer(offer, offer.endReason || 'timed_out').catch(e =>
+        console.error(`[expert-offer] sweep refund failed for ${offer.offerId}: ${e.message}`));
+      const lu = lobbyUsers[offer.expert];
+      if (lu) io.to(lu.socketId).emit('expert-offer-cancelled', { offerId: offer.offerId, room: offer.room, reason: 'timed_out' });
+    } else {
+      console.log(`[expert-offer] ${offer.offerId} expired unfunded — nothing to refund`);
+    }
+  }
+}, 60 * 1000).unref();
 
 function fedAttachSocket(ws, label) {
   // fedHandleMessage is async (hello awaits verifyPeer). We chain handlers in
