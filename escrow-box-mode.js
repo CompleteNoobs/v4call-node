@@ -72,14 +72,25 @@ function createEscrowBoxMode({
     }
     const row = queue.get(ref);
     if (!row) { L.warn(`receipt for unknown/!queued ref ${ref} — ignored`); return; }
-    if (queue.markSettled(ref, receipt)) {
+    // A status:'failed' receipt is the box's TERMINAL rejection of this report (e.g. the payment
+    // landed in an account the box doesn't hold). Park the row as 'failed' — ends the drainer's
+    // retry-until-received loop — and still fire the finalize handler exactly once so server.js
+    // marks the legacy ledger rows failed (its dispatcher already handles status:'failed').
+    const marked = receipt.status === 'failed'
+      ? queue.markFailed(ref, receipt)
+      : queue.markSettled(ref, receipt);
+    if (marked) {
       let facts = {}, meta = null;
       try { facts = JSON.parse(row.facts_json); } catch {}
       try { meta = row.meta_json ? JSON.parse(row.meta_json) : null; } catch {}
       try { await onSettledHandler(ref, { facts, receipt, meta }); }
       catch (e) { L.error(`finalize ${ref} threw: ${e.message}`); }
-      L.info(`settled ${ref} via box: settlement=${receipt.settlement} refund=${receipt.refund} status=${receipt.status}`);
-    } // else: already settled (a duplicate receipt) — no-op
+      if (receipt.status === 'failed') {
+        L.error(`${ref} REJECTED by box (terminal): ${receipt.reason || 'no reason given'} — parked as failed; nothing was disbursed. Operator action needed if a real payment is stranded.`);
+      } else {
+        L.info(`settled ${ref} via box: settlement=${receipt.settlement} refund=${receipt.refund} status=${receipt.status}`);
+      }
+    } // else: already settled/failed (a duplicate receipt) — no-op
   }
 
   // Sign (fresh, under the stable nonce) and publish one pending row. Stays pending on any failure

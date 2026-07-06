@@ -177,3 +177,37 @@ test('4 — a receipt NOT signed by the pinned box key is rejected (no finalize)
     assert.equal(h.settledCalls.length, 1, 'genuine receipt finalizes');
   } finally { h.cleanup(); }
 });
+
+test('5 — a status:failed receipt (terminal box rejection) parks the row as failed and stops the drainer', async () => {
+  // The box rejects an authorized-but-structurally-bad report (e.g. payment to an account it
+  // doesn't hold) with a signed status:'failed' receipt. The node must: park the queue row as
+  // 'failed' (drainer stops republishing), fire the finalize handler EXACTLY once (so server.js
+  // marks its legacy ledger rows failed), and never disburse-notify.
+  const h = harness({ onReport: (signed) => escrowCore.buildSettlementReceipt({
+    ref: signed.ref, settlement: 0, refund: 0, dust: 0, currency: 'TEST',
+    disburseTx: null, status: 'failed', reason: 'structural verify failure: transfer to wrong account',
+    createdAt: NOW }) });
+  try {
+    const payRows = recordCombinedCall(h, 'cF');
+    await h.boxMode.settleCall({ callId: 'cF', payRows, endReason: 'hangup', now: NOW });
+
+    // finalize fired exactly once, with the failed receipt (server.js dispatcher maps it to
+    // ledger rows 'failed' + no notify)
+    assert.equal(h.settledCalls.length, 1, 'finalize fired once');
+    assert.equal(h.settledCalls[0].receipt.status, 'failed');
+    assert.match(h.settledCalls[0].receipt.reason, /wrong account/);
+
+    // row is parked as failed — no longer pending, so the drainer republishes nothing
+    const row = h.queue.get('cF');
+    assert.equal(row.status, 'failed');
+    const republished = await h.boxMode.drainOnce();
+    assert.equal(republished, 0, 'drainer has nothing left to republish');
+    assert.equal(h.published.length, 1, 'no further publishes after the terminal receipt');
+
+    // a duplicate failed receipt is a no-op (exactly-once)
+    await h.deliverReceipt(escrowCore.signReport(escrowCore.buildSettlementReceipt({
+      ref: 'cF', settlement: 0, refund: 0, dust: 0, currency: 'TEST',
+      disburseTx: null, status: 'failed', reason: 'again', createdAt: NOW }), h.boxSk));
+    assert.equal(h.settledCalls.length, 1, 'duplicate failed receipt does not re-finalize');
+  } finally { h.cleanup(); }
+});

@@ -28,7 +28,7 @@ function createSettlementQueue({ db, log = () => {} }) {
       facts_json   TEXT    NOT NULL,             -- the call-end report FACTS (unsigned; signed at publish time)
       nonce        TEXT    NOT NULL,             -- stable one-shot ('ref:settle') so the box dedups republishes
       meta_json    TEXT,                         -- node-side finalize context (e.g. { callerServer, federated })
-      status       TEXT    NOT NULL DEFAULT 'pending',   -- 'pending' | 'settled'
+      status       TEXT    NOT NULL DEFAULT 'pending',   -- 'pending' | 'settled' | 'failed'
       created_at   INTEGER NOT NULL,             -- call-end epoch ms (also the report createdAt)
       last_attempt INTEGER,
       attempts     INTEGER NOT NULL DEFAULT 0,
@@ -41,6 +41,7 @@ function createSettlementQueue({ db, log = () => {} }) {
   const _get         = db.prepare(`SELECT * FROM pending_reports WHERE ref = ?`);
   const _markAttempt = db.prepare(`UPDATE pending_reports SET last_attempt = ?, attempts = attempts + 1 WHERE ref = ?`);
   const _markSettled = db.prepare(`UPDATE pending_reports SET status = 'settled', receipt_json = ? WHERE ref = ? AND status = 'pending'`);
+  const _markFailed  = db.prepare(`UPDATE pending_reports SET status = 'failed',  receipt_json = ? WHERE ref = ? AND status = 'pending'`);
 
   return {
     // Durably enqueue a call-end report. Returns true iff THIS caller won the single-winner race
@@ -56,6 +57,13 @@ function createSettlementQueue({ db, log = () => {} }) {
     // can fire finalization EXACTLY once (inline receipt OR drainer redelivery, never twice).
     markSettled(ref, receipt) {
       const info = _markSettled.run(JSON.stringify(receipt), ref);
+      return info.changes > 0;
+    },
+    // Transition pending→failed on a box-signed status:'failed' receipt (a TERMINAL rejection —
+    // e.g. the payment went to an account the box doesn't hold). Stops the drainer republishing;
+    // the row is kept for audit. Same exactly-once semantics as markSettled.
+    markFailed(ref, receipt) {
+      const info = _markFailed.run(JSON.stringify(receipt), ref);
       return info.changes > 0;
     },
   };
