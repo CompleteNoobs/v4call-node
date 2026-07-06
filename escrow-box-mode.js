@@ -123,6 +123,31 @@ function createEscrowBoxMode({
     return true;
   }
 
+  /**
+   * Settle a single (non-call) payment via the box — paid DMs, attachments, invites, and
+   * ring-fee refunds. Same durable enqueue + publish + async-finalize-on-receipt pattern as
+   * settleCall, but for the report/split shape built by buildSinglePaymentReportFacts (no
+   * duration/cap concept — the whole verified amount splits into net + fee, or, platformFee 0,
+   * is a pure refund back to payoutTo).
+   *
+   * @param ref            unique settlement ref (msgId / inviteId / callId — must not collide
+   *                       with any other settleCall/settlePayment ref on this node)
+   * @param txId/sender/amount/currency/memo   the ONE on-chain deposit the box will re-verify
+   * @param payoutTo       recipient of the net payout (the original sender, for a refund)
+   * @param platformFee    0..1 fraction to the box's configured feeAccount; 0 = pure refund
+   * @param now            settlement-clock epoch ms
+   * @param meta           finalize context for onSettled (server.js dispatches on meta.kind)
+   * @returns true iff a NEW report was enqueued (false on a duplicate)
+   */
+  async function settlePayment({ ref, txId, sender, amount, currency, memo, payoutTo, platformFee = 0, now, meta = null }) {
+    const facts = escrowAdapter.buildSinglePaymentReportFacts({ txId, sender, amount, currency, memo, payoutTo, platformFee });
+    const nonce = escrowReporter.settleNonce(ref);
+    const won = queue.enqueue(ref, facts, nonce, now, meta);
+    if (!won) { L.info(`${ref} already queued (duplicate settle) — ignored`); return false; }
+    await publishRow(queue.get(ref));
+    return true;
+  }
+
   // Boot: bring up the transport (if the key is ready) and drain any reports left pending from a
   // prior run, then retry on an interval. Never throws (a transport problem must not crash v4call).
   async function start() {
@@ -132,7 +157,7 @@ function createEscrowBoxMode({
     if (t && typeof t.unref === 'function') t.unref();
   }
 
-  return { start, settleCall, onSettled, drainOnce, _handleReceipt: handleReceipt };
+  return { start, settleCall, settlePayment, onSettled, drainOnce, _handleReceipt: handleReceipt };
 }
 
 module.exports = { createEscrowBoxMode };

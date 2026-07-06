@@ -402,7 +402,32 @@ if (ESCROW_MODE === 'box') {
   // updates the legacy audit ledger, and (federated) sends the caller's receipt back to their
   // server. Runs EXACTLY once per call (inline receipt OR drainer redelivery). The numbers come
   // from the box's signed receipt (the authority); display context comes from the reported facts.
-  escrowBoxMode.onSettled(async (callId, { facts, receipt, meta }) => {
+  escrowBoxMode.onSettled(async (ref, { facts, receipt, meta }) => {
+    // ── Single-payment settlements (paid DMs/attachments/invites/ring-fee refunds) — data-driven
+    // finalize: meta carries which durable-ledger rows to update and (on success) what to emit.
+    // Distinct from the call-end path below (meta.kind is unset for calls — back-compat with
+    // anything already queued before this dispatcher existed).
+    if (meta && (meta.kind === 'payout_fee' || meta.kind === 'refund')) {
+      const ok      = receipt.status === 'settled';
+      const rowStat = ok ? 'sent' : (receipt.status === 'pending' ? 'pending' : 'failed');
+      try {
+        if (meta.kind === 'payout_fee') {
+          if (meta.payoutType) ledgerPaymentUpdate(ref, meta.payoutType, rowStat, receipt.disburse_tx || null);
+          if (meta.feeType)    ledgerPaymentUpdate(ref, meta.feeType,    rowStat, null);
+        } else {
+          if (meta.refundType) ledgerPaymentUpdate(ref, meta.refundType, rowStat, receipt.disburse_tx || null);
+        }
+      } catch (e) { console.warn(`[escrow-box] ledgerPaymentUpdate ${ref} (${meta.kind}) failed: ${e.message}`); }
+      if (!ok) console.error(`[escrow-box] ${meta.kind} ${ref} settled with status=${receipt.status}`);
+      if (meta.notify) {
+        const sid = lobbyUsers[meta.notify.username]?.socketId;
+        if (sid && (ok || meta.notify.always)) io.to(sid).emit(meta.notify.event, meta.notify.payload);
+      }
+      return;
+    }
+
+    // ── Call-end settlements (the original box-mode path) ──────────────────────────────────
+    const callId = ref;
     const cf = (facts && facts.callFacts) || {};
     const pays = (facts && Array.isArray(facts.payments)) ? facts.payments : [];
     const caller = (pays[0] && pays[0].sender) || null;
@@ -2361,18 +2386,38 @@ async function disbursePaidInvite(inviteId) {
 
   const platformFee  = PLATFORM_FEE;
   const prec  = await getCurrencyPrecision(e.currency);
-  const floor = Math.pow(10, -prec);
   const platformCut  = parseFloat((e.paid * platformFee).toFixed(prec));
   const inviteeNet   = parseFloat((e.paid - platformCut).toFixed(prec));
 
+  const lu = lobbyUsers[e.inviter];
+  const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
+  if (lu) io.to(lu.socketId).emit('lobby-info', {
+    text: `✓ ${inviteeLabel} accepted your invite to #${e.room}. Net ${inviteeNet.toFixed(prec)} ${e.currency} sent.`
+  });
+  console.log(`[paid-invite] ${inviteId} accepted — net ${inviteeNet} ${e.currency} → @${e.invitee}, fee ${platformCut} → @${SERVER_HIVE_ACCOUNT}`);
+
+  if (escrowBoxMode) {
+    ledgerPayment(inviteId, 'invite_payout', ESCROW_ACCOUNT, e.invitee, inviteeNet, `v4call:invite-payout:${inviteId}`, 'pending', null, e.currency);
+    ledgerPayment(inviteId, 'invite_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, `v4call:invite-fee:${inviteId}`, 'pending', null, e.currency);
+    await escrowBoxMode.settlePayment({
+      ref: inviteId, txId: e.txId, sender: e.inviter, amount: e.paid, currency: e.currency, memo: e.memo,
+      payoutTo: e.invitee, platformFee, now: Date.now(),
+      meta: { kind: 'payout_fee', payoutType: 'invite_payout', feeType: 'invite_fee',
+        notify: { username: e.invitee, event: 'lobby-info',
+          payload: { text: `💰 @${e.inviter} paid you ${inviteeNet.toFixed(prec)} ${e.currency} for the invite to #${e.room}.` } } },
+    });
+    return;
+  }
+
+  const floor = Math.pow(10, -prec);
   if (inviteeNet >= floor) {
     const payoutMemo = `v4call:invite-payout:${inviteId}`;
     ledgerPayment(inviteId, 'invite_payout', ESCROW_ACCOUNT, e.invitee, inviteeNet, payoutMemo, 'pending', null, e.currency);
     sendFromEscrow(e.invitee, inviteeNet, payoutMemo, e.currency, inviteId).then(r => {
       if (r && r.success) {
         ledgerPaymentUpdate(inviteId, 'invite_payout', 'sent', r.txId);
-        const lu = lobbyUsers[e.invitee];
-        if (lu) io.to(lu.socketId).emit('lobby-info', {
+        const lu2 = lobbyUsers[e.invitee];
+        if (lu2) io.to(lu2.socketId).emit('lobby-info', {
           text: `💰 @${e.inviter} paid you ${inviteeNet.toFixed(prec)} ${e.currency} for the invite to #${e.room}.`
         });
       } else {
@@ -2389,13 +2434,6 @@ async function disbursePaidInvite(inviteId) {
       if (r && r.success) ledgerPaymentUpdate(inviteId, 'invite_fee', 'sent', r.txId);
     });
   }
-
-  const lu = lobbyUsers[e.inviter];
-  const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
-  if (lu) io.to(lu.socketId).emit('lobby-info', {
-    text: `✓ ${inviteeLabel} accepted your invite to #${e.room}. Net ${inviteeNet.toFixed(prec)} ${e.currency} sent.`
-  });
-  console.log(`[paid-invite] ${inviteId} accepted — net ${inviteeNet} ${e.currency} → @${e.invitee}, fee ${platformCut} → @${SERVER_HIVE_ACCOUNT}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3656,6 +3694,21 @@ io.on('connection', (socket) => {
     broadcastLobby();
     broadcastRooms();
 
+    // Self escrow-mismatch check — warn the user at login if THEIR OWN rates
+    // post/user-announce declares an escrow this server doesn't control. Paid
+    // contacts TO them are money-safe (the escrow-mismatch guards elsewhere
+    // treat them as free rather than stranding funds) but the fee silently
+    // never applies until they fix this — tell them why, right away.
+    fetchRates(username).then(myRates => {
+      if (myRates?.escrow && myRates.escrow !== ESCROW_ACCOUNT) {
+        socket.emit('lobby-info', {
+          text: `⚠ You've signed into a node that doesn't use your selected escrow account (@${myRates.escrow}). ` +
+            `Your fees will NOT be collected until you update your user-announce to use @${ESCROW_ACCOUNT}, ` +
+            `or sign in with a node that uses your @${myRates.escrow} escrow account.`
+        });
+      }
+    }).catch(e => console.warn(`[escrow-check] self-check failed for @${username}: ${e.message}`));
+
     // Announce new user to federated peers.
     if (FEDERATION_ENABLED) fedAnnounceUserOnline(username);
 
@@ -3865,7 +3918,22 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (textRate >= dmFloor) {
+    // For a LOCAL recipient, their rates-post escrow must be the one THIS server
+    // controls — otherwise the payment would verify fine (it really lands
+    // wherever they declared) but disbursement silently strands because we
+    // don't hold that account's key. Rather than block the message, treat it
+    // as free (money-safe — no payment is even attempted) and tell the sender
+    // why, so they aren't left wondering. Mirrors what calls already do.
+    const localEscrowMismatch = !!(recipient && textRate >= dmFloor && calleeEscrow !== ESCROW_ACCOUNT);
+    if (localEscrowMismatch) {
+      socket.emit('lobby-info', { text:
+        `⚠ @${to}'s rates post/user-announce declares escrow @${calleeEscrow}, but this ` +
+        `server's active escrow account is @${ESCROW_ACCOUNT} — sending free. @${to} won't ` +
+        `receive this fee until they update their user-announce to declare @${ESCROW_ACCOUNT}.`
+      });
+    }
+
+    if (textRate >= dmFloor && !localEscrowMismatch) {
       // ── Payment required ─────────────────────────────────────────────────
       if (!textPaid || !textMemo || !msgId) {
         socket.emit('lobby-dm-payment-required', {
@@ -3902,27 +3970,38 @@ io.on('connection', (socket) => {
         const platformCut  = parseFloat((textPaid * platformFee).toFixed(dmPrec));
         const recipientNet = parseFloat((textPaid - platformCut).toFixed(dmPrec));
 
-        if (recipientNet >= dmFloor) {
-          const payoutMemo = `v4call:text-payout:${msgId}`;
-          ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
-          sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
-            if (r.success) {
-              ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
-              io.to(recipient.socketId).emit('text-payment-received', {
-                from, amount: recipientNet, currency: cur, msgId
-              });
-            } else {
-              console.error(`[text] Payout failed to @${to}: ${r.reason}`);
-            }
+        if (escrowBoxMode) {
+          ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, `v4call:text-payout:${msgId}`, 'pending');
+          ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, `v4call:text-fee:${msgId}`, 'pending');
+          await escrowBoxMode.settlePayment({
+            ref: msgId, txId: textTxId, sender: from, amount: textPaid, currency: cur, memo: textMemo,
+            payoutTo: to, platformFee, now: Date.now(),
+            meta: { kind: 'payout_fee', payoutType: 'text_payout', feeType: 'text_fee',
+              notify: { username: to, event: 'text-payment-received', payload: { from, amount: recipientNet, currency: cur, msgId } } },
           });
-        }
+        } else {
+          if (recipientNet >= dmFloor) {
+            const payoutMemo = `v4call:text-payout:${msgId}`;
+            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
+            sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+              if (r.success) {
+                ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+                io.to(recipient.socketId).emit('text-payment-received', {
+                  from, amount: recipientNet, currency: cur, msgId
+                });
+              } else {
+                console.error(`[text] Payout failed to @${to}: ${r.reason}`);
+              }
+            });
+          }
 
-        if (platformCut >= dmFloor) {
-          const feeMemo = `v4call:text-fee:${msgId}`;
-          ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
-          sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
-            if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
-          });
+          if (platformCut >= dmFloor) {
+            const feeMemo = `v4call:text-fee:${msgId}`;
+            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
+            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+              if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+            });
+          }
         }
 
         console.log(`[text] @${from} → @${to}: paid ${textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
@@ -4011,7 +4090,17 @@ io.on('connection', (socket) => {
       return cb({ found: true, free: true });
     }
 
-    cb({ found: true, free: false, rates: applicable, escrow: rates.escrow || ESCROW_ACCOUNT });
+    // Local recipient's rates-post escrow must be the one THIS server controls —
+    // otherwise the ring/deposit payment would verify fine (it really lands
+    // wherever they declared) but disbursement silently strands. Mirrors the
+    // DM/invite guards (v0.16.10 / this session).
+    const callRatesEscrow = rates.escrow || ESCROW_ACCOUNT;
+    if (callRatesEscrow !== ESCROW_ACCOUNT) {
+      return cb({ found: true, escrowMismatch: true,
+        message: `@${callee}'s rates post/user-announce declares escrow @${callRatesEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce to declare @${ESCROW_ACCOUNT} before paid calls can be accepted.` });
+    }
+
+    cb({ found: true, free: false, rates: applicable, escrow: callRatesEscrow });
   });
 
   // ── ALL RATE OPTIONS (for payment picker) ──────────────────────────────────
@@ -4033,8 +4122,16 @@ io.on('connection', (socket) => {
     if (result.options.length === 0) {
       return cb({ found: true, free: true, belowFloor: result.belowFloor || false });
     }
+
+    // See get-rates above — same local escrow-mismatch guard.
+    const callRatesEscrow = rates.escrow || ESCROW_ACCOUNT;
+    if (callRatesEscrow !== ESCROW_ACCOUNT) {
+      return cb({ found: true, escrowMismatch: true,
+        message: `@${callee}'s rates post/user-announce declares escrow @${callRatesEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce to declare @${ESCROW_ACCOUNT} before paid calls can be accepted.` });
+    }
+
     result.options[0]._recommended = true;
-    cb({ found: true, free: false, options: result.options, escrow: rates.escrow || ESCROW_ACCOUNT, belowFloor: result.belowFloor || false });
+    cb({ found: true, free: false, options: result.options, escrow: callRatesEscrow, belowFloor: result.belowFloor || false });
   });
 
   // ── PAYMENT VERIFICATION ───────────────────────────────────────────────────
@@ -4046,6 +4143,15 @@ io.on('connection', (socket) => {
     // Verify against the actual escrow the caller paid — for federated callees
     // this is the peer's escrow account, not our local one.
     const targetEscrow = escrow || ESCROW_ACCOUNT;
+
+    // For a LOCAL callee, the escrow claimed MUST be the one this server controls
+    // — otherwise the payment verifies fine (it really lands wherever claimed)
+    // but disbursement silently strands. Mirrors the DM/invite guards. Federated
+    // callees legitimately use the peer's own escrow (checked earlier, at
+    // call-user time, against the peer's announced account).
+    if (lobbyUsers[callee] && targetEscrow !== ESCROW_ACCOUNT) {
+      return cb({ verified: false, reason: `@${callee}'s rates post/user-announce declares escrow @${targetEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce before paid calls can be accepted.` });
+    }
 
     // Lock the applicable rate/fee BEFORE recording so they ride on the durable
     // escrow row (the home for what activePayments holds today — handover §5).
@@ -4114,6 +4220,11 @@ io.on('connection', (socket) => {
     const cur = currency || 'HBD';
     const targetEscrow = escrow || ESCROW_ACCOUNT;
 
+    // Local-callee escrow-mismatch guard — see verify-ring-payment above.
+    if (lobbyUsers[callee] && targetEscrow !== ESCROW_ACCOUNT) {
+      return cb && cb({ verified: false, reason: `@${callee}'s rates post/user-announce declares escrow @${targetEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce before paid calls can be accepted.` });
+    }
+
     console.log(`[payment] Verifying deposit: @${caller} → @${targetEscrow} ${totalAmount} ${cur} (memo: ${memo}, tx: ${txId})`);
     // This is the SINGLE durable row for the whole call payment (ring+connect+deposit
     // are one on-chain transfer). Verify the FULL transfer (= totalAmount), but store
@@ -4173,6 +4284,12 @@ io.on('connection', (socket) => {
     if (!caller) return cb && cb({ verified: false });
     const cur = currency || 'HBD';
     const targetEscrow = escrow || activePayments[callId]?.escrow || ESCROW_ACCOUNT;
+    const topupCallee = activePayments[callId]?.callee;
+
+    // Local-callee escrow-mismatch guard — see verify-ring-payment above.
+    if (topupCallee && lobbyUsers[topupCallee] && targetEscrow !== ESCROW_ACCOUNT) {
+      return cb && cb({ verified: false, reason: `@${topupCallee}'s rates post/user-announce declares escrow @${targetEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${topupCallee} needs to update their user-announce before paid calls can be accepted.` });
+    }
 
     // Each top-up is its own on-chain transfer → its own durable row (same ref=callId).
     const res = await verifyAndRecordPayment({
@@ -4245,7 +4362,9 @@ io.on('connection', (socket) => {
         SELECT
           c.call_id, c.caller, c.callee, c.status,
           p.amount   AS ring_paid,
-          p.currency AS ring_currency
+          p.currency AS ring_currency,
+          p.tx_id    AS ring_tx_id,
+          p.memo     AS ring_memo
         FROM calls c
         JOIN payments p
           ON p.call_id = c.call_id
@@ -4272,8 +4391,21 @@ io.on('connection', (socket) => {
 
     const refundMemo = `v4call:ring-refund:${callId}:user-action`;
     const cur        = row.ring_currency || 'HBD';
-    ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, row.caller, row.ring_paid, refundMemo, 'pending', null, cur);
 
+    if (escrowBoxMode) {
+      ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, row.caller, row.ring_paid, refundMemo, 'pending', null, cur);
+      await escrowBoxMode.settlePayment({
+        ref: callId, txId: row.ring_tx_id, sender: row.caller, amount: row.ring_paid, currency: cur, memo: row.ring_memo,
+        payoutTo: row.caller, platformFee: 0, now: Date.now(),
+        meta: { kind: 'refund', refundType: 'ring_refund',
+          notify: { username: row.caller, event: 'ring-fee-refunded',
+            payload: { callId, by: callee, amount: row.ring_paid, currency: cur } } },
+      });
+      console.log(`[refund-ring-fee] @${callee} refund of ${row.ring_paid} ${cur} to @${row.caller} (${callId}) queued via box`);
+      return cb && cb({ success: true, amount: row.ring_paid, currency: cur, queued: true });
+    }
+
+    ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, row.caller, row.ring_paid, refundMemo, 'pending', null, cur);
     try {
       const r = await sendFromEscrow(row.caller, row.ring_paid, refundMemo, cur, callId);
       if (r.success) {
@@ -4378,14 +4510,25 @@ io.on('connection', (socket) => {
             `Funds paid cannot be disbursed. Contact @${callee} to update their rates.`;
           if (callId) {
             const refundMemo = `v4call:refund:${callId}:escrow_mismatch`;
-            ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
-            sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(ref => {
-              socket.emit('call-failed', {
-                reason: msg + (ref.success ? ` Ring fee refunded.` : ` Refund pending — contact support.`),
-                refunded: ref.success
-              });
-              if (ref.success) ledgerPaymentUpdate(callId, 'refund', 'sent', ref.txId);
-            }).catch(e => console.error('[call-user] escrow-mismatch refund failed:', e.message));
+            if (escrowBoxMode) {
+              ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+              const ap = activePayments[callId] || {};
+              escrowBoxMode.settlePayment({
+                ref: callId, txId: ap.ringTxId, sender: caller, amount: ringFeePaid, currency: ringCurrency, memo: ap.ringMemo,
+                payoutTo: caller, platformFee: 0, now: Date.now(),
+                meta: { kind: 'refund', refundType: 'refund' },
+              }).catch(e => console.error('[call-user] escrow-mismatch refund enqueue failed:', e.message));
+              socket.emit('call-failed', { reason: msg + ` Ring fee refund queued.`, refunded: true });
+            } else {
+              ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+              sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(ref => {
+                socket.emit('call-failed', {
+                  reason: msg + (ref.success ? ` Ring fee refunded.` : ` Refund pending — contact support.`),
+                  refunded: ref.success
+                });
+                if (ref.success) ledgerPaymentUpdate(callId, 'refund', 'sent', ref.txId);
+              }).catch(e => console.error('[call-user] escrow-mismatch refund failed:', e.message));
+            }
           } else {
             socket.emit('call-failed', { reason: msg });
           }
@@ -4416,14 +4559,28 @@ io.on('connection', (socket) => {
         // Callee unreachable between rate check and ring — refund ring fee
         const ringCurrency = activePayments[callId]?.currency || 'HBD';
         const refundMemo = `v4call:refund:${callId}:unreachable`;
-        ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
-        sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(r => {
-          const msg = r.success
-            ? `${offlineReason} Ring fee of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} refunded.`
-            : `${offlineReason} Refund of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} pending — contact support.`;
-          socket.emit('call-failed', { reason: msg, refunded: r.success });
-          if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
-        });
+        if (escrowBoxMode) {
+          ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+          const ap = activePayments[callId] || {};
+          escrowBoxMode.settlePayment({
+            ref: callId, txId: ap.ringTxId, sender: caller, amount: ringFeePaid, currency: ringCurrency, memo: ap.ringMemo,
+            payoutTo: caller, platformFee: 0, now: Date.now(),
+            meta: { kind: 'refund', refundType: 'refund' },
+          }).catch(e => console.error('[call-user] unreachable refund enqueue failed:', e.message));
+          socket.emit('call-failed', {
+            reason: `${offlineReason} Ring fee of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} refund queued.`,
+            refunded: true
+          });
+        } else {
+          ledgerPayment(callId, 'refund', ESCROW_ACCOUNT, caller, ringFeePaid, refundMemo, 'pending', null, ringCurrency);
+          sendFromEscrow(caller, ringFeePaid, refundMemo, ringCurrency, callId).then(r => {
+            const msg = r.success
+              ? `${offlineReason} Ring fee of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} refunded.`
+              : `${offlineReason} Refund of ${fmtAmt(ringFeePaid, ringCurrency)} ${ringCurrency} pending — contact support.`;
+            socket.emit('call-failed', { reason: msg, refunded: r.success });
+            if (r.success) ledgerPaymentUpdate(callId, 'refund', 'sent', r.txId);
+          });
+        }
       } else {
         socket.emit('call-failed', { reason: offlineReason });
       }
@@ -5132,6 +5289,7 @@ io.on('connection', (socket) => {
         currency:   fedCur,
         paid:       payment.paid,
         memo:       payment.memo,
+        txId:       payment.txId,
         status:     'pending',
         created_at: Date.now(),
         type:       'allowlist',
@@ -5283,6 +5441,7 @@ io.on('connection', (socket) => {
       currency:   cur,
       paid:       payment.paid,
       memo:       payment.memo,
+      txId:       payment.txId,
       status:     'pending',
       created_at: Date.now(),
       type:       'allowlist'
@@ -5889,7 +6048,21 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (textRate >= dmFloor) {
+      // For a LOCAL recipient, their rates-post escrow must be the one THIS server
+      // controls — otherwise the payment would verify fine (it really lands
+      // wherever they declared) but disbursement silently strands. Rather than
+      // block the attachment, treat it as free (money-safe — no payment is even
+      // attempted) and tell the sender why. Mirrors lobby-dm and calls.
+      const localEscrowMismatch = !!(recipient && textRate >= dmFloor && calleeEscrow !== ESCROW_ACCOUNT);
+      if (localEscrowMismatch) {
+        socket.emit('lobby-info', { text:
+          `⚠ @${to}'s rates post/user-announce declares escrow @${calleeEscrow}, but this ` +
+          `server's active escrow account is @${ESCROW_ACCOUNT} — sending free. @${to} won't ` +
+          `receive this fee until they update their user-announce to declare @${ESCROW_ACCOUNT}.`
+        });
+      }
+
+      if (textRate >= dmFloor && !localEscrowMismatch) {
         // Payment required
         if (!env.textPaid || !env.textMemo || !env.msgId) {
           socket.emit('dm-attachment-payment-required', {
@@ -5927,27 +6100,38 @@ io.on('connection', (socket) => {
           const platformCut  = parseFloat((env.textPaid * platformFee).toFixed(dmPrec));
           const recipientNet = parseFloat((env.textPaid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= dmFloor) {
-            const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
-            ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
-            sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(env.msgId, 'text_payout', 'sent', r.txId);
-                io.to(recipient.socketId).emit('text-payment-received', {
-                  from, amount: recipientNet, currency: cur, msgId: env.msgId
-                });
-              } else {
-                console.error(`[dm-attachment] Payout failed to @${to}: ${r.reason}`);
-              }
+          if (escrowBoxMode) {
+            ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, `v4call:dm-att-payout:${env.msgId}`, 'pending', null, cur);
+            ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, `v4call:dm-att-fee:${env.msgId}`, 'pending', null, cur);
+            await escrowBoxMode.settlePayment({
+              ref: env.msgId, txId: env.textTxId, sender: from, amount: env.textPaid, currency: cur, memo: env.textMemo,
+              payoutTo: to, platformFee, now: Date.now(),
+              meta: { kind: 'payout_fee', payoutType: 'text_payout', feeType: 'text_fee',
+                notify: { username: to, event: 'text-payment-received', payload: { from, amount: recipientNet, currency: cur, msgId: env.msgId } } },
             });
-          }
+          } else {
+            if (recipientNet >= dmFloor) {
+              const payoutMemo = `v4call:dm-att-payout:${env.msgId}`;
+              ledgerPayment(env.msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
+              sendFromEscrow(to, recipientNet, payoutMemo, cur, env.msgId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(env.msgId, 'text_payout', 'sent', r.txId);
+                  io.to(recipient.socketId).emit('text-payment-received', {
+                    from, amount: recipientNet, currency: cur, msgId: env.msgId
+                  });
+                } else {
+                  console.error(`[dm-attachment] Payout failed to @${to}: ${r.reason}`);
+                }
+              });
+            }
 
-          if (platformCut >= dmFloor) {
-            const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
-            ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
-            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
-              if (r.success) ledgerPaymentUpdate(env.msgId, 'text_fee', 'sent', r.txId);
-            });
+            if (platformCut >= dmFloor) {
+              const feeMemo = `v4call:dm-att-fee:${env.msgId}`;
+              ledgerPayment(env.msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
+              sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, env.msgId).then(r => {
+                if (r.success) ledgerPaymentUpdate(env.msgId, 'text_fee', 'sent', r.txId);
+              });
+            }
           }
 
           console.log(`[dm-attachment] @${from} → @${to}: paid ${env.textPaid} ${cur} | net: ${recipientNet} | fee: ${platformCut}`);
@@ -6773,15 +6957,23 @@ async function fedHandleMessage(ws, raw) {
             console.warn(`[fed-text] ✗ Recipient-side rate check failed: @${from} → @${to}: ${rejectReason}`);
             const refundMemo = `v4call:text-refund:${msgId}`;
             ledgerPayment(msgId, 'text_refund', ESCROW_ACCOUNT, from, paid, refundMemo, 'pending');
-            sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
-                console.log(`[fed-text] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
-              } else {
-                ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
-                console.error(`[fed-text] Refund to @${from} failed: ${r.reason}`);
-              }
-            });
+            if (escrowBoxMode) {
+              escrowBoxMode.settlePayment({
+                ref: msgId, txId: textTxId, sender: from, amount: paid, currency: cur, memo: textMemo,
+                payoutTo: from, platformFee: 0, now: Date.now(),
+                meta: { kind: 'refund', refundType: 'text_refund' },
+              }).catch(e => console.error(`[fed-text] Refund enqueue to @${from} failed: ${e.message}`));
+            } else {
+              sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
+                  console.log(`[fed-text] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
+                } else {
+                  ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
+                  console.error(`[fed-text] Refund to @${from} failed: ${r.reason}`);
+                }
+              });
+            }
             fedSend(ws, { type: 'dm-failed', from, to, msgId, reason: rejectReason });
             return;
           }
@@ -6792,26 +6984,37 @@ async function fedHandleMessage(ws, raw) {
           const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
           const recipientNet = parseFloat((paid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= dmFloor) {
-            const payoutMemo = `v4call:text-payout:${msgId}`;
-            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
-            sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
-                if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
-                  from, amount: recipientNet, currency: cur, msgId
-                });
-              } else {
-                console.error(`[fed-text] Payout to @${to} failed: ${r.reason}`);
-              }
-            });
-          }
-          if (platformCut >= dmFloor) {
-            const feeMemo = `v4call:text-fee:${msgId}`;
-            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
-            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
-              if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
-            });
+          if (escrowBoxMode) {
+            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, `v4call:text-payout:${msgId}`, 'pending');
+            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, `v4call:text-fee:${msgId}`, 'pending');
+            escrowBoxMode.settlePayment({
+              ref: msgId, txId: textTxId, sender: from, amount: paid, currency: cur, memo: textMemo,
+              payoutTo: to, platformFee: PLATFORM_FEE, now: Date.now(),
+              meta: { kind: 'payout_fee', payoutType: 'text_payout', feeType: 'text_fee',
+                notify: recipient ? { username: to, event: 'text-payment-received', payload: { from, amount: recipientNet, currency: cur, msgId } } : null },
+            }).catch(e => console.error(`[fed-text] settlePayment enqueue failed: ${e.message}`));
+          } else {
+            if (recipientNet >= dmFloor) {
+              const payoutMemo = `v4call:text-payout:${msgId}`;
+              ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending');
+              sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+                  if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
+                    from, amount: recipientNet, currency: cur, msgId
+                  });
+                } else {
+                  console.error(`[fed-text] Payout to @${to} failed: ${r.reason}`);
+                }
+              });
+            }
+            if (platformCut >= dmFloor) {
+              const feeMemo = `v4call:text-fee:${msgId}`;
+              ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending');
+              sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+                if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+              });
+            }
           }
 
           console.log(`[fed-text] @${from}@${fromServer || ws._domain} → @${to}: paid ${paid} ${cur} | net ${recipientNet} | fee ${platformCut}`);
@@ -6895,15 +7098,23 @@ async function fedHandleMessage(ws, raw) {
             console.warn(`[fed-att] ✗ Recipient-side check failed: @${from} → @${to}: ${rejectReason}`);
             const refundMemo = `v4call:dm-att-refund:${msgId}`;
             ledgerPayment(msgId, 'text_refund', ESCROW_ACCOUNT, from, paid, refundMemo, 'pending', null, cur);
-            sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
-                console.log(`[fed-att] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
-              } else {
-                ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
-                console.error(`[fed-att] Refund to @${from} failed: ${r.reason}`);
-              }
-            });
+            if (escrowBoxMode) {
+              escrowBoxMode.settlePayment({
+                ref: msgId, txId: textTxId, sender: from, amount: paid, currency: cur, memo: textMemo,
+                payoutTo: from, platformFee: 0, now: Date.now(),
+                meta: { kind: 'refund', refundType: 'text_refund' },
+              }).catch(e => console.error(`[fed-att] Refund enqueue to @${from} failed: ${e.message}`));
+            } else {
+              sendFromEscrow(from, paid, refundMemo, cur, msgId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(msgId, 'text_refund', 'sent', r.txId);
+                  console.log(`[fed-att] Refund sent to @${from}: ${paid} ${cur} (tx ${r.txId})`);
+                } else {
+                  ledgerPaymentUpdate(msgId, 'text_refund', 'failed', null);
+                  console.error(`[fed-att] Refund to @${from} failed: ${r.reason}`);
+                }
+              });
+            }
             fedSend(ws, { type: 'dm-attachment-failed', from, to, msgId, reason: rejectReason });
             return;
           }
@@ -6914,26 +7125,37 @@ async function fedHandleMessage(ws, raw) {
           const platformCut  = parseFloat((paid * PLATFORM_FEE).toFixed(dmPrec));
           const recipientNet = parseFloat((paid - platformCut).toFixed(dmPrec));
 
-          if (recipientNet >= dmFloor) {
-            const payoutMemo = `v4call:dm-att-payout:${msgId}`;
-            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
-            sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
-                if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
-                  from, amount: recipientNet, currency: cur, msgId
-                });
-              } else {
-                console.error(`[fed-att] Payout to @${to} failed: ${r.reason}`);
-              }
-            });
-          }
-          if (platformCut >= dmFloor) {
-            const feeMemo = `v4call:dm-att-fee:${msgId}`;
-            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
-            sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
-              if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
-            });
+          if (escrowBoxMode) {
+            ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, `v4call:dm-att-payout:${msgId}`, 'pending', null, cur);
+            ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, `v4call:dm-att-fee:${msgId}`, 'pending', null, cur);
+            escrowBoxMode.settlePayment({
+              ref: msgId, txId: textTxId, sender: from, amount: paid, currency: cur, memo: textMemo,
+              payoutTo: to, platformFee: PLATFORM_FEE, now: Date.now(),
+              meta: { kind: 'payout_fee', payoutType: 'text_payout', feeType: 'text_fee',
+                notify: recipient ? { username: to, event: 'text-payment-received', payload: { from, amount: recipientNet, currency: cur, msgId } } : null },
+            }).catch(e => console.error(`[fed-att] settlePayment enqueue failed: ${e.message}`));
+          } else {
+            if (recipientNet >= dmFloor) {
+              const payoutMemo = `v4call:dm-att-payout:${msgId}`;
+              ledgerPayment(msgId, 'text_payout', ESCROW_ACCOUNT, to, recipientNet, payoutMemo, 'pending', null, cur);
+              sendFromEscrow(to, recipientNet, payoutMemo, cur, msgId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(msgId, 'text_payout', 'sent', r.txId);
+                  if (recipient) io.to(recipient.socketId).emit('text-payment-received', {
+                    from, amount: recipientNet, currency: cur, msgId
+                  });
+                } else {
+                  console.error(`[fed-att] Payout to @${to} failed: ${r.reason}`);
+                }
+              });
+            }
+            if (platformCut >= dmFloor) {
+              const feeMemo = `v4call:dm-att-fee:${msgId}`;
+              ledgerPayment(msgId, 'text_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformCut, feeMemo, 'pending', null, cur);
+              sendFromEscrow(SERVER_HIVE_ACCOUNT, platformCut, feeMemo, cur, msgId).then(r => {
+                if (r.success) ledgerPaymentUpdate(msgId, 'text_fee', 'sent', r.txId);
+              });
+            }
           }
 
           console.log(`[fed-att] @${from}@${fromServer || ws._domain} → @${to}: paid ${paid} ${cur} | net ${recipientNet} | fee ${platformCut}`);
@@ -7148,15 +7370,23 @@ async function fedHandleMessage(ws, raw) {
             console.warn(`[fed-payment] ✗ Recipient-side rate check failed: ${callId} ring — ${rejectReason}`);
             const refundMemo = `v4call:ring-refund:${callId}`;
             ledgerPayment(callId, 'ring_refund', ESCROW_ACCOUNT, from, amount, refundMemo, 'pending');
-            sendFromEscrow(from, amount, refundMemo, cur, callId).then(r => {
-              if (r.success) {
-                ledgerPaymentUpdate(callId, 'ring_refund', 'sent', r.txId);
-                console.log(`[fed-payment] Ring refund sent to @${from}: ${amount} ${cur} (tx ${r.txId})`);
-              } else {
-                ledgerPaymentUpdate(callId, 'ring_refund', 'failed', null);
-                console.error(`[fed-payment] Ring refund to @${from} failed: ${r.reason}`);
-              }
-            });
+            if (escrowBoxMode) {
+              escrowBoxMode.settlePayment({
+                ref: callId, txId, sender: from, amount, currency: cur, memo,
+                payoutTo: from, platformFee: 0, now: Date.now(),
+                meta: { kind: 'refund', refundType: 'ring_refund' },
+              }).catch(e => console.error(`[fed-payment] Ring refund enqueue to @${from} failed: ${e.message}`));
+            } else {
+              sendFromEscrow(from, amount, refundMemo, cur, callId).then(r => {
+                if (r.success) {
+                  ledgerPaymentUpdate(callId, 'ring_refund', 'sent', r.txId);
+                  console.log(`[fed-payment] Ring refund sent to @${from}: ${amount} ${cur} (tx ${r.txId})`);
+                } else {
+                  ledgerPaymentUpdate(callId, 'ring_refund', 'failed', null);
+                  console.error(`[fed-payment] Ring refund to @${from} failed: ${r.reason}`);
+                }
+              });
+            }
             fedSend(ws, { type: 'payment-rejected', callId, paymentType, reason: rejectReason });
             return;
           }
@@ -7566,12 +7796,26 @@ async function refundPaidInvite(inviteId, newStatus) {
   if (!e || e.status !== 'pending') return;
   e.status = newStatus; // mark first so concurrent accept/decline see it locked
   const refundMemo = `v4call:invite-refund:${inviteId}`;
+  const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
+
+  if (escrowBoxMode) {
+    ledgerPayment(inviteId, 'invite_refund', ESCROW_ACCOUNT, e.inviter, e.paid, refundMemo, 'pending', null, e.currency);
+    await escrowBoxMode.settlePayment({
+      ref: inviteId, txId: e.txId, sender: e.inviter, amount: e.paid, currency: e.currency, memo: e.memo,
+      payoutTo: e.inviter, platformFee: 0, now: Date.now(),
+      meta: { kind: 'refund', refundType: 'invite_refund',
+        notify: { username: e.inviter, event: 'lobby-info',
+          payload: { text: `↩️ Invite to ${inviteeLabel} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${fmtAmt(e.paid, e.currency)} ${e.currency}.` } } },
+    });
+    console.log(`[paid-invite] ↩ Refund of ${e.paid} ${e.currency} to @${e.inviter} for ${inviteId} (${newStatus}) queued via box`);
+    return;
+  }
+
   try {
     const r = await sendFromEscrow(e.inviter, e.paid, refundMemo, e.currency, inviteId);
     if (r && r.success) {
       ledgerPayment(inviteId, 'invite_refund', ESCROW_ACCOUNT, e.inviter, e.paid, refundMemo, 'sent', r.txId || null, e.currency);
       const lu = lobbyUsers[e.inviter];
-      const inviteeLabel = e.invitee_server ? `@${e.invitee}@${e.invitee_server}` : `@${e.invitee}`;
       if (lu) io.to(lu.socketId).emit('lobby-info', {
         text: `↩️ Invite to ${inviteeLabel} (#${e.room}) — ${newStatus.replace('_', ' ')}. Refunded ${fmtAmt(e.paid, e.currency)} ${e.currency}.`
       });
