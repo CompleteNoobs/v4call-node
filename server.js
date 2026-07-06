@@ -5085,12 +5085,27 @@ io.on('connection', (socket) => {
     // v0.17 — a paid expert entering the room STARTS the metered session: persist
     // start_ts on the durable escrow row (the settlement clock) and seed the
     // live-call cache so processCallEnd settles this offer exactly like a 1:1 call
-    // (payout→expert, refund→admin, fee→operator). Reconnect mid-session is a
-    // no-op: the offer is already 'active', so joined() refuses a second start.
+    // (payout→expert, refund→admin, fee→operator).
     if (joinedVia === 'paid' && !isFed) {
       const xoTicket = r.paidInvitees.get(username);
       const xo = xoTicket && expertOffers.get(xoTicket.offerId);
-      if (xo && expertOffers.joined(xo.offerId, username, Date.now()).ok) {
+      if (xo && xo.status === 'active' && expertGraceTimers[xo.offerId]) {
+        // A3 — RECONNECT within the disconnect-grace window: cancel the pending
+        // settle, keep the original start_ts, re-arm the display on both sides.
+        clearTimeout(expertGraceTimers[xo.offerId].timer);
+        delete expertGraceTimers[xo.offerId];
+        const started = {
+          offerId: xo.offerId, room, expert: xo.expert, startTs: xo.startTs,
+          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
+          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
+        };
+        const inv = lobbyUsers[xo.inviter];
+        if (inv) io.to(inv.socketId).emit('expert-session-started', started);
+        io.to(socket.id).emit('expert-session-started', { ...started, perspective: 'expert', platformFee: PLATFORM_FEE });
+        if (inv) io.to(inv.socketId).emit('lobby-info', { text: `✓ 💎 @${xo.expert} reconnected — session continues.` });
+        console.log(`[expert-offer] 💎 ${xo.offerId} reconnected within grace (@${username})`);
+      } else if (xo && expertOffers.joined(xo.offerId, username, Date.now()).ok) {
+        // Fresh session start.
         const startTs = xo.startTs;
         recordEscrowStartTs(xo.offerId, startTs);
         activePayments[xo.offerId] = {
@@ -5100,19 +5115,37 @@ io.on('connection', (socket) => {
           platformFee: PLATFORM_FEE, startTime: startTs, escrow: ESCROW_ACCOUNT,
         };
         io.to(room).emit('lobby-info', { text: `💎 @${username} joined as a paid expert.` });
+        const started = {
+          offerId: xo.offerId, room, expert: xo.expert, startTs,
+          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
+          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
+        };
         const inv = lobbyUsers[xo.inviter];
-        if (inv) io.to(inv.socketId).emit('expert-session-started', {
-          offerId: xo.offerId, room, expert: xo.expert, startTs,
-          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
-          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
-        });
-        io.to(socket.id).emit('expert-session-started', {
-          offerId: xo.offerId, room, expert: xo.expert, startTs,
-          connectFee: xo.connectFee, ratePerHour: xo.ratePerHour,
-          currency: xo.currency, maxDurationMin: xo.maxDurationMin, cap: xo.cap,
-          perspective: 'expert', platformFee: PLATFORM_FEE,
-        });
-        console.log(`[expert-offer] 💎 session started: ${xo.offerId} (@${username} in #${room})`);
+        if (inv) io.to(inv.socketId).emit('expert-session-started', started);
+        io.to(socket.id).emit('expert-session-started', { ...started, perspective: 'expert', platformFee: PLATFORM_FEE });
+
+        // A3 — auto-end the paid session at maxDuration. The money is already
+        // capped by settle(), but this stops the meter cleanly + notifies. If the
+        // expert stays in the room after, they're just a normal (unpaid) member.
+        const capMs = xo.maxDurationMin * 60 * 1000;
+        const capTimer = setTimeout(() => {
+          delete expertCapTimers[xo.offerId];
+          const still = expertOffers.get(xo.offerId);
+          if (!still || still.status !== 'active') return;
+          const mem = r.members.find(m => m.username === xo.expert && !m.homeServer);
+          io.to(room).emit('lobby-info', { text: `⏰ 💎 @${xo.expert}'s paid session reached its ${xo.maxDurationMin}-min cap — meter stopped.` });
+          const capInv = lobbyUsers[xo.inviter];
+          if (capInv) io.to(capInv.socketId).emit('expert-session-capped', { offerId: xo.offerId, room, expert: xo.expert });
+          const expSock = lobbyUsers[xo.expert];
+          if (expSock) io.to(expSock.socketId).emit('expert-session-capped', { offerId: xo.offerId, room, expert: xo.expert, perspective: 'expert' });
+          // Settle using the live member entry (or a synthetic one — the expert may
+          // still be present); processCallEnd caps elapsed at maxDuration anyway.
+          settleExpertOnExit(r, room, mem || { username: xo.expert, joinedVia: 'paid', homeServer: null }, 'max_duration');
+        }, capMs);
+        if (capTimer.unref) capTimer.unref();
+        expertCapTimers[xo.offerId] = capTimer;
+
+        console.log(`[expert-offer] 💎 session started: ${xo.offerId} (@${username} in #${room}, cap ${xo.maxDurationMin}min)`);
       }
     }
 
@@ -6407,9 +6440,9 @@ io.on('connection', (socket) => {
       const dropped = rooms[room].members.find(u => u.socketId === socket.id);
       rooms[room].members = rooms[room].members.filter(u => u.socketId !== socket.id);
       socket.to(room).emit('user-left', socket.id);
-      // v0.17 Part A: a paid expert's disconnect settles IMMEDIATELY for elapsed
-      // time (same as 1:1 calls today). The 30s reconnect grace is the A3 build.
-      settleExpertOnExit(rooms[room], room, dropped, 'disconnect');
+      // v0.17 A3: a paid expert's raw socket drop gets a 30s reconnect grace
+      // before settling (a deliberate leave/kick/ban settles immediately elsewhere).
+      graceOrSettleExpertOnDisconnect(rooms[room], room, dropped);
       clearSpotlightIfMember(rooms[room], room, username);
 
       if (rooms[room].isCall) {
@@ -8049,6 +8082,18 @@ async function refundExpertOffer(offer, why) {
 // callee=expert / connect_paid / rate_per_hour / platform_fee / start_ts, so
 // processCallEnd (box or in-process) pays connect+elapsed×rate (capped at the
 // funded deposit) to the expert, refunds the rest to the admin, takes the fee.
+// v0.17 A3 — per-session timers keyed by offerId.
+//   grace: a paid expert's socket dropped → 30s to reconnect before we settle.
+//   cap:   the session auto-settles when it reaches the offer's maxDuration.
+const expertGraceTimers = {};   // offerId → { timer, r, roomName, member }
+const expertCapTimers   = {};   // offerId → timer
+const EXPERT_DISCONNECT_GRACE_MS = 30 * 1000;
+
+function clearExpertTimers(offerId) {
+  if (expertGraceTimers[offerId]) { clearTimeout(expertGraceTimers[offerId].timer); delete expertGraceTimers[offerId]; }
+  if (expertCapTimers[offerId])   { clearTimeout(expertCapTimers[offerId]);         delete expertCapTimers[offerId]; }
+}
+
 function settleExpertOnExit(r, roomName, member, reason) {
   try {
     if (!r || !member || member.joinedVia !== 'paid' || member.homeServer) return;
@@ -8056,6 +8101,7 @@ function settleExpertOnExit(r, roomName, member, reason) {
     if (!offer) return;
     const claimed = expertOffers.beginSettle(offer.offerId, reason);
     if (!claimed) return;   // a racing exit trigger already claimed it
+    clearExpertTimers(offer.offerId);       // cancel any grace/cap timer for this session
     r.paidInvitees.delete(member.username);
     if (!activePayments[offer.offerId]) {
       // Node restarted mid-session: the live-cache entry is gone (same limitation as
@@ -8070,6 +8116,34 @@ function settleExpertOnExit(r, roomName, member, reason) {
       .catch(e => console.error(`[expert-offer] settlement failed for ${offer.offerId}: ${e.message}`));
   } catch (e) {
     console.error(`[expert-offer] settleExpertOnExit error: ${e.message}`);
+  }
+}
+
+// A paid expert's SOCKET dropped (not a deliberate leave/kick). Give them 30s to
+// reconnect (mirrors the 1:1-call reconnect grace the design calls for) before
+// settling for elapsed time. A rejoin within the window cancels this (see the
+// join hook). Deliberate exits (leave-room / kick / ban / room-end) still settle
+// immediately via settleExpertOnExit — only a raw disconnect gets the grace.
+function graceOrSettleExpertOnDisconnect(r, roomName, member) {
+  try {
+    if (!r || !member || member.joinedVia !== 'paid' || member.homeServer) return;
+    const offer = expertOffers.findByExpert(member.username, roomName, ['active']);
+    if (!offer) return;
+    if (expertGraceTimers[offer.offerId]) return;   // already in grace
+    console.log(`[expert-offer] ⏳ @${member.username} dropped from #${roomName} — ${EXPERT_DISCONNECT_GRACE_MS/1000}s grace before settling ${offer.offerId}`);
+    const inv = lobbyUsers[offer.inviter];
+    if (inv) io.to(inv.socketId).emit('lobby-info', { text: `⏳ 💎 @${offer.expert} dropped — ${EXPERT_DISCONNECT_GRACE_MS/1000}s to reconnect before the session settles.` });
+    const timer = setTimeout(() => {
+      delete expertGraceTimers[offer.offerId];
+      // Re-check: the offer must still be active (a rejoin would have kept it active
+      // but cleared this timer; a settle would have flipped it out of active).
+      const still = expertOffers.get(offer.offerId);
+      if (still && still.status === 'active') settleExpertOnExit(r, roomName, member, 'disconnect');
+    }, EXPERT_DISCONNECT_GRACE_MS);
+    if (timer.unref) timer.unref();
+    expertGraceTimers[offer.offerId] = { timer, r, roomName, member };
+  } catch (e) {
+    console.error(`[expert-offer] graceOrSettleExpertOnDisconnect error: ${e.message}`);
   }
 }
 
