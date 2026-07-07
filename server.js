@@ -2322,6 +2322,27 @@ function buildCallRateResult(rateBlock, callType, escrow, platformFee) {
 // All call sites must await it.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── No-tier policy (owner decision 2026-07-08) ───────────────────────────────
+// A caller who matches NONE of the callee's posted tiers (holds none of the
+// gated tokens, is on no named list, no default-list window applies) used to
+// fall through to FREE — anyone could bypass every posted fee by simply holding
+// nothing (the completenewbie bypass, found in fed testing 2026-07-07). If the
+// callee's rates post defines tiers, matching none now means NO CONTACT. A
+// rates post with no tiers at all still means free, as does no post at all.
+function ratesDefineTiers(rates) {
+  return !!rates && ((rates.tokens || []).length > 0 || (rates.lists || []).length > 0);
+}
+
+function noTierMessage(rates) {
+  const who  = rates.account ? `@${rates.account}` : 'This user';
+  const ways = [];
+  const toks = (rates.tokens || []).map(t => t.symbol);
+  if (toks.length) ways.push(`hold ${toks.join(' or ')}`);
+  if ((rates.lists || []).some(l => l.name !== 'default')) ways.push('be on one of their contact lists');
+  if ((rates.lists || []).some(l => l.name === 'default')) ways.push('contact them within their posted hours');
+  return `${who} only accepts contact matching their posted rates — you'd need to ${ways.join(', or ')}. You currently match none of their tiers.`;
+}
+
 async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice', now = new Date()) {
   if (!calleeRates) return null;
 
@@ -2425,7 +2446,13 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
     }
   }
 
-  // ── Step 5: No rates apply → free call ────────────────────────────────────
+  // ── Step 5: No tier matched ────────────────────────────────────────────────
+  // Tiers posted but none matched → deny (see the no-tier policy note above).
+  // No tiers posted at all → nothing to gate → free.
+  if (ratesDefineTiers(calleeRates)) {
+    console.log(`[rates] @${caller} matches no tier of @${calleeRates.account || '?'} — contact denied (no-tier policy)`);
+    return { noTier: true, message: noTierMessage(calleeRates) };
+  }
   return null;
 }
 
@@ -2554,6 +2581,14 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
     }
   }
   if (hbdOption) await pushOrFlag(hbdOption);
+
+  // No-tier policy: tiers posted, none matched, and nothing was merely
+  // below-floor (below-floor = a MATCHED tier priced under the currency's
+  // smallest unit, which stays free by design) → deny, mirroring
+  // getRatesForCaller's Step 5.
+  if (options.length === 0 && !belowFloor && ratesDefineTiers(rates)) {
+    return { options: [], blocked: false, feeRejected: false, noTier: true, message: noTierMessage(rates) };
+  }
 
   return { options, blocked: false, feeRejected: false, belowFloor };
 }
@@ -4154,6 +4189,13 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // No-tier policy — matching none of the recipient's posted tiers means no
+    // contact, not a free message (the completenewbie bypass).
+    if (applicable?.noTier) {
+      socket.emit('lobby-dm-error', `🚫 ${applicable.message}`);
+      return;
+    }
+
     const textRate     = applicable?.flat || 0;
     const cur          = textCurrency || applicable?.currency || 'HBD';
     const calleeEscrow = calleeRates?.escrow || ESCROW_ACCOUNT;
@@ -4340,6 +4382,10 @@ io.on('connection', (socket) => {
       return cb({ found: true, feeRejected: true, message: applicable.message });
     }
 
+    if (applicable?.noTier) {
+      return cb({ found: true, noTier: true, message: applicable.message });
+    }
+
     if (!applicable) {
       return cb({ found: true, free: true });
     }
@@ -4374,6 +4420,9 @@ io.on('connection', (socket) => {
     }
     if (result.blocked) {
       return cb({ found: true, blocked: true, message: result.message });
+    }
+    if (result.noTier) {
+      return cb({ found: true, noTier: true, message: result.message });
     }
     if (result.options.length === 0) {
       return cb({ found: true, free: true, belowFloor: result.belowFloor || false });
@@ -4416,7 +4465,11 @@ io.on('connection', (socket) => {
     const rates = await fetchRates(callee);
     if (rates) {
       const applicable = await getRatesForCaller(rates, caller, 'voice', new Date());
-      if (applicable && !applicable.blocked && !applicable.feeRejected) {
+      // Blocked / no-tier callers can't buy their way in with a ring payment.
+      if (applicable?.blocked || applicable?.noTier) {
+        return cb({ verified: false, reason: applicable.message || `@${callee} is not accepting your calls.` });
+      }
+      if (applicable && !applicable.feeRejected) {
         lockedRate        = applicable.rate       || 0;
         lockedMinDeposit  = applicable.minDeposit || 0;
         lockedPlatformFee = applicable.platformFee || PLATFORM_FEE;
@@ -4768,6 +4821,21 @@ io.on('connection', (socket) => {
         socket.emit('call-failed', { reason: `Please wait ${waitSec}s before calling @${callee} again.` });
         return;
       }
+    }
+
+    // Server-side tier/block gate (the get-rates check is client UX only): a
+    // caller matching NONE of the callee's posted tiers used to slip through
+    // as a free call (the completenewbie bypass, fed testing 2026-07-07).
+    // Fail-open on a rates-fetch hiccup — a Hive outage must not kill calling.
+    try {
+      const gateRates = await fetchRates(callee);
+      const gate = gateRates ? await getRatesForCaller(gateRates, caller, callType || 'voice', new Date()) : null;
+      if (gate?.blocked || gate?.noTier) {
+        socket.emit('call-failed', { reason: gate.message || `@${callee} is not accepting your calls.` });
+        return;
+      }
+    } catch (e) {
+      console.warn(`[call-user] rate gate fetch failed for @${callee}: ${e.message}`);
     }
 
     // Determine where the callee lives — local socket or federated peer.
@@ -5153,7 +5221,7 @@ io.on('connection', (socket) => {
       // the admin's in-room notice + allowlist pre-fill route through the
       // canonical @user@server form.
       const dispUser = r.local ? r.user : `${r.user}@${r.server}`;
-      if (inv.blocked || inv.feeRejected) {
+      if (inv.blocked || inv.feeRejected || inv.noTier) {
         deferred.push({ user: dispUser, reason: inv.message || 'cannot invite' });
         continue;
       }
@@ -5511,6 +5579,10 @@ io.on('connection', (socket) => {
         socket.emit('allowlist-error', { room, reason: fedInv.message || `@${fedInvitee}'s platform fee is below this server's minimum.` });
         return;
       }
+      if (fedInv.noTier) {
+        socket.emit('allowlist-error', { room, reason: fedInv.message || `@${fedInvitee} only accepts invites from users matching their posted rates.` });
+        return;
+      }
 
       const isPaid = fedInv.options.length > 0;
 
@@ -5704,6 +5776,10 @@ io.on('connection', (socket) => {
     }
     if (inv.feeRejected) {
       socket.emit('allowlist-error', { room, reason: inv.message || `@${invitee}'s platform fee is below this server's minimum.` });
+      return;
+    }
+    if (inv.noTier) {
+      socket.emit('allowlist-error', { room, reason: inv.message || `@${invitee} only accepts invites from users matching their posted rates.` });
       return;
     }
 
@@ -6498,6 +6574,10 @@ io.on('connection', (socket) => {
       }
       if (applicable?.feeRejected) {
         socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `⚠ ${applicable.message}` });
+        return;
+      }
+      if (applicable?.noTier) {
+        socket.emit('dm-attachment-error', { msgId: env.msgId || null, error: `🚫 ${applicable.message}` });
         return;
       }
 
@@ -7412,6 +7492,8 @@ async function fedHandleMessage(ws, raw) {
             rejectReason = optResult.message || 'sender is blocked by recipient';
           } else if (optResult.feeRejected) {
             rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.noTier) {
+            rejectReason = optResult.message || 'sender matches none of the recipient\'s rate tiers';
           } else if (optResult.options.length > 0) {
             const opt = optResult.options.find(o => o.currency === cur);
             if (!opt) {
@@ -7426,8 +7508,8 @@ async function fedHandleMessage(ws, raw) {
               }
             }
           }
-          // If optResult.options.length === 0: recipient has no rates post
-          // OR no matching window right now → free DM territory; let through.
+          // If optResult.options.length === 0 (and not noTier): recipient has
+          // no rates post or posted no tiers → genuinely free; let through.
           if (rejectReason) {
             console.warn(`[fed-text] ✗ Recipient-side rate check failed: @${from} → @${to}: ${rejectReason}`);
             const refundMemo = `v4call:text-refund:${msgId}`;
@@ -7558,6 +7640,8 @@ async function fedHandleMessage(ws, raw) {
             rejectReason = optResult.message || 'sender is blocked by recipient';
           } else if (optResult.feeRejected) {
             rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.noTier) {
+            rejectReason = optResult.message || 'sender matches none of the recipient\'s rate tiers';
           } else if (optResult.options.length > 0) {
             const opt = optResult.options.find(o => o.currency === cur);
             if (!opt) {
@@ -7663,6 +7747,23 @@ async function fedHandleMessage(ws, raw) {
       if (calleeUser.inCall) {
         fedSend(ws, { type: 'call-declined', caller, callee, roomName, reason: 'busy' });
         return;
+      }
+      // Recipient-side tier/block gate (design rule #15): a FREE federated
+      // call-invite had no gate at all — fee-charging callees were freely
+      // ringable by any remote caller matching no tier (completenewbie bypass)
+      // and even by callers they blocked. Paid rings are separately enforced
+      // in the payment handler; this gates the invite itself. Fail-open on a
+      // rates-fetch hiccup, matching the local call-user gate.
+      try {
+        const recipRates = await fetchRates(callee);
+        const gate = recipRates ? await getRatesForCaller(recipRates, caller, callType || 'voice', new Date()) : null;
+        if (gate?.blocked || gate?.noTier) {
+          fedSend(ws, { type: 'call-declined', caller, callee, roomName, reason: gate.blocked ? 'blocked' : 'no_tier', message: gate.message });
+          console.log(`[federation] ✗ call-invite @${caller}@${callerServer || ws._domain} → @${callee} rejected (${gate.blocked ? 'blocked' : 'no matching tier'})`);
+          return;
+        }
+      } catch (e) {
+        console.warn(`[federation] call-invite rate gate failed for @${callee}: ${e.message}`);
       }
       // Mark the callee as in-call so local traffic doesn't collide.
       calleeUser.inCall = roomName;
@@ -7828,6 +7929,8 @@ async function fedHandleMessage(ws, raw) {
             rejectReason = optResult.message || 'caller is blocked by recipient';
           } else if (optResult.feeRejected) {
             rejectReason = optResult.message || 'recipient platform fee below this server\'s minimum';
+          } else if (optResult.noTier) {
+            rejectReason = optResult.message || 'caller matches none of the recipient\'s rate tiers';
           } else if (optResult.options.length > 0) {
             const opt = optResult.options.find(o => o.currency === cur);
             if (!opt) {
@@ -7974,6 +8077,11 @@ async function fedHandleMessage(ws, raw) {
       if (recipInv.feeRejected) {
         fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'fee_rejected' });
         console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} — recipient platform fee mismatch — rejected`);
+        return;
+      }
+      if (recipInv.noTier) {
+        fedSend(ws, { type: 'room-response', invite_id, response: 'declined', reason: 'paid_rejected', detail: 'no_tier' });
+        console.log(`[federation] ← room-invite @${from_user}@${ws._domain} → @${target} — inviter matches no rate tier — rejected`);
         return;
       }
       const recipientRequiresPayment = (recipInv.options || []).length > 0;
