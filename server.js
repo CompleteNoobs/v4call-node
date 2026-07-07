@@ -1492,6 +1492,30 @@ function recipientStatus(username) {
   return { status: 'offline' };
 }
 
+// Which escrow account must @callee's rates post declare for a paid flow to be
+// disbursable? LOCAL callee → this server's ESCROW_ACCOUNT (we hold that key).
+// FEDERATED callee → the PEER server's announced escrow (from its signed
+// v4call-server.json — it holds that key, we don't). Offline/unroutable → null:
+// no paid flow can start, so no escrow guard applies.
+// Fixes the fed-testing bug where get-rates/get-all-rates compared a federated
+// callee's escrow against OUR ESCROW_ACCOUNT — every cross-server rate looked
+// mismatched, so clients fell back to "sending free" while lobby-dm correctly
+// demanded payment → the DM died silently in between.
+function escrowRouteForCallee(callee) {
+  const r = recipientStatus(callee);
+  if (r.status === 'local')     return { escrow: ESCROW_ACCOUNT, local: true };
+  if (r.status === 'federated') return { escrow: r.peer.escrow || peerEscrowForDomain(r.peer.domain), domain: r.peer.domain };
+  if (r.status === 'nostr' || r.status === 'nostr-only')
+    return { escrow: peerEscrowForDomain(r.domain), domain: r.domain };
+  return null;
+}
+
+function escrowMismatchMessage(callee, declared, route) {
+  return route.local
+    ? `@${callee}'s rates post/user-announce declares escrow @${declared}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce to declare @${ESCROW_ACCOUNT} before paid contacts can be accepted.`
+    : `@${callee} is on ${route.domain}, which controls escrow @${route.escrow}, but their rates post/user-announce declares @${declared}. They need to update their user-announce to declare @${route.escrow} for paid contacts to work across federation.`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Nostr payload transport (dm + dm-attachment over relays) ─────────────────
 // Mirrors the WS /federation transport: a per-peer "pseudo-socket" lets the SAME
@@ -4275,14 +4299,16 @@ io.on('connection', (socket) => {
       return cb({ found: true, free: true });
     }
 
-    // Local recipient's rates-post escrow must be the one THIS server controls —
+    // The callee's rates-post escrow must be one their OWN server controls —
     // otherwise the ring/deposit payment would verify fine (it really lands
-    // wherever they declared) but disbursement silently strands. Mirrors the
-    // DM/invite guards (v0.16.10 / this session).
-    const callRatesEscrow = rates.escrow || ESCROW_ACCOUNT;
-    if (callRatesEscrow !== ESCROW_ACCOUNT) {
+    // wherever they declared) but disbursement silently strands. For a local
+    // callee that's OUR escrow; for a federated callee it's the PEER's escrow.
+    // Mirrors the DM/invite guards (v0.16.10 / fed-testing fix).
+    const route = escrowRouteForCallee(callee);
+    const callRatesEscrow = rates.escrow || (route && route.escrow) || ESCROW_ACCOUNT;
+    if (route && route.escrow && callRatesEscrow !== route.escrow) {
       return cb({ found: true, escrowMismatch: true,
-        message: `@${callee}'s rates post/user-announce declares escrow @${callRatesEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce to declare @${ESCROW_ACCOUNT} before paid calls can be accepted.` });
+        message: escrowMismatchMessage(callee, callRatesEscrow, route) });
     }
 
     cb({ found: true, free: false, rates: applicable, escrow: callRatesEscrow });
@@ -4308,11 +4334,12 @@ io.on('connection', (socket) => {
       return cb({ found: true, free: true, belowFloor: result.belowFloor || false });
     }
 
-    // See get-rates above — same local escrow-mismatch guard.
-    const callRatesEscrow = rates.escrow || ESCROW_ACCOUNT;
-    if (callRatesEscrow !== ESCROW_ACCOUNT) {
+    // See get-rates above — same escrow guard, local vs federated aware.
+    const route = escrowRouteForCallee(callee);
+    const callRatesEscrow = rates.escrow || (route && route.escrow) || ESCROW_ACCOUNT;
+    if (route && route.escrow && callRatesEscrow !== route.escrow) {
       return cb({ found: true, escrowMismatch: true,
-        message: `@${callee}'s rates post/user-announce declares escrow @${callRatesEscrow}, but this server's active escrow account is @${ESCROW_ACCOUNT}. @${callee} needs to update their user-announce to declare @${ESCROW_ACCOUNT} before paid calls can be accepted.` });
+        message: escrowMismatchMessage(callee, callRatesEscrow, route) });
     }
 
     result.options[0]._recommended = true;
