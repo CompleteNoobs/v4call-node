@@ -96,6 +96,10 @@ function createEscrowBoxMode({
         L.error(`${ref} REJECTED by box (terminal): ${receipt.reason || 'no reason given'} — parked as failed; nothing was disbursed. Operator action needed if a real payment is stranded.`);
       } else {
         L.info(`settled ${ref} via box: settlement=${receipt.settlement} refund=${receipt.refund} status=${receipt.status}`);
+        // Step 6 — surface the box's attestation verdict (shadow mode: informational).
+        if (receipt.attestations) {
+          L.info(`attestation verdict for ${ref} (box, shadow): caller=${receipt.attestations.caller} callee=${receipt.attestations.callee}${receipt.attestations.ok ? ' ✓' : ''}`);
+        }
       }
     } else {
       // Row already terminal. If the STORED receipt said 'pending' and this one is a
@@ -148,8 +152,8 @@ function createEscrowBoxMode({
    * @param meta           optional finalize context (e.g. { callerServer, federated } for fed calls)
    * @returns true iff a NEW report was enqueued (false on a duplicate call-end)
    */
-  async function settleCall({ callId, payRows, endReason, now, meta = null }) {
-    const facts = escrowAdapter.buildCallEndReportFacts({ payRows, endReason, now, maxDurationMin });
+  async function settleCall({ callId, payRows, endReason, now, attestations = null, meta = null }) {
+    const facts = escrowAdapter.buildCallEndReportFacts({ payRows, endReason, now, maxDurationMin, attestations });
     const nonce = escrowReporter.settleNonce(callId);
     const won = queue.enqueue(callId, facts, nonce, now, meta);
     if (!won) { L.info(`${callId} already queued (duplicate call-end) — ignored`); return false; }

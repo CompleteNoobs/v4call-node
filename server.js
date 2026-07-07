@@ -2652,6 +2652,39 @@ async function disbursePaidInvite(inviteId) {
 
 const activePayments = {};
 
+// ── Step 6 — call attestations (shadow mode) ──────────────────────────────────
+// callId → { caller?: att, callee?: att, _ts } — collected from `call-attest` socket
+// events, attached VERBATIM to the call-end settlement report (the box verifies the
+// user signatures independently against on-chain posting keys), then dropped. The
+// non-ender's attestation arrives moments AFTER call-end (they sign on peer-hung-up),
+// so settlement waits a short grace for the second signature — bounded, best-effort.
+const callAttestations = new Map();
+const ATTESTATION_GRACE_MS = parseInt(process.env.ATTESTATION_GRACE_MS || '2500', 10);
+setInterval(() => {   // sweep abandoned entries (free calls, crashes) — 10 min TTL
+  const cut = Date.now() - 10 * 60_000;
+  for (const [k, v] of callAttestations) if ((v._ts || 0) < cut) callAttestations.delete(k);
+}, 60_000).unref();
+
+// Wait up to graceMs for both attestations of a call; resolves early when both are in.
+// If NOTHING has arrived by call-end (free call, old clients, fed caller with no local
+// attester), don't stall settlement for the full grace — one short beat only.
+async function collectCallAttestations(callId, graceMs = ATTESTATION_GRACE_MS) {
+  if (!callAttestations.has(String(callId))) graceMs = Math.min(graceMs, 500);
+  const deadline = Date.now() + graceMs;
+  for (;;) {
+    const cur = callAttestations.get(String(callId));
+    if (cur && cur.caller && cur.callee) break;
+    if (Date.now() >= deadline) break;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  const cur = callAttestations.get(String(callId));
+  callAttestations.delete(String(callId));
+  const out = [];
+  if (cur?.caller) out.push(cur.caller);
+  if (cur?.callee) out.push(cur.callee);
+  return out;
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Credit Burn Engine ────────────────────────────────────────────────────────
@@ -3042,7 +3075,10 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     if (payRows.length === 0) {
       console.warn(`[billing] Call ${callId} has no durable escrow row — nothing to settle (box mode)`);
     } else {
-      await escrowBoxMode.settleCall({ callId, payRows, endReason, now });
+      // Step 6 — brief grace for the non-ender's attestation (they sign on peer-hung-up,
+      // moments after this call-end). Best-effort; absent attestations settle as before.
+      const attestations = await collectCallAttestations(callId);
+      await escrowBoxMode.settleCall({ callId, payRows, endReason, now, attestations });
     }
     delete activePayments[callId];
     return;
@@ -3087,15 +3123,18 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   // node and escrow are the same host; the Step-5 box extraction swaps this for a Nostr
   // round-trip with the SAME payload. Best-effort + non-gating here (the durable ledger
   // is the settlement guard); on the box, verify/dedup become hard gates.
+  const _inprocAtts = await collectCallAttestations(callId);
   const _evReport = escrowReporter.buildSignedReport({
     ref: callId, subject: callId,
-    facts: { kind: 'call-end', endReason, durationMs, endedAt: now, metered: ratePerHour },
+    facts: { kind: 'call-end', endReason, durationMs, endedAt: now, metered: ratePerHour,
+      ...(_inprocAtts.length ? { attestations: _inprocAtts } : {}) },
     nonce: escrowReporter.settleNonce(callId), createdAt: now,
   });
   const _accept = escrowReporter.acceptReport(_evReport);
   if (_evReport && (!_accept.verified || _accept.replay)) {
     console.warn(`[escrow-report] call ${callId} report verdict: verified=${_accept.verified} fresh=${_accept.fresh} (in-process self-check — proceeding; box would gate)`);
   }
+  if (_inprocAtts.length) console.log(`[attest] ${callId}: ${_inprocAtts.map(a => a.role).join('+')} attestation(s) attached to in-process report (shadow — box mode verifies against on-chain keys)`);
 
   // ── Money flow ──────────────────────────────────────────────────────────────
   // ring fee → platform (non-refundable); connect fee → callee (non-refundable, minus
@@ -3272,7 +3311,11 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
       const fedRows = payRows.map(r => (r.rate_per_hour != null)
         ? { ...r, start_ts: now - (durationMs || 0), platform_fee: PLATFORM_FEE }
         : r);
-      await escrowBoxMode.settleCall({ callId, payRows: fedRows, endReason, now, meta: { callerServer, federated: true } });
+      // Step 6 — attach any locally-collected attestations (the CALLEE is local on this,
+      // the settling, server). The remote caller's attestation needs fed propagation of
+      // callId/startTs — deferred; shadow mode logs it 'absent' until then.
+      const fedAtts = await collectCallAttestations(callId);
+      await escrowBoxMode.settleCall({ callId, payRows: fedRows, endReason, now, attestations: fedAtts, meta: { callerServer, federated: true } });
     }
     delete activePayments[callId];
     return;
@@ -4643,6 +4686,29 @@ io.on('connection', (socket) => {
 
   // ── CALL END (explicit hang-up) ────────────────────────────────────────────
 
+  // ── Step 6 — call attestations (shadow mode) ───────────────────────────────
+  // Each party signs its OWN view of {callId, role, account, startTs, endTs} with its
+  // Hive POSTING key (the client's existing signRaw scheme) and sends it here at
+  // hang-up. The node only does LIGHT validation (identity + shape) and holds them
+  // briefly; the BOX does the real verification against on-chain posting keys —
+  // attestations are trust-bearing end-to-end, the node is just the courier. Absent /
+  // late attestations are fine (shadow mode logs 'absent').
+  socket.on('call-attest', (att) => {
+    const username = socket._username;
+    if (!username || !att || !att.callId || !att.sig) return;
+    if (att.role !== 'caller' && att.role !== 'callee') return;
+    if (String(att.account || '').toLowerCase() !== username.toLowerCase()) return; // can only attest as yourself
+    const cur = callAttestations.get(String(att.callId)) || {};
+    if (cur[att.role]) return; // first attestation per role wins
+    cur[att.role] = {
+      callId: String(att.callId), role: att.role, account: username.toLowerCase(),
+      startTs: Number(att.startTs) || 0, endTs: Number(att.endTs) || 0, sig: String(att.sig),
+    };
+    cur._ts = Date.now();
+    callAttestations.set(String(att.callId), cur);
+    console.log(`[attest] ${att.role} attestation received for ${att.callId} (@${username})`);
+  });
+
   socket.on('call-end', async ({ callId }) => {
     const username = socket._username;
     const room     = socket._room;
@@ -4949,10 +5015,13 @@ io.on('connection', (socket) => {
     if (room._callTimer) { clearTimeout(room._callTimer); delete room._callTimer; }
 
     if (accepted) {
-      const callerSid = lobbyUsers[caller]?.socketId;
-      if (callerSid) io.to(callerSid).emit('call-accepted', { callee, roomName });
-      socket.emit('call-accepted', { caller, roomName });
       const now = Date.now();
+      const callerSid = lobbyUsers[caller]?.socketId;
+      // callId + the SERVER-authoritative start ride to BOTH parties so each can sign a
+      // Step-6 call attestation over the same start the settlement meters from. (The
+      // callee previously never learned callId at all.)
+      if (callerSid) io.to(callerSid).emit('call-accepted', { callee, roomName, callId: room.callId, startTs: now });
+      socket.emit('call-accepted', { caller, roomName, callId: room.callId, startTs: now });
       if (activePayments[room.callId]) activePayments[room.callId].startTime = now;
       recordEscrowStartTs(room.callId, now);   // durable row is the settlement authority
       ledgerCallUpdate(room.callId, { connected_at: new Date(now).toISOString(), status: 'connected' });
