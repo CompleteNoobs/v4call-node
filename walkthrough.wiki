@@ -191,8 +191,8 @@ The first install compiles <code>better-sqlite3</code> — this is why you insta
 
 '''Quick confidence check — run the test suites''' (fully offline, no keys or network needed):
 
- cd /opt/v4call/escrow-core && npm test     # escrow-core money engine — expect 72 passing
- cd /opt/v4call/v4call-node && npm test     # node's escrow integration — expect 43 passing
+ cd /opt/v4call/escrow-core && npm test     # escrow-core money engine — expect 80 passing
+ cd /opt/v4call/v4call-node && npm test     # node's escrow integration — expect 55 passing
 
 Green tests here mean the money engine and its wiring into the node are sound before you ever touch a real key.
 
@@ -784,7 +784,7 @@ Confirm <code>V4CALL_SERVER_JSON_PATH</code> points at your uploaded signed file
 ;Escrow balance
 : <code>curl -H "Authorization: Bearer KEY" https://node.yourdomain.com/admin/balance</code>
 ;Run the money-engine tests
-: <code>cd /opt/v4call/escrow-core && npm test</code> (72) · <code>cd /opt/v4call/v4call-node && npm test</code> (43)
+: <code>cd /opt/v4call/escrow-core && npm test</code> (80) · <code>cd /opt/v4call/v4call-node && npm test</code> (55)
 ;The split, in one line
 : '''v4call-app''' = screens · '''v4call-node''' = brain (this repo, holds the key for now) · '''escrow-core''' = money library (in-process today, own box later) · '''nGate''' = federation bouncer (unchanged).
 ;Source of truth
