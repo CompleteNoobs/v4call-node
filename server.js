@@ -312,6 +312,33 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_calls_callee   ON calls(callee);
   CREATE INDEX IF NOT EXISTS idx_calls_call_id  ON calls(call_id);
   CREATE INDEX IF NOT EXISTS idx_payments_call_id ON payments(call_id);
+
+  -- v0.17 Part C — durable paid-expert receipts (brief Q8: extend v4call-ledger.db).
+  -- One row per settled session OR refunded offer, written at settlement/refund time
+  -- and upgraded by completion receipts. seen_* flags drive the "while you were away"
+  -- summary on login (mirrors the missed-calls popup pattern); cleared on client ack.
+  CREATE TABLE IF NOT EXISTS expert_receipts (
+    offer_id      TEXT    PRIMARY KEY,
+    kind          TEXT    NOT NULL DEFAULT 'session',   -- 'session' | 'offer_refund'
+    room          TEXT,
+    inviter       TEXT    NOT NULL,
+    expert        TEXT    NOT NULL,
+    currency      TEXT    NOT NULL DEFAULT 'HBD',
+    connect_paid  REAL    DEFAULT 0,
+    duration_min  REAL    DEFAULT 0,
+    duration_cost REAL    DEFAULT 0,
+    payout_net    REAL    DEFAULT 0,       -- expert's net earnings (0 for offer_refund)
+    refund        REAL    DEFAULT 0,       -- back to the inviter
+    fee           REAL    DEFAULT 0,       -- platform cut
+    status        TEXT    NOT NULL DEFAULT 'settled',   -- 'settled' | 'pending' | 'failed' | 'refunded'
+    end_reason    TEXT,
+    disburse_tx   TEXT,
+    settled_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    seen_inviter  INTEGER NOT NULL DEFAULT 0,
+    seen_expert   INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_xr_inviter ON expert_receipts(inviter, seen_inviter);
+  CREATE INDEX IF NOT EXISTS idx_xr_expert  ON expert_receipts(expert, seen_expert);
 `);
 
 console.log('[ledger] SQLite ready:', path.join(LOG_DIR, 'v4call-ledger.db'));
@@ -423,6 +450,9 @@ if (ESCROW_MODE === 'box') {
         const sid = lobbyUsers[meta.notify.username]?.socketId;
         if (sid && (ok || meta.notify.always)) io.to(sid).emit(meta.notify.event, meta.notify.payload);
       }
+      // v0.17 Part C — an offer refund settling via the box updates its durable receipt
+      // ('refunded' reads truer than 'settled' for a session that never happened).
+      if (String(ref).startsWith('xo_')) expertReceiptUpgrade(ref, ok ? 'refunded' : receipt.status, receipt.disburse_tx || null);
       return;
     }
 
@@ -489,6 +519,19 @@ if (ESCROW_MODE === 'box') {
       const peer = federationPeers[meta.callerServer];
       if (peer?.connected) fedSend(peer.ws, { type: 'call-receipt-fed', callId, receipt: { ...disp, perspective: 'caller' } });
     }
+    // v0.17 Part C — durable receipt for paid-expert sessions (offer refs are 'xo_…').
+    // Survives the ephemeral call-receipt modal: a party who's offline (or closes the
+    // popup) gets a "while you were away" summary on next login.
+    if (String(callId).startsWith('xo_')) {
+      const offer = expertOffers.get(callId);
+      expertReceiptWrite({
+        offer_id: callId, kind: 'session', room: (offer && offer.room) || null,
+        inviter: caller, expert: callee, currency,
+        connect_paid: connectPaid, duration_min: disp.durationMin, duration_cost: disp.durationCost,
+        payout_net: calleeNet, refund: disp.refundAmount, fee: platformTotal,
+        status: receipt.status, end_reason: disp.endReason, disburse_tx: disp.disburseTx,
+      });
+    }
   });
 
   // COMPLETION: a settlement that finalized as 'pending' (transient disburse failure)
@@ -524,6 +567,9 @@ if (ESCROW_MODE === 'box') {
       const sid = u && lobbyUsers[u]?.socketId;
       if (sid) io.to(sid).emit('lobby-info', { text: ok ? msgOk : msgFail });
     }
+    // v0.17 Part C — upgrade the durable expert receipt to the FINAL outcome (and
+    // re-flag it unseen so the login summary shows the completed state).
+    if (String(ref).startsWith('xo_')) expertReceiptUpgrade(ref, receipt.status, receipt.disburse_tx || null);
     console.log(`[escrow-box] ${ok ? '✓' : '✗'} completion for ${ref}: ${receipt.status}`);
   });
 
@@ -1083,6 +1129,60 @@ function ledgerPaymentUpdate(callId, type, status, txId = null) {
   } catch(e) {
     console.error('[ledger] Payment update failed:', e.message);
   }
+}
+
+// ── v0.17 Part C — durable paid-expert receipts ──────────────────────────────
+// Written at settlement (session) / refund (offer never became a session), upgraded
+// by completion receipts, surfaced as a "while you were away" summary on login.
+function expertReceiptWrite(row) {
+  try {
+    db.prepare(`
+      INSERT INTO expert_receipts (offer_id, kind, room, inviter, expert, currency,
+        connect_paid, duration_min, duration_cost, payout_net, refund, fee,
+        status, end_reason, disburse_tx, seen_inviter, seen_expert)
+      VALUES (@offer_id, @kind, @room, @inviter, @expert, @currency,
+        @connect_paid, @duration_min, @duration_cost, @payout_net, @refund, @fee,
+        @status, @end_reason, @disburse_tx, @seen_inviter, @seen_expert)
+      ON CONFLICT(offer_id) DO UPDATE SET
+        status = excluded.status, disburse_tx = COALESCE(excluded.disburse_tx, disburse_tx),
+        payout_net = excluded.payout_net, refund = excluded.refund, fee = excluded.fee,
+        seen_inviter = 0, seen_expert = MIN(seen_expert, excluded.seen_expert)
+    `).run({
+      kind: 'session', room: null, connect_paid: 0, duration_min: 0, duration_cost: 0,
+      payout_net: 0, refund: 0, fee: 0, status: 'settled', end_reason: null,
+      disburse_tx: null, seen_inviter: 0, seen_expert: 0, ...row,
+    });
+  } catch (e) { console.error('[expert-receipt] write failed:', e.message); }
+}
+function expertReceiptUpgrade(offerId, status, disburseTx) {
+  try {
+    // A status change (pending→settled/failed) re-flags both parties unseen so the
+    // login summary reflects the FINAL outcome even if they saw the pending one.
+    db.prepare(`
+      UPDATE expert_receipts SET status = ?, disburse_tx = COALESCE(?, disburse_tx),
+        seen_inviter = 0, seen_expert = 0
+      WHERE offer_id = ? AND status != ?
+    `).run(status, disburseTx, offerId, status);
+  } catch (e) { console.error('[expert-receipt] upgrade failed:', e.message); }
+}
+function expertReceiptsUnseen(username, limit = 12) {
+  try {
+    return db.prepare(`
+      SELECT * FROM expert_receipts
+      WHERE (inviter = @u AND seen_inviter = 0) OR (expert = @u AND seen_expert = 0)
+      ORDER BY settled_at DESC LIMIT @limit
+    `).all({ u: username, limit });
+  } catch (e) { console.error('[expert-receipt] unseen query failed:', e.message); return []; }
+}
+function expertReceiptsMarkSeen(username, offerIds) {
+  try {
+    const mk = db.prepare(`
+      UPDATE expert_receipts SET
+        seen_inviter = CASE WHEN inviter = @u THEN 1 ELSE seen_inviter END,
+        seen_expert  = CASE WHEN expert  = @u THEN 1 ELSE seen_expert  END
+      WHERE offer_id = @id`);
+    for (const id of offerIds) mk.run({ u: username, id: String(id) });
+  } catch (e) { console.error('[expert-receipt] markSeen failed:', e.message); }
 }
 
 
@@ -3803,6 +3903,14 @@ io.on('connection', (socket) => {
       socket.emit('missed-calls-summary', { calls: missedCalls });
     }
 
+    // ── v0.17 Part C — paid-expert receipts this user hasn't seen yet ────────
+    // (settled/refunded while they were offline, or the popup was missed). The
+    // client shows a summary modal and acks with expert-receipts-seen.
+    const xReceipts = expertReceiptsUnseen(username);
+    if (xReceipts.length > 0) {
+      socket.emit('expert-receipts-summary', { receipts: xReceipts });
+    }
+
     // ── v0.16.17 — Pending paid-invite re-delivery ─────────────────────────
     // If someone paid to invite this user while they were offline, the original
     // `room-invite` socket emit never reached them. Without re-delivery, the
@@ -5755,6 +5863,14 @@ io.on('connection', (socket) => {
       if (inv) io.to(inv.socketId).emit('lobby-info', { text: `✗ 💎 @${o.expert} declined your offer to #${o.room}. Refund in flight.` });
       console.log(`[expert-offer] ✗ ${o.offerId} declined by @${expert}`);
     }
+  });
+
+  // v0.17 Part C — the client dismissed the receipts summary; mark those rows seen
+  // for THIS user's role(s) so they aren't re-shown on the next login.
+  socket.on('expert-receipts-seen', ({ offerIds }) => {
+    const user = socket._username;
+    if (!user || !Array.isArray(offerIds) || offerIds.length === 0) return;
+    expertReceiptsMarkSeen(user, offerIds.slice(0, 50));
   });
 
   socket.on('allowlist-remove', ({ room, username: targetUser }) => {
@@ -8103,6 +8219,15 @@ async function refundExpertOffer(offer, why) {
   const refundMemo = `v4call:offer-refund:${offer.offerId}`;
   const text = `↩️ 💎 Offer to @${offer.expert} (#${offer.room}) — ${String(why).replace(/_/g, ' ')}. ` +
                `Refunded ${offer.cap} ${offer.currency}.`;
+  // v0.17 Part C — durable receipt for the inviter (offer never became a session).
+  // The expert is pre-marked seen: a declined/expired offer isn't their receipt.
+  // Box mode upgrades status via the settlement/completion receipts (same offer_id ref).
+  expertReceiptWrite({
+    offer_id: offer.offerId, kind: 'offer_refund', room: offer.room,
+    inviter: offer.inviter, expert: offer.expert, currency: offer.currency,
+    refund: offer.cap, status: escrowBoxMode ? 'pending' : 'refunded',
+    end_reason: String(why), seen_expert: 1,
+  });
 
   if (escrowBoxMode) {
     ledgerPayment(offer.offerId, 'offer_refund', ESCROW_ACCOUNT, offer.inviter, offer.cap, refundMemo, 'pending', null, offer.currency);
@@ -8432,7 +8557,13 @@ server.listen(PORT, BIND_HOST, () => {
   const adminKey  = process.env.ADMIN_KEY;
 
   if (!escrowKey) {
-    console.error('⚠️  WARNING: V4CALL_ESCROW_KEY not set — escrow payouts will not work!');
+    // In box mode the node is KEYLESS BY DESIGN (the escrow box holds the only money
+    // key) — a scary "payouts will not work" warning here is wrong and misleading.
+    if (ESCROW_MODE === 'box') {
+      console.log('✓ Keyless node (ESCROW_MODE=box) — settlements disburse on the escrow box, as designed.');
+    } else {
+      console.error('⚠️  WARNING: V4CALL_ESCROW_KEY not set — escrow payouts will not work!');
+    }
   } else {
     try {
       const key    = dhive.PrivateKey.fromString(escrowKey);
