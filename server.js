@@ -434,18 +434,39 @@ if (ESCROW_MODE === 'box') {
     const callee = cf.callee || null;
     const currency = receipt.currency || (facts && facts.currency) || 'HBD';
     const durationMin = Math.min(((facts && facts.durationMs) || 0) / 60000, MAX_CALL_DURATION_MIN);
+    // Re-derive the money breakdown from the reported facts + the box's settlement
+    // numbers so the client receipt shows real figures (the lean box receipt only
+    // carries settlement/refund/status; calleeNet/platformTotal live in the split).
+    const prec = await getCurrencyPrecision(currency);
+    const rnd  = (n) => parseFloat(Number(n || 0).toFixed(prec));
+    const connectPaid   = Number(cf.connectPaid) || 0;
+    const ringPaid      = Number(cf.ringPaid) || 0;
+    const platformFee   = (cf.platformFee != null) ? Number(cf.platformFee) : PLATFORM_FEE;
+    const depositPaid   = pays.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const durationCost  = Number(receipt.settlement) || 0;
+    const calleeGross   = rnd(connectPaid + durationCost);
+    const platformOnCall= rnd(calleeGross * platformFee);
+    const calleeNet     = rnd(calleeGross - platformOnCall);
+    const platformTotal = rnd(ringPaid + platformOnCall);
+    const settledOk     = receipt.status === 'settled';
     const disp = {
       callId, caller, callee, currency,
+      startTime:    cf.startTs ? new Date(Number(cf.startTs)).toISOString() : '',
       endTime:      new Date(receipt.created_at || Date.now()).toISOString(),
       durationMin:  parseFloat(durationMin.toFixed(2)),
-      durationCost: receipt.settlement,
-      refundAmount: receipt.refund,
+      ringPaid, connectPaid, depositPaid,
+      durationCost: rnd(durationCost),
+      refundAmount: rnd(receipt.refund),
+      calleeNet, platformTotal, platformOnCall, precision: prec,
       disburseTx:   receipt.disburse_tx || null,
-      status:       receipt.status,
+      status:       receipt.status,             // 'settled' | 'pending' | 'failed'
+      settleFailed: !settledOk,                 // client shows a clear held-funds banner
+      settleReason: receipt.reason || null,
       endReason:    facts && facts.endReason,
       federated:    !!(meta && meta.federated),
       mode: 'box',
     };
+    if (!settledOk) console.error(`[escrow-box] ⚠ call ${callId} settlement status=${receipt.status}${receipt.reason ? ' ('+receipt.reason+')' : ''} — funds NOT disbursed; held in escrow.`);
     try {
       ledgerCallUpdate(callId, {
         ended_at:      new Date().toISOString(),
@@ -8103,6 +8124,12 @@ function settleExpertOnExit(r, roomName, member, reason) {
     if (!claimed) return;   // a racing exit trigger already claimed it
     clearExpertTimers(offer.offerId);       // cancel any grace/cap timer for this session
     r.paidInvitees.delete(member.username);
+    // Freeze both tickers immediately — settlement is async (box round-trip), so
+    // without this the admin's spend ticker keeps climbing until the receipt lands.
+    const endingInv = lobbyUsers[offer.inviter];
+    if (endingInv) io.to(endingInv.socketId).emit('expert-session-ending', { offerId: offer.offerId, room: roomName, expert: offer.expert, reason });
+    const endingExp = lobbyUsers[offer.expert];
+    if (endingExp) io.to(endingExp.socketId).emit('expert-session-ending', { offerId: offer.offerId, room: roomName, expert: offer.expert, reason, perspective: 'expert' });
     if (!activePayments[offer.offerId]) {
       // Node restarted mid-session: the live-cache entry is gone (same limitation as
       // 1:1 calls — "settlement state persistence" is a post-v0.17 backlog item).
