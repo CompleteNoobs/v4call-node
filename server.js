@@ -479,10 +479,10 @@ if (ESCROW_MODE === 'box') {
     const totalPaid     = pays.reduce((s, p) => s + (Number(p.amount) || 0), 0);
     const depositPaid   = Math.max(0, rnd(totalPaid - connectPaid - ringPaid));
     const durationCost  = Number(receipt.settlement) || 0;
-    const calleeGross   = rnd(connectPaid + durationCost);
+    const calleeGross   = rnd(ringPaid + connectPaid + durationCost);
     const platformOnCall= rnd(calleeGross * platformFee);
     const calleeNet     = rnd(calleeGross - platformOnCall);
-    const platformTotal = rnd(ringPaid + platformOnCall);
+    const platformTotal = platformOnCall;
     const settledOk     = receipt.status === 'settled';
     const disp = {
       callId, caller, callee, currency,
@@ -3137,8 +3137,10 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
   if (_inprocAtts.length) console.log(`[attest] ${callId}: ${_inprocAtts.map(a => a.role).join('+')} attestation(s) attached to in-process report (shadow — box mode verifies against on-chain keys)`);
 
   // ── Money flow ──────────────────────────────────────────────────────────────
-  // ring fee → platform (non-refundable); connect fee → callee (non-refundable, minus
-  // platform %); deposit → duration cost to callee, unused portion refunded to caller.
+  // ring + connect fees → callee (non-refundable — the ring fee is the CALLEE's
+  // anti-spam fee, OWNER decision 2026-07-07); deposit → duration cost to callee,
+  // unused portion refunded to caller; platform takes platformFee % of the whole
+  // callee gross (ring + connect + duration).
   // The cap (durationCost = min(metered usage, deposit), refund = the rest) is the
   // money-safety invariant — computed by escrow-core.settle, never inline.
   const meteredUsage = escrowAdapter.meteredUsage(
@@ -3149,10 +3151,10 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     deposit: depositPaid, meteredUsage, currency, places: prec, dustFloor: floor
   });
 
-  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
+  const calleeGross    = parseFloat((ringPaid + connectPaid + durationCost).toFixed(prec));
   const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
   const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
-  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(prec));
+  const platformTotal  = platformOnCall;
 
   // Sanity check
   const totalIn  = ringPaid + connectPaid + depositPaid;
@@ -3164,7 +3166,7 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
 
   console.log(`[billing] Call ${callId} ended (${endReason})`);
   console.log(`[billing]   Duration:   ${durationMin.toFixed(2)} min`);
-  console.log(`[billing]   Ring:       ${ringPaid} ${currency} → platform`);
+  console.log(`[billing]   Ring:       ${ringPaid} ${currency} → callee`);
   console.log(`[billing]   Connect:    ${connectPaid} ${currency} → callee`);
   console.log(`[billing]   Duration $: ${durationCost} ${currency} → callee`);
   console.log(`[billing]   Refund:     ${refundAmount} ${currency} → caller`);
@@ -3236,9 +3238,9 @@ async function processCallEnd(callId, roomName, io, lobbyUsers, endReason = 'unk
     }
   }
 
-  // 3. Platform fee (ring fee + % cut)
+  // 3. Platform fee (% of callee gross)
   if (platformTotal >= floor) {
-    const feeMemo   = `v4call:fee:${callId}:ring+cut`;
+    const feeMemo   = `v4call:fee:${callId}:cut`;
     const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: SERVER_HIVE_ACCOUNT, amount: platformTotal, currency, memo: feeMemo, reason: 'platform_fee' });
     ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending', null, currency);
     const feeResult = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
@@ -3373,10 +3375,10 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
     deposit: depositPaid, meteredUsage, currency, places: prec, dustFloor: floor
   });
 
-  const calleeGross    = parseFloat((connectPaid + durationCost).toFixed(prec));
+  const calleeGross    = parseFloat((ringPaid + connectPaid + durationCost).toFixed(prec));
   const platformOnCall = parseFloat((calleeGross * platformFee).toFixed(prec));
   const calleeNet      = parseFloat((calleeGross - platformOnCall).toFixed(prec));
-  const platformTotal  = parseFloat((ringPaid + platformOnCall).toFixed(prec));
+  const platformTotal  = platformOnCall;
 
   console.log(`[fed-billing] Call ${callId} ended (${endReason}) — disbursing`);
   console.log(`[fed-billing]   Duration:   ${durationMin.toFixed(2)} min`);
@@ -3434,9 +3436,9 @@ async function processFederatedCallEnd(callId, durationMs, endReason, callerServ
     if (!r.success) console.error(`[fed-billing] Refund FAILED to @${caller}: ${r.reason}`);
   }
 
-  // 3. Platform fee to us
+  // 3. Platform fee to us (% of callee gross)
   if (platformTotal >= floor) {
-    const feeMemo = `v4call:fee:${callId}:ring+cut`;
+    const feeMemo = `v4call:fee:${callId}:cut`;
     const { refund_id } = escrowLedger.recordRefund({ ref: callId, to_account: SERVER_HIVE_ACCOUNT, amount: platformTotal, currency, memo: feeMemo, reason: 'platform_fee' });
     ledgerPayment(callId, 'platform_fee', ESCROW_ACCOUNT, SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, 'pending', null, currency);
     const r = await sendFromEscrow(SERVER_HIVE_ACCOUNT, platformTotal, feeMemo, currency, callId);
