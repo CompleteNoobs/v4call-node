@@ -2333,13 +2333,34 @@ function ratesDefineTiers(rates) {
   return !!rates && ((rates.tokens || []).length > 0 || (rates.lists || []).length > 0);
 }
 
+// Rate-bearing fields of a parsed window/section (deposit minimums are not fees).
+const RATE_FIELDS = ['invite', 'offer', 'text', 'voiceRing', 'voiceConnect', 'voiceRate',
+                     'videoRing', 'videoConnect', 'videoRate'];
+function windowHasAnyRate(w) {
+  return RATE_FIELDS.some(k => Number(w && w[k]) > 0);
+}
+
+// The announce generator ALWAYS appends [LIST:default] (mon-sun 00:00-23:59) with
+// zeros unless the user priced it — so an ALL-ZERO default window is boilerplate,
+// not "free for everyone". It only grants free access when it is the ONLY thing
+// the announce defines; next to token sections / named lists it is vestigial and
+// skipped, so unmatched callers fall through to the no-tier denial instead of
+// walking in free past every posted fee (guest33/completenewbie, 2026-07-08).
+function defaultWindowGrantsAccess(rates, win) {
+  if (windowHasAnyRate(win)) return true;   // user actually priced it → a real tier
+  const named = (rates.lists || []).some(l => l.name !== 'default');
+  return !((rates.tokens || []).length > 0 || named);
+}
+
 function noTierMessage(rates) {
   const who  = rates.account ? `@${rates.account}` : 'This user';
   const ways = [];
   const toks = (rates.tokens || []).map(t => t.symbol);
   if (toks.length) ways.push(`hold ${toks.join(' or ')}`);
   if ((rates.lists || []).some(l => l.name !== 'default')) ways.push('be on one of their contact lists');
-  if ((rates.lists || []).some(l => l.name === 'default')) ways.push('contact them within their posted hours');
+  if ((rates.lists || []).some(l => l.name === 'default' && (l.windows || []).some(windowHasAnyRate)))
+    ways.push('contact them within their posted hours');
+  if (!ways.length) ways.push('be listed in their user-announce');
   return `${who} only accepts contact matching their posted rates — you'd need to ${ways.join(', or ')}. You currently match none of their tiers.`;
 }
 
@@ -2431,12 +2452,14 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
   }
 
   // ── Step 4: Default list ───────────────────────────────────────────────────
+  // An all-zero default window next to real tiers is generator boilerplate and
+  // grants nothing (defaultWindowGrantsAccess) — fall through to Step 5 instead.
   const defList = (calleeRates.lists || []).find(l => l.name === 'default');
   if (defList) {
     const win = defList.windows.find(w =>
       w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
     );
-    if (win) {
+    if (win && defaultWindowGrantsAccess(calleeRates, win)) {
       const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
       if (await isOptionBelowFloor(result)) {
         console.log(`[rates] @${caller} HBD rate from default list below floor (${RATE_FLOOR}) — treating as free`);
@@ -2575,7 +2598,9 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
       const win = defList.windows.find(w =>
         w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
       );
-      if (win) {
+      // Same rule as getRatesForCaller Step 4: an all-zero default window next
+      // to real tiers is boilerplate and yields no option (→ noTier below).
+      if (win && defaultWindowGrantsAccess(rates, win)) {
         hbdOption = { currency: 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
       }
     }
