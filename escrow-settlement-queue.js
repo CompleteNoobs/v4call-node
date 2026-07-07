@@ -66,6 +66,12 @@ function createSettlementQueue({ db, log = () => {} }) {
       const info = _markFailed.run(JSON.stringify(receipt), ref);
       return info.changes > 0;
     },
+    // Replace the stored receipt on an ALREADY-terminal row (a box COMPLETION receipt:
+    // the original said 'pending', the retry later finished the payouts). Display/audit
+    // only — no status transition, no re-finalize.
+    updateReceipt(ref, receipt) {
+      db.prepare(`UPDATE pending_reports SET receipt_json = ? WHERE ref = ?`).run(JSON.stringify(receipt), ref);
+    },
   };
 }
 

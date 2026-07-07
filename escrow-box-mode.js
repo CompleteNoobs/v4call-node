@@ -31,6 +31,7 @@ function createEscrowBoxMode({
   const box = String(boxPubkey).toLowerCase();
   let client = null;
   let onSettledHandler = async () => {};
+  let onCompletedHandler = async () => {};
 
   const L = {
     info: (m) => log.log && log.log(`[escrow-box] ${m}`),
@@ -42,6 +43,12 @@ function createEscrowBoxMode({
    *  (ref, { facts, receipt, meta }) — server.js emits the client receipt, updates the legacy
    *  ledger, and (federated) sends the caller's receipt back to their server. */
   function onSettled(fn) { onSettledHandler = fn; }
+
+  /** Register the COMPLETION handler: a finalized-as-pending settlement whose payouts
+   *  later landed via the box's recovery retry (or flipped to failed). Called EXACTLY
+   *  once per pending→settled/failed transition with (ref, { facts, receipt, meta }) —
+   *  server.js notifies both parties + upgrades the legacy ledger rows. */
+  function onCompleted(fn) { onCompletedHandler = fn; }
 
   // Lazily create the transport. Returns the client, or null if the reporting key isn't readable
   // yet (the node's NOSTR identity, written by nostr-fed at boot) — settlements stay durably
@@ -90,7 +97,23 @@ function createEscrowBoxMode({
       } else {
         L.info(`settled ${ref} via box: settlement=${receipt.settlement} refund=${receipt.refund} status=${receipt.status}`);
       }
-    } // else: already settled/failed (a duplicate receipt) — no-op
+    } else {
+      // Row already terminal. If the STORED receipt said 'pending' and this one is a
+      // definitive settled/failed, it's the box's COMPLETION receipt — the recovery
+      // retry finished the payouts (or gave up). Fire onCompleted EXACTLY once for the
+      // pending→terminal transition; duplicates (stored no longer pending) are no-ops.
+      let stored = null;
+      try { stored = row.receipt_json ? JSON.parse(row.receipt_json) : null; } catch {}
+      if (stored && stored.status === 'pending' && (receipt.status === 'settled' || receipt.status === 'failed')) {
+        queue.updateReceipt(ref, receipt);
+        let facts = {}, meta = null;
+        try { facts = JSON.parse(row.facts_json); } catch {}
+        try { meta = row.meta_json ? JSON.parse(row.meta_json) : null; } catch {}
+        try { await onCompletedHandler(ref, { facts, receipt, meta }); }
+        catch (e) { L.error(`onCompleted ${ref} threw: ${e.message}`); }
+        L.info(`${ref} settlement COMPLETED (was pending): status=${receipt.status}`);
+      } // else: plain duplicate receipt — no-op
+    }
   }
 
   // Sign (fresh, under the stable nonce) and publish one pending row. Stays pending on any failure
@@ -168,7 +191,7 @@ function createEscrowBoxMode({
     if (t && typeof t.unref === 'function') t.unref();
   }
 
-  return { start, settleCall, settlePayment, onSettled, drainOnce, _handleReceipt: handleReceipt };
+  return { start, settleCall, settlePayment, onSettled, onCompleted, drainOnce, _handleReceipt: handleReceipt };
 }
 
 module.exports = { createEscrowBoxMode };

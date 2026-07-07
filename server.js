@@ -442,7 +442,12 @@ if (ESCROW_MODE === 'box') {
     const connectPaid   = Number(cf.connectPaid) || 0;
     const ringPaid      = Number(cf.ringPaid) || 0;
     const platformFee   = (cf.platformFee != null) ? Number(cf.platformFee) : PLATFORM_FEE;
-    const depositPaid   = pays.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    // The on-chain transfer bundles ring+connect+deposit; the DISPLAY deposit is the
+    // metered (refundable) portion only — total minus the non-refundable fees. Without
+    // this subtraction the receipt double-counts connect (shown on its own line too)
+    // and inflates "Net cost to you".
+    const totalPaid     = pays.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const depositPaid   = Math.max(0, rnd(totalPaid - connectPaid - ringPaid));
     const durationCost  = Number(receipt.settlement) || 0;
     const calleeGross   = rnd(connectPaid + durationCost);
     const platformOnCall= rnd(calleeGross * platformFee);
@@ -484,6 +489,42 @@ if (ESCROW_MODE === 'box') {
       const peer = federationPeers[meta.callerServer];
       if (peer?.connected) fedSend(peer.ws, { type: 'call-receipt-fed', callId, receipt: { ...disp, perspective: 'caller' } });
     }
+  });
+
+  // COMPLETION: a settlement that finalized as 'pending' (transient disburse failure)
+  // whose payouts later landed via the box's recovery retry — or definitively failed.
+  // Tell the humans (the original receipt said "funds held"; this is the follow-up
+  // the 2026-07-07 live test showed was missing) + upgrade the legacy ledger rows.
+  escrowBoxMode.onCompleted(async (ref, { facts, receipt, meta }) => {
+    const ok = receipt.status === 'settled';
+    const rowStat = ok ? 'sent' : 'failed';
+    try {
+      if (meta && meta.kind === 'payout_fee') {
+        if (meta.payoutType) ledgerPaymentUpdate(ref, meta.payoutType, rowStat, receipt.disburse_tx || null);
+        if (meta.feeType)    ledgerPaymentUpdate(ref, meta.feeType,    rowStat, null);
+      } else if (meta && meta.kind === 'refund') {
+        if (meta.refundType) ledgerPaymentUpdate(ref, meta.refundType, rowStat, receipt.disburse_tx || null);
+      }
+    } catch (e) { console.warn(`[escrow-box] completion ledger update ${ref} failed: ${e.message}`); }
+    // The deferred success notify (e.g. text-payment-received) that onSettled skipped
+    // while the settlement was still pending — fire it now the money actually moved.
+    if (ok && meta && meta.notify) {
+      const sid = lobbyUsers[meta.notify.username]?.socketId;
+      if (sid) io.to(sid).emit(meta.notify.event, meta.notify.payload);
+    }
+    // Call-shaped settlements (1:1 + paid expert): tell both parties in plain words.
+    const cf = (facts && facts.callFacts) || {};
+    const pays = (facts && Array.isArray(facts.payments)) ? facts.payments : [];
+    const caller = (pays[0] && pays[0].sender) || null;
+    const callee = cf.callee || null;
+    const cur = receipt.currency || (facts && facts.currency) || 'HBD';
+    const msgOk   = `✓ Settlement for ${ref} completed — payout ${receipt.settlement} ${cur} delivered${receipt.disburse_tx ? ` (tx ${String(receipt.disburse_tx).slice(0, 8)}…)` : ''}.`;
+    const msgFail = `⚠ Settlement for ${ref} could NOT complete — funds remain in escrow; the operator must settle manually.`;
+    for (const u of [caller, callee]) {
+      const sid = u && lobbyUsers[u]?.socketId;
+      if (sid) io.to(sid).emit('lobby-info', { text: ok ? msgOk : msgFail });
+    }
+    console.log(`[escrow-box] ${ok ? '✓' : '✗'} completion for ${ref}: ${receipt.status}`);
   });
 
   escrowBoxMode.start().catch(e => console.error('[escrow] box mode start failed (settlements will queue + retry):', e.message));

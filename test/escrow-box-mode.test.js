@@ -211,3 +211,39 @@ test('5 — a status:failed receipt (terminal box rejection) parks the row as fa
     assert.equal(h.settledCalls.length, 1, 'duplicate failed receipt does not re-finalize');
   } finally { h.cleanup(); }
 });
+
+test('6 — a COMPLETION receipt (pending→settled) fires onCompleted exactly once, updates the stored receipt', async () => {
+  // The box first answers 'pending' (transient disburse failure), then — after its
+  // recovery retry lands the payouts — publishes a refreshed 'settled' receipt.
+  const h = harness({ onReport: (signed) => escrowCore.buildSettlementReceipt({
+    ref: signed.ref, settlement: 1.0, refund: 1.0, dust: 0, currency: 'HBD',
+    disburseTx: null, status: 'pending', createdAt: NOW }) });
+  const completions = [];
+  h.boxMode.onCompleted((ref, ctx) => { completions.push({ ref, status: ctx.receipt.status, meta: ctx.meta }); });
+  try {
+    const payRows = recordCombinedCall(h, 'cG');
+    await h.boxMode.settleCall({ callId: 'cG', payRows, endReason: 'hangup', now: NOW, meta: { note: 'ctx' } });
+
+    // finalized once as pending; row terminal with the pending receipt stored
+    assert.equal(h.settledCalls.length, 1);
+    assert.equal(h.settledCalls[0].receipt.status, 'pending');
+    assert.equal(h.queue.get('cG').status, 'settled');
+    assert.equal(completions.length, 0, 'no completion yet');
+
+    // box's recovery finished → refreshed receipt arrives
+    const doneReceipt = escrowCore.buildSettlementReceipt({
+      ref: 'cG', settlement: 1.0, refund: 1.0, dust: 0, currency: 'HBD',
+      disburseTx: 'boxtx_done', status: 'settled', createdAt: NOW + 60000 });
+    await h.deliverReceipt(escrowCore.signReport(doneReceipt, h.boxSk));
+
+    assert.equal(completions.length, 1, 'onCompleted fired once');
+    assert.equal(completions[0].status, 'settled');
+    assert.equal(completions[0].meta.note, 'ctx', 'finalize context is passed through');
+    assert.equal(h.settledCalls.length, 1, 'onSettled NOT re-fired (no double finalize)');
+    assert.equal(JSON.parse(h.queue.get('cG').receipt_json).status, 'settled', 'stored receipt upgraded');
+
+    // duplicates of either receipt are no-ops now
+    await h.deliverReceipt(escrowCore.signReport(doneReceipt, h.boxSk));
+    assert.equal(completions.length, 1, 'duplicate completion receipt does not re-fire');
+  } finally { h.cleanup(); }
+});
