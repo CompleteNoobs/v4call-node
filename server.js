@@ -5410,6 +5410,10 @@ io.on('connection', (socket) => {
       const need = r.tokenGate
         ? `allowlist or ${r.tokenGate.amount} ${r.tokenGate.symbol}`
         : 'allowlist';
+      // Log the exact canonical identity we matched against — allowlist
+      // mismatches (e.g. a client claiming its app domain instead of its node
+      // domain as homeServer) are otherwise invisible server-side.
+      console.log(`[join] rejected ${canonicalUser}${isFed ? ` (fed, homeServer=${fedHome})` : ''} from #${room} — not on allowlist (${r.allowlist.size} entries), needs ${need}`);
       socket.emit('join-rejected', { room, reason: `Not authorised — needs ${need}.` });
       return;
     }
