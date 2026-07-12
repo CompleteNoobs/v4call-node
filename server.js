@@ -2124,6 +2124,12 @@ function parseRates(body) {
       list.users = usersM[1].split(',').map(u => u.trim().toLowerCase()).filter(Boolean);
     }
 
+    // CURRENCY: unit for every rate number in this list (user-announce editor
+    // emits it per list). HBD, HIVE, or any Hive-Engine token symbol.
+    // Absent (all pre-existing posts) = HBD, the historical behaviour.
+    const curM = listBody.match(/^CURRENCY:(.+)$/mi);
+    if (curM) list.currency = curM[1].trim().toUpperCase();
+
     // [DAYS:...][TIME:HH:MM-HH:MM] ... [/TIME] windows within this list
     const timeRegex = /\[DAYS:([^\]]+)\]\[TIME:([^\]]+)\]([\s\S]*?)\[\/TIME\]/gi;
     let timeM;
@@ -2441,10 +2447,11 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
       w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
     );
     if (win) {
-      console.log(`[rates] @${caller} matched list "${list.name}"`);
-      const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      const listCur = list.currency || 'HBD';
+      console.log(`[rates] @${caller} matched list "${list.name}" (${listCur})`);
+      const result = { currency: listCur, ...buildCallRateResult(win, callType, escrow, platformFee) };
       if (await isOptionBelowFloor(result)) {
-        console.log(`[rates] @${caller} HBD rate from list "${list.name}" below floor (${RATE_FLOOR}) — treating as free`);
+        console.log(`[rates] @${caller} ${listCur} rate from list "${list.name}" below floor — treating as free`);
         return null;
       }
       return result;
@@ -2460,9 +2467,10 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
       w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
     );
     if (win && defaultWindowGrantsAccess(calleeRates, win)) {
-      const result = { currency: 'HBD', ...buildCallRateResult(win, callType, escrow, platformFee) };
+      const defCur = defList.currency || 'HBD';
+      const result = { currency: defCur, ...buildCallRateResult(win, callType, escrow, platformFee) };
       if (await isOptionBelowFloor(result)) {
-        console.log(`[rates] @${caller} HBD rate from default list below floor (${RATE_FLOOR}) — treating as free`);
+        console.log(`[rates] @${caller} ${defCur} rate from default list below floor — treating as free`);
         return null;
       }
       return result;
@@ -2499,8 +2507,9 @@ async function isOptionBelowFloor(opt) {
 
 // ── computePaymentOptions ─────────────────────────────────────────────────────
 // Returns ALL the payment options a caller qualifies for (one per accepted
-// currency: any token section where the caller has balance, plus an HBD option
-// if a named/default list window matches). Used by the multi-currency picker
+// currency: any token section where the caller has balance, plus a list option
+// if a named/default list window matches — priced in that list's CURRENCY
+// field, HBD when absent). Used by the multi-currency picker
 // AND by v0.16.6 recipient-side rate enforcement on federation.
 //
 // Why a helper: getRatesForCaller returns a single applicable (first token
@@ -2579,8 +2588,9 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
     }
   }
 
-  // HBD option — first matching named list, else default list
-  let hbdOption = null;
+  // List option — first matching named list, else default list. Priced in the
+  // list's CURRENCY field (HBD when absent — all pre-CURRENCY posts).
+  let listOption = null;
   for (const list of (rates.lists || [])) {
     if (list.name === 'default') continue;
     if (!list.users.includes(caller)) continue;
@@ -2588,11 +2598,11 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
       w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
     );
     if (win) {
-      hbdOption = { currency: 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
+      listOption = { currency: list.currency || 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
       break;
     }
   }
-  if (!hbdOption) {
+  if (!listOption) {
     const defList = (rates.lists || []).find(l => l.name === 'default');
     if (defList) {
       const win = defList.windows.find(w =>
@@ -2601,11 +2611,19 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
       // Same rule as getRatesForCaller Step 4: an all-zero default window next
       // to real tiers is boilerplate and yields no option (→ noTier below).
       if (win && defaultWindowGrantsAccess(rates, win)) {
-        hbdOption = { currency: 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
+        listOption = { currency: defList.currency || 'HBD', listName: 'default', ...buildCallRateResult(win, callType, escrow, platformFee) };
       }
     }
   }
-  if (hbdOption) await pushOrFlag(hbdOption);
+  if (listOption) {
+    // Token-priced list: attach the caller's balance so the picker can show it
+    // (list membership grants the tier regardless of balance — unlike token
+    // sections — but the caller can't pay without holding the token).
+    if (listOption.currency !== 'HBD' && listOption.currency !== 'HIVE') {
+      listOption.balance = await getHiveEngineTokenBalance(caller, listOption.currency);
+    }
+    await pushOrFlag(listOption);
+  }
 
   // No-tier policy: tiers posted, none matched, and nothing was merely
   // below-floor (below-floor = a MATCHED tier priced under the currency's
