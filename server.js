@@ -2099,6 +2099,10 @@ function parseRates(body) {
   // ── [TOKEN:SYMBOL] sections (V2 only) ───────────────────────────────────────
   // Each token section defines rates that apply if the caller holds that token.
   // The first token section where the caller has a balance > 0 wins.
+  // Day-splitter support (2026-07-13): a token section may carry [DAYS][TIME]
+  // windows exactly like lists do. Legacy flat sections (no windows) become one
+  // 24/7 window so the resolvers have a single code path; the flat fields are
+  // kept on the token object for back-compat with any old reader.
   const tokenRegex = /\[TOKEN:([^\]]+)\]([\s\S]*?)\[\/TOKEN\]/gi;
   let tokenMatch;
   while ((tokenMatch = tokenRegex.exec(block)) !== null) {
@@ -2106,7 +2110,14 @@ function parseRates(body) {
     const tBody       = tokenMatch[2];
     const rates       = parseRateBlock(tBody);
     const allowBlocked = /^ALLOW-BLOCKED:\s*yes/mi.test(tBody); // can this token bypass a block?
-    result.tokens.push({ symbol, allowBlocked, ...rates });
+    let windows = parseWindows(tBody);
+    // MODE:quiet = day-splitter section whose bands are ALL quiet (deliberately
+    // unreachable). Without the marker, an empty-window section would fall into
+    // the legacy-flat fallback below and read as a free 24/7 tier.
+    if (!windows.length && !/^MODE:\s*quiet/mi.test(tBody)) {
+      windows = [{ days: parseDays('mon-sun'), timeStart: '00:00', timeEnd: '23:59', explicitFree: false, ...rates }];
+    }
+    result.tokens.push({ symbol, allowBlocked, windows, ...rates });
   }
 
   // ── [LIST:name] sections (V1 and V2) ────────────────────────────────────────
@@ -2131,22 +2142,45 @@ function parseRates(body) {
     if (curM) list.currency = curM[1].trim().toUpperCase();
 
     // [DAYS:...][TIME:HH:MM-HH:MM] ... [/TIME] windows within this list
-    const timeRegex = /\[DAYS:([^\]]+)\]\[TIME:([^\]]+)\]([\s\S]*?)\[\/TIME\]/gi;
-    let timeM;
-    while ((timeM = timeRegex.exec(listBody)) !== null) {
-      const timeParts = timeM[2].trim().split('-');
-      const win = {
-        days:      parseDays(timeM[1].trim()),
-        timeStart: timeParts[0]?.trim() || '00:00',
-        timeEnd:   timeParts[1]?.trim() || '23:59',
-        ...parseRateBlock(timeM[3])
-      };
-      list.windows.push(win);
-    }
+    list.windows = parseWindows(listBody);
     result.lists.push(list);
   }
 
   return result;
+}
+
+// ── parseWindows ──────────────────────────────────────────────────────────────
+// Parses the [DAYS:…][TIME:…]…[/TIME] windows inside a list or token body.
+// A MODE:free line inside a window marks a deliberate FREE band from the
+// day-splitter editor — distinguishable from an all-zero window that may just
+// be generator boilerplate (see defaultWindowGrantsAccess).
+
+function parseWindows(body) {
+  const windows = [];
+  const timeRegex = /\[DAYS:([^\]]+)\]\[TIME:([^\]]+)\]([\s\S]*?)\[\/TIME\]/gi;
+  let timeM;
+  while ((timeM = timeRegex.exec(body)) !== null) {
+    const timeParts = timeM[2].trim().split('-');
+    windows.push({
+      days:         parseDays(timeM[1].trim()),
+      timeStart:    timeParts[0]?.trim() || '00:00',
+      timeEnd:      timeParts[1]?.trim() || '23:59',
+      explicitFree: /^MODE:\s*free/mi.test(timeM[3]),
+      ...parseRateBlock(timeM[3])
+    });
+  }
+  return windows;
+}
+
+// ── matchWindow ───────────────────────────────────────────────────────────────
+// First window covering (dayName, timeStr) — both UTC by protocol — or null.
+// A unit (list or token) whose windows don't cover the current moment simply
+// doesn't match; resolution continues to the next unit ("quiet hours").
+
+function matchWindow(windows, dayName, timeStr) {
+  return (windows || []).find(w =>
+    w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
+  ) || null;
 }
 
 // ── parseRateBlock ────────────────────────────────────────────────────────────
@@ -2354,6 +2388,7 @@ function windowHasAnyRate(w) {
 // walking in free past every posted fee (guest33/completenewbie, 2026-07-08).
 function defaultWindowGrantsAccess(rates, win) {
   if (windowHasAnyRate(win)) return true;   // user actually priced it → a real tier
+  if (win.explicitFree) return true;        // deliberate 🆓 band (MODE:free from the day-splitter)
   const named = (rates.lists || []).some(l => l.name !== 'default');
   return !((rates.tokens || []).length > 0 || named);
 }
@@ -2364,7 +2399,7 @@ function noTierMessage(rates) {
   const toks = (rates.tokens || []).map(t => t.symbol);
   if (toks.length) ways.push(`hold ${toks.join(' or ')}`);
   if ((rates.lists || []).some(l => l.name !== 'default')) ways.push('be on one of their contact lists');
-  if ((rates.lists || []).some(l => l.name === 'default' && (l.windows || []).some(windowHasAnyRate)))
+  if ((rates.lists || []).some(l => l.name === 'default' && (l.windows || []).some(w => windowHasAnyRate(w) || w.explicitFree)))
     ways.push('contact them within their posted hours');
   if (!ways.length) ways.push('be listed in their user-announce');
   return `${who} only accepts contact matching their posted rates — you'd need to ${ways.join(', or ')}. You currently match none of their tiers.`;
@@ -2406,11 +2441,14 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
       if (bal > 0) {
         console.log(`[rates] Block bypass: @${caller} holds ${bypassToken} (bal: ${bal})`);
         bypassed = true;
-        // If bypassed, apply that token's rates directly (skip normal token loop)
+        // If bypassed, apply that token's rates directly (skip normal token loop).
+        // The token's window must cover the current UTC moment — quiet hours on
+        // the bypass token fall through to list matching like any other unit.
         const tokSection = (calleeRates.tokens || []).find(t => t.symbol === bypassToken);
-        if (tokSection) {
+        const bypassWin  = tokSection ? matchWindow(tokSection.windows, dayName, timeStr) : null;
+        if (bypassWin) {
           console.log(`[rates] Applying ${bypassToken} token rates for bypassed @${caller}`);
-          const result = { currency: bypassToken, ...buildCallRateResult(tokSection, callType, escrow, platformFee) };
+          const result = { currency: bypassToken, ...buildCallRateResult(bypassWin, callType, escrow, platformFee) };
           if (await isOptionBelowFloor(result)) {
             console.log(`[rates] @${caller} ${bypassToken} rate below the currency floor — treating as free`);
             return null;
@@ -2427,12 +2465,15 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
   }
 
   // ── Step 2: TOKEN sections ─────────────────────────────────────────────────
-  // First token section where the caller holds a balance > 0 wins.
+  // First token section where a window covers now AND the caller holds a
+  // balance > 0 wins. Window check first — no Hive-Engine call in quiet hours.
   for (const tok of (calleeRates.tokens || [])) {
+    const win = matchWindow(tok.windows, dayName, timeStr);
+    if (!win) continue;   // token's quiet hours — try the next unit
     const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
     if (bal > 0) {
       console.log(`[rates] @${caller} qualifies for ${tok.symbol} token rates (bal: ${bal})`);
-      const result = { currency: tok.symbol, ...buildCallRateResult(tok, callType, escrow, platformFee) };
+      const result = { currency: tok.symbol, ...buildCallRateResult(win, callType, escrow, platformFee) };
       if (await isOptionBelowFloor(result)) {
         console.log(`[rates] @${caller} ${tok.symbol} rate below the currency floor — treating as free`);
         return null;
@@ -2445,9 +2486,7 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
   for (const list of (calleeRates.lists || [])) {
     if (list.name === 'default') continue;
     if (!list.users.includes(caller)) continue;
-    const win = list.windows.find(w =>
-      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-    );
+    const win = matchWindow(list.windows, dayName, timeStr);
     if (win) {
       const listCur = list.currency || 'HBD';
       console.log(`[rates] @${caller} matched list "${list.name}" (${listCur})`);
@@ -2465,9 +2504,7 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
   // grants nothing (defaultWindowGrantsAccess) — fall through to Step 5 instead.
   const defList = (calleeRates.lists || []).find(l => l.name === 'default');
   if (defList) {
-    const win = defList.windows.find(w =>
-      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-    );
+    const win = matchWindow(defList.windows, dayName, timeStr);
     if (win && defaultWindowGrantsAccess(calleeRates, win)) {
       const defCur = defList.currency || 'HBD';
       const result = { currency: defCur, ...buildCallRateResult(win, callType, escrow, platformFee) };
@@ -2582,14 +2619,17 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
     options.push(opt);
   };
 
-  // Token sections — one option per token the caller holds
+  // Token sections — one option per token the caller holds whose windows cover
+  // now (UTC). Window check first — no Hive-Engine call in a token's quiet hours.
   for (const tok of (rates.tokens || [])) {
+    const win = matchWindow(tok.windows, dayName, timeStr);
+    if (!win) continue;
     const bal = await getHiveEngineTokenBalance(caller, tok.symbol);
     if (bal > 0) {
       await pushOrFlag({
         currency: tok.symbol,
         balance:  bal,
-        ...buildCallRateResult(tok, callType, escrow, platformFee)
+        ...buildCallRateResult(win, callType, escrow, platformFee)
       });
     }
   }
@@ -2600,9 +2640,7 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   for (const list of (rates.lists || [])) {
     if (list.name === 'default') continue;
     if (!list.users.includes(caller)) continue;
-    const win = list.windows.find(w =>
-      w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-    );
+    const win = matchWindow(list.windows, dayName, timeStr);
     if (win) {
       listOption = { currency: list.currency || 'HBD', listName: list.name, ...buildCallRateResult(win, callType, escrow, platformFee) };
       break;
@@ -2611,9 +2649,7 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   if (!listOption) {
     const defList = (rates.lists || []).find(l => l.name === 'default');
     if (defList) {
-      const win = defList.windows.find(w =>
-        w.days.includes(dayName) && timeInWindow(timeStr, w.timeStart, w.timeEnd)
-      );
+      const win = matchWindow(defList.windows, dayName, timeStr);
       // Same rule as getRatesForCaller Step 4: an all-zero default window next
       // to real tiers is boilerplate and yields no option (→ noTier below).
       if (win && defaultWindowGrantsAccess(rates, win)) {
