@@ -2374,8 +2374,10 @@ async function getRatesForCaller(calleeRates, callerUsername, callType = 'voice'
   if (!calleeRates) return null;
 
   const caller  = callerUsername.toLowerCase();
-  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
-  const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+  // UTC by protocol — see the matching note in computePaymentOptions: all
+  // federated servers must resolve [DAYS]/[TIME] windows identically.
+  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getUTCDay()];
+  const timeStr = now.getUTCHours().toString().padStart(2,'0') + ':' + now.getUTCMinutes().toString().padStart(2,'0');
   const { escrow } = calleeRates;
 
   // ── Platform fee enforcement ───────────────────────────────────────────────
@@ -2527,8 +2529,12 @@ async function computePaymentOptions(rates, callerUsername, callType, now = new 
   if (!rates) return { options: [], blocked: false, feeRejected: false };
 
   const caller  = callerUsername.toLowerCase();
-  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getDay()];
-  const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+  // Rate-post [DAYS]/[TIME] windows are UTC by protocol. Match with getUTC* —
+  // NOT server-local time — so every federated server resolves the same post
+  // identically regardless of its host timezone (recipient-side re-validation
+  // would otherwise reject payments a differently-zoned caller server approved).
+  const dayName = ['sun','mon','tue','wed','thu','fri','sat'][now.getUTCDay()];
+  const timeStr = now.getUTCHours().toString().padStart(2,'0') + ':' + now.getUTCMinutes().toString().padStart(2,'0');
   const escrow  = rates.escrow;
 
   // Platform fee minimum — server rejects if callee's posted fee is too low
